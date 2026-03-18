@@ -1,0 +1,8 @@
+//
+// Created by hcj2003 on 10/27/25.
+//
+
+#ifndef OPENGAUSS_O_CSN_MANAGER_H
+#define OPENGAUSS_O_CSN_MANAGER_H
+
+#endif //OPENGAUSS_O_CSN_MANAGER_H

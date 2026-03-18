@@ -1,0 +1,8 @@
+//
+// Created by hcj2003 on 10/8/25.
+//
+
+#ifndef OPENGAUSS_O_OCCMANAGER_H
+#define OPENGAUSS_O_OCCMANAGER_H
+
+#endif //OPENGAUSS_O_OCCMANAGER_H

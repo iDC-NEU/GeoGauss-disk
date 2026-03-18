@@ -1,0 +1,156 @@
+//
+// Created by hcj2003 on 10/13/25.
+//
+
+#include "occ/o_txn.h"
+#include "occ/occ_mem.h"
+#include "occ/o_delta_table.h"
+#include "occ/occ_internal.h"
+
+// 应该不需要在进行hot扫描
+bool O_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, HeapTuple heap_tuple, Snapshot snapshot)
+{
+    TransactionId prev_xmax = InvalidTransactionId;
+    // t_data指向实际内存
+    Page dp = (Page)BufferGetPage(buffer);
+    BlockNumber blkno;
+    OffsetNumber offnum;
+
+    blkno = ItemPointerGetBlockNumber(tid);
+    offnum = ItemPointerGetOffsetNumber(tid);
+
+    bool at_chain_start = true;
+    bool valid;
+
+    for (;;)
+    {
+        ItemId lp;
+        lp = PageGetItemId(dp, offnum);
+
+        /* check for unused, dead, or redirected items */
+        if (!ItemIdIsNormal(lp))
+        {
+            /* We should only see a redirect at start of chain */
+            if (ItemIdIsRedirected(lp) && at_chain_start)
+            {
+                /* Follow the redirect */
+                offnum = ItemIdGetRedirect(lp);
+                at_chain_start = false;
+                continue;
+            }
+            /* else must be end of chain */
+            return false;
+        }
+
+        heap_tuple->t_len = ItemIdGetLength(lp);
+        heap_tuple->t_bucketId = RelationGetBktid(relation);
+        ItemPointerSet(&heap_tuple->t_self, blkno, offnum);
+        heap_tuple->t_tableOid = RelationGetRelid(relation);
+
+        heap_tuple->t_data = (HeapTupleHeader)PageGetItem(dp, lp);
+
+        if (TransactionIdIsValid(prev_xmax) && !TransactionIdEquals(prev_xmax, HeapTupleGetRawXmin(heap_tuple)))
+        {
+            return false;
+        }
+
+        return true; // 此处直接返回
+
+        if (snapshot == nullptr)
+        {
+            return true;
+        }
+
+        if (snapshot->satisfies == SNAPSHOT_MVCC)
+        {
+            valid = HeapTupleSatisfiesMVCC(heap_tuple, snapshot, buffer, NULL);
+        }
+        else
+        {
+            valid = HeapTupleSatisfiesVisibility(heap_tuple, snapshot, buffer, NULL);
+        }
+
+        if (valid)
+        {
+            ItemPointerSetOffsetNumber(tid, offnum);
+            return true;
+        }
+
+        if (HeapTupleIsHotUpdated(heap_tuple))
+        {
+            offnum = ItemPointerGetOffsetNumber(&heap_tuple->t_data->t_ctid);
+            at_chain_start = false;
+            prev_xmax = HeapTupleGetUpdateXid(heap_tuple);
+        }
+        else
+        {
+            return false; /* end of chain */
+        }
+    }
+    return false;
+}
+
+HeapTuple occ_sentinel::GetData(HeapTuple heap_tuple, Buffer buffer)
+{
+    ItemPointer tid = &tuple_id;
+
+    if (g_enable_occ_delta)
+    {
+        /* delta 模式：若 overlay 里有最新版本，直接返回 */
+        O_DeltaEntry deltaEntry;
+        if (O_DeltaTable::Instance().Lookup(relation, tid, deltaEntry))
+        {
+            if (deltaEntry.deleted || deltaEntry.tuple == nullptr)
+            {
+                return nullptr;
+            }
+            HeapTuple src = deltaEntry.tuple;
+            heap_tuple->t_len = src->t_len;
+            heap_tuple->t_bucketId = src->t_bucketId;
+            heap_tuple->t_self = src->t_self;
+            heap_tuple->t_tableOid = src->t_tableOid;
+            heap_tuple->t_data = src->t_data;
+            return heap_tuple;
+        }
+    }
+
+    O_heap_hot_search_buffer(tid, relation, buffer, heap_tuple, snapshot);
+
+    return heap_tuple;
+}
+
+HeapTuple occ_sentinel::GetData(HeapTuple heap_tuple)
+{
+    ItemPointer tid = &tuple_id;
+
+    if (g_enable_occ_delta)
+    {
+        /* delta 模式：优先从 overlay 读取 */
+        O_DeltaEntry deltaEntry;
+        if (O_DeltaTable::Instance().Lookup(relation, tid, deltaEntry))
+        {
+            if (deltaEntry.deleted || deltaEntry.tuple == nullptr)
+            {
+                return nullptr;
+            }
+            HeapTuple src = deltaEntry.tuple;
+            heap_tuple->t_len = src->t_len;
+            heap_tuple->t_bucketId = src->t_bucketId;
+            heap_tuple->t_self = src->t_self;
+            heap_tuple->t_tableOid = src->t_tableOid;
+            heap_tuple->t_data = src->t_data;
+            return heap_tuple;
+        }
+    }
+
+    Buffer buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
+
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    O_heap_hot_search_buffer(tid, relation, buffer, heap_tuple, snapshot);
+
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+    ReleaseBuffer(buffer);
+
+    return heap_tuple;
+}
