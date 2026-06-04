@@ -103,7 +103,7 @@ public:
 //        return MOT_ATOMIC_LOAD(GetData()->t_data->m_status);
     }
 
-    bool TryLock(uint64_t /*thdid*/)
+    bool TryLock(uint64_t /*thdid*/) const
     {
         const char* relname = NameStr(relation->rd_rel->relname);
         uint64_t    h       = sentinel_hash(relname, &tuple_id);
@@ -123,7 +123,7 @@ public:
         return holder == self_id;
     }
 
-    void Lock(uint64_t thdId)
+    void Lock(uint64_t thdId) const
     {
         for (;;) {
             if (TryLock(thdId)) {
@@ -135,7 +135,7 @@ public:
         }
     }
 
-    inline void Unlock()
+    inline void Unlock() const
     {
         const char* relname = NameStr(relation->rd_rel->relname);
         uint64_t    h       = sentinel_hash(relname, &tuple_id);
