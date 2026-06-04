@@ -6,8 +6,51 @@
 #include "occ/o_delta_table.h"
 #include "occ/occ_internal.h"
 
-/* 默认启用 delta 覆盖模式 */
-bool g_enable_occ_delta = true;
+#include <algorithm>
+#include <cstdint>
+#include <unistd.h>
+#include <vector>
+
+/* 默认不启用 delta 覆盖模式 */
+bool g_enable_occ_delta = false;
+
+namespace {
+
+struct SortedWriteEntry {
+    uint64_t hash;
+    O_Access* access;
+    occ_sentinel sent;
+};
+
+static void CollectWriteSetByHash(O_TxnOrderedSet_t& orderedSet, std::vector<SortedWriteEntry>& out)
+{
+    out.clear();
+    out.reserve(orderedSet.size());
+    for (const auto& raPair : orderedSet) {
+        O_Access* ac = raPair.second;
+        occ_sentinel sent = ac->m_origSentinel;
+        const char* relname = NameStr(sent.relation->rd_rel->relname);
+        uint64_t h = sentinel_hash(relname, &sent.tuple_id);
+        out.push_back({h, ac, sent});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const SortedWriteEntry& a, const SortedWriteEntry& b) { return a.hash < b.hash; });
+}
+
+static uint32_t CountUniqueHashes(const std::vector<SortedWriteEntry>& entries)
+{
+    uint32_t count = 0;
+    uint64_t prev = UINT64_MAX;
+    for (const auto& e : entries) {
+        if (e.hash != prev) {
+            count++;
+            prev = e.hash;
+        }
+    }
+    return count;
+}
+
+}  // namespace
 
 void OccTransactionManager::WriteChanges(O_TxnManager* txMan)
 {
@@ -52,7 +95,14 @@ RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
 
     } while (0);
 
-    m_rowsLocked = true;
+    if (rc == RC_OK) {
+        m_rowsLocked = true;
+    } else {
+        if (numSentinelLock > 0) {
+            ReleaseHeaderLocks(txMan, numSentinelLock);
+        }
+        m_rowsLocked = false;
+    }
 
     return rc;
 }
@@ -96,24 +146,65 @@ bool OccTransactionManager::PreAbortCheck(O_TxnManager* txMan)
 
 RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinelsLock)
 {
-    RC rc = RC_OK;
     uint64_t sleepTime = 1;
     uint64_t thdId = txMan->GetThdId();
     O_TxnOrderedSet_t& orderedSet = txMan->m_accessMgr->GetOrderedRowSet();
     numSentinelsLock = 0;
+    m_lockedSentinels.clear();
 
-    for (const auto& raPair : orderedSet) {
-        O_Access* ac = raPair.second;
-        occ_sentinel sent = ac->m_origSentinel;
-        sent.Lock(thdId);
-        numSentinelsLock++;
-        if (!QuickHeaderValidation(ac)) {
-            rc = RC_ABORT;
-            goto final;
-        }
+    std::vector<SortedWriteEntry> entries;
+    CollectWriteSetByHash(orderedSet, entries);
+    if (entries.empty()) {
+        return RC_OK;
     }
-final:
-    return rc;
+
+    const uint32_t uniqueHashCount = CountUniqueHashes(entries);
+
+    while (true) {
+        uint64_t lastHash = UINT64_MAX;
+        numSentinelsLock = 0;
+        bool lockIncomplete = false;
+
+        for (const auto& e : entries) {
+            if (e.hash != lastHash) {
+                if (!e.sent.TryLock(thdId)) {
+                    lockIncomplete = true;
+                    break;
+                }
+                m_lockedSentinels.push_back(e.sent);
+                numSentinelsLock++;
+                lastHash = e.hash;
+            }
+
+            if (!QuickHeaderValidation(e.access)) {
+                ReleaseHeaderLocks(txMan, numSentinelsLock);
+                numSentinelsLock = 0;
+                return RC_ABORT;
+            }
+        }
+
+        if (!lockIncomplete && numSentinelsLock == uniqueHashCount) {
+            return RC_OK;
+        }
+
+        ReleaseHeaderLocks(txMan, numSentinelsLock);
+        numSentinelsLock = 0;
+
+        if (m_preAbort) {
+            for (const auto& e : entries) {
+                if (!QuickHeaderValidation(e.access)) {
+                    return RC_ABORT;
+                }
+            }
+        }
+
+        if (sleepTime > OCC_LOCK_TIME_OUT) {
+            return RC_ABORT;
+        }
+
+        (void)usleep(5);
+        sleepTime = sleepTime << 1;
+    }
 }
 
 bool OccTransactionManager::QuickHeaderValidation(O_Access* access)
@@ -203,29 +294,25 @@ bool OccTransactionManager::ValidateWriteSet(O_TxnManager* txMan)
 
 void OccTransactionManager::ReleaseHeaderLocks(O_TxnManager* txMan, uint32_t numOfLocks)
 {
-    if (numOfLocks == 0) {
+    (void)txMan;
+    if (numOfLocks == 0 || m_lockedSentinels.empty()) {
         return;
     }
 
-    O_TxnAccess* tx = txMan->m_accessMgr;
-    O_TxnOrderedSet_t& orderedSet = tx->GetOrderedRowSet();
-    // use local counter to optimize
-    for (const auto& raPair : orderedSet) {
-        O_Access* access = raPair.second;
-        if (access->m_type == RD) {
-            continue;
-        } else {
-            numOfLocks--;
-            access->m_origSentinel.Unlock();
-        }
-        if (!numOfLocks) {
-            break;
-        }
+    uint32_t n = numOfLocks;
+    if (n > m_lockedSentinels.size()) {
+        n = (uint32_t)m_lockedSentinels.size();
     }
+
+    for (uint32_t i = 0; i < n; ++i) {
+        m_lockedSentinels[i].Unlock();
+    }
+    m_lockedSentinels.erase(m_lockedSentinels.begin(), m_lockedSentinels.begin() + n);
 }
 
 void OccTransactionManager::CleanUp()
 {
     m_writeSetSize = 0;
     m_insertSetSize = 0;
+    m_lockedSentinels.clear();
 }
