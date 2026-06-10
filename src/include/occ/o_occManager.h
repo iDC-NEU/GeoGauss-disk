@@ -63,7 +63,7 @@ private:
 
     bool m_validationNoWait{true};
 
-    bool m_preAbort{true};
+    bool m_preAbort{false};
 
     /** @var 已加锁的 hash 槽代表 sentinel（去重后），用于按序释放 */
     std::vector<occ_sentinel> m_lockedSentinels;

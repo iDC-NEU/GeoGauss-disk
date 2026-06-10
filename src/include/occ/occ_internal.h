@@ -54,4 +54,14 @@ inline void O_SetDeltaMode(bool enable_delta)
     g_enable_occ_delta = enable_delta;
 }
 
+/* 当前会话是否存在 OCC 写集（用于跳过只读路径上的 OCC 扫描开销） */
+inline bool O_TxnHasActiveWriteSet()
+{
+    if (u_sess->occ_cxt.txn_manager == nullptr) {
+        return false;
+    }
+    O_TxnAccess *access = u_sess->occ_cxt.txn_manager->m_accessMgr;
+    return access != nullptr && access->m_Size() > 0;
+}
+
 #endif // OPENGAUSS_OCC_INTERNAL_H

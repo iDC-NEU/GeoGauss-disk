@@ -113,6 +113,10 @@
 #include "replication/bcm.h"
 #endif
 
+//HCJ ADDBY
+#include "occ/o_executor.h"
+#include "occ/occ_internal.h"
+
 #define DECOMPRESS_HEAP_TUPLE(_isCompressed, _heapTuple, _destTupleData, _rd_att, _heapPage)  \
     do {                                                                                      \
         if ((_isCompressed)) {                                                                \
@@ -2176,6 +2180,10 @@ HeapTuple heap_getnext(TableScanDesc sscan, ScanDirection direction, bool* has_c
     /* Note: no locking manipulations needed */
     HEAPDEBUG_1; /* heap_getnext( info ) */
 
+//                 HCJ ADDBY
+    bool enable_occ;
+    HeapTuple currRow;
+hcj1:
     if (scan->rs_base.rs_pageatatime) {
         heapgettup_pagemode(scan, direction, scan->rs_base.rs_nkeys, scan->rs_base.rs_key, has_cur_xact_write);
     } else {
@@ -2196,6 +2204,15 @@ HeapTuple heap_getnext(TableScanDesc sscan, ScanDirection direction, bool* has_c
     pgstat_count_heap_getnext(scan->rs_base.rs_rd);
 
     Assert(!HEAP_TUPLE_IS_COMPRESSED(scan->rs_ctup.t_data));
+
+    //    HCJ ADDBY
+    enable_occ = true;
+    if (enable_occ && O_TxnHasActiveWriteSet()) {
+        currRow = O_seq_scan(scan);
+        if (currRow != NULL) {
+            scan->rs_ctup.t_data = currRow->t_data;
+        }
+    }
     return &(scan->rs_ctup);
 }
 
@@ -3016,6 +3033,10 @@ Oid heap_insert(Relation relation, HeapTuple tup, CommandId cid, int options, Bu
 
     /* NO EREPORT(ERROR) from here till changes are logged */
     START_CRIT_SECTION();
+
+    //HCJ ADDBY
+    heaptup->t_data->m_rowCSN = 0;
+    heaptup->t_data->is_latest = true;
 
     RelationPutHeapTuple(relation, buffer, heaptup, xid);
 
@@ -10379,7 +10400,10 @@ HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead, bool* has
         scan->xs_continue_hot = !IsMVCCSnapshot(scan->xs_snapshot);
 
         pgstat_count_heap_fetch(scan->indexRelation);
-        
+
+//        HCJ ADDBY
+        scan->xs_rowcsn = scan->xs_ctup.t_data->m_rowCSN;  //怎么保证这是旧版本的
+
         return &scan->xs_ctup;
     }
     

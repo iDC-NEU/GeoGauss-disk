@@ -28,6 +28,11 @@ Tuple O_index_getnext(IndexScanDesc scan, ScanDirection direction, bool* has_cur
             Assert(ItemPointerGetBlockNumber(&scan->xs_ctup.t_self) == BufferGetBlockNumber(scan->xs_cbuf));
         }
 
+        /* 事务尚无写集时直接返回索引扫描结果，避免逐行拷贝到 OCC 本地表 */
+        if (!O_TxnHasActiveWriteSet()) {
+            return (Tuple)&scan->xs_ctup;
+        }
+
         O_TxnManager* txn = GetTxnManager();
 
         RC rc = RC_OK;
@@ -45,6 +50,9 @@ Tuple O_index_getnext(IndexScanDesc scan, ScanDirection direction, bool* has_cur
 HeapTuple O_seq_scan(HeapScanDesc scan)
 {
     O_TxnManager* txn = GetTxnManager();
+    if (txn == nullptr) {
+        return &(scan->rs_ctup);
+    }
 
     RC rc = RC_OK;
 
@@ -52,7 +60,11 @@ HeapTuple O_seq_scan(HeapScanDesc scan)
 
     HeapTuple currRow = txn->RowLookup(AccessType::RD, sentinel, rc, nullptr, &(scan->rs_ctup));
 
-    return currRow;
+    /* OCC 未命中时回退 heap 版本，避免 COUNT(*) 等全表扫描漏行 */
+    if (currRow != nullptr) {
+        return currRow;
+    }
+    return &(scan->rs_ctup);
 }
 
 bool O_check_unique(Relation relation, ItemPointerData tid)

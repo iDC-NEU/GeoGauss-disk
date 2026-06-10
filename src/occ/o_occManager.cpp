@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <unistd.h>
 #include <vector>
 
 /* 默认不启用 delta 覆盖模式 */
@@ -41,6 +40,22 @@ static uint32_t CountUniqueHashes(const std::vector<SortedWriteEntry>& entries)
     uint32_t count = 0;
     uint64_t prev = UINT64_MAX;
     for (const auto& e : entries) {
+        if (e.hash != prev) {
+            count++;
+            prev = e.hash;
+        }
+    }
+    return count;
+}
+
+static uint32_t CountLockableHashes(const std::vector<SortedWriteEntry>& entries)
+{
+    uint32_t count = 0;
+    uint64_t prev = UINT64_MAX;
+    for (const auto& e : entries) {
+        if (e.access->m_type == INS) {
+            continue;
+        }
         if (e.hash != prev) {
             count++;
             prev = e.hash;
@@ -105,10 +120,7 @@ RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
             break;
         }
 
-        if (!ValidateWriteSet(txMan)) {
-            rc = RC_ABORT;
-            break;
-        }
+        /* LockHeaders / insert-only 快速路径已完成逐行校验，无需重复 ValidateWriteSet */
 
     } while (0);
 
@@ -188,7 +200,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
         return RC_OK;
     }
 
-    const uint32_t uniqueHashCount = CountUniqueHashes(entries);
+    const uint32_t lockableHashCount = CountLockableHashes(entries);
 
     while (true) {
         uint64_t lastHash = UINT64_MAX;
@@ -197,13 +209,16 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
 
         for (const auto& e : entries) {
             if (e.hash != lastHash) {
-                if (!e.sent.TryLock(thdId)) {
+                lastHash = e.hash;
+                if (e.access->m_type == INS) {
+                    /* 新插入行 TID 唯一，无需在提交时抢锁 */
+                } else if (!e.sent.TryLock(thdId)) {
                     lockIncomplete = true;
                     break;
+                } else {
+                    m_lockedSentinels.push_back(e.sent);
+                    numSentinelsLock++;
                 }
-                m_lockedSentinels.push_back(e.sent);
-                numSentinelsLock++;
-                lastHash = e.hash;
             }
 
             if (!QuickHeaderValidation(e.access)) {
@@ -213,7 +228,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
             }
         }
 
-        if (!lockIncomplete && numSentinelsLock == uniqueHashCount) {
+        if (!lockIncomplete && numSentinelsLock == lockableHashCount) {
             return RC_OK;
         }
 
@@ -232,7 +247,9 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
             return RC_ABORT;
         }
 
-        (void)usleep(5);
+        for (int i = 0; i < 64; ++i) {
+            __builtin_ia32_pause();
+        }
         sleepTime = sleepTime << 1;
     }
 }
