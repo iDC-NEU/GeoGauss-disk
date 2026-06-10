@@ -123,9 +123,9 @@ public:
         return m_lastAcc->GetSlot();
     }
 
-    inline void SetLastAccessedSlot(TupleTableSlot *slot)
+    inline void SetLastAccessedSlot(TupleTableSlot *slot, bool deepCopy = false)
     {
-        return m_lastAcc->SetSlot(slot);
+        return m_lastAcc->SetSlot(slot, deepCopy);
     }
 
     void ClearSet(void);

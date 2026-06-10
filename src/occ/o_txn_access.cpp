@@ -264,9 +264,31 @@ bool O_TxnAccess::EnsureRowAccessForModify(Relation rel, ItemPointer tid, HeapTu
         return true;
     }
 
-    RC rc = RC_OK;
-    (void)MapRowtoLocalTable(RD_FOR_UPDATE, sentinel, rc, nullptr, oldHeapTuple);
-    return m_lastAcc != nullptr;
+    HeapTuple row = O_heap_copytuple_impl(oldHeapTuple);
+    if (row == nullptr) {
+        return false;
+    }
+
+    ac = GetAccessPtr(m_rowCnt);
+    if (unlikely(ac == nullptr)) {
+        CreateNewAccess(RD_FOR_UPDATE);
+        ac = GetAccessPtr(m_rowCnt);
+    }
+    if (ac == nullptr) {
+        return false;
+    }
+
+    ac->m_origSentinel = sentinel;
+    ac->m_globalRow = row;
+    ac->m_localRow = row;
+    ac->m_csn = row->t_data->m_rowCSN;
+    ac->m_type = RD_FOR_UPDATE;
+    ac->m_stmtCount = m_txnManager->GetStmtCount();
+
+    m_rowsSet->insert(O_RowAccessPair_t(sentinel, ac));
+    m_rowCnt++;
+    SetLastAccess(ac);
+    return true;
 }
 
 RC O_TxnAccess::LookupFilterRow(O_Access *curr_acc, const AccessType type, HeapTuple &r_local_Row)
@@ -531,11 +553,21 @@ RC O_TxnAccess::GenerateDraft(O_Access *ac, AccessType acType)
 
 RC O_TxnAccess::CreateMVCCDraft(O_Access *ac, AccessType acType)
 {
+    if (ac->m_localRow != nullptr) {
+        return RC_OK;
+    }
+
     HeapTuple globalRow = ac->GetGlobalVersion();
+    if (globalRow == nullptr) {
+        return RC_ERROR;
+    }
+
     HeapTuple newRow = O_heap_copytuple_impl(globalRow);
+    if (newRow == nullptr) {
+        return RC_ERROR;
+    }
 
     ac->m_localRow = newRow;
-
     return RC_OK;
 }
 

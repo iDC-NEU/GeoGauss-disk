@@ -54,7 +54,7 @@ RC O_UpdateRow(O_TxnManager *txn, HeapTuple heap_tuple, TupleTableSlot *slot, ES
 
         txn->m_accessMgr->SetLastAccessedEstate(estate);
 
-        txn->m_accessMgr->SetLastAccessedSlot(slot);
+        txn->m_accessMgr->SetLastAccessedSlot(slot, update_index);
 
         rc = txn->UpdateLastRowState(AccessType::WR, update_index);
 

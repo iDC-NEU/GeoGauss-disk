@@ -305,12 +305,16 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access)
 
 bool OccTransactionManager::QuickVersionCheck(O_Access* access)
 {
-    HeapTuple localTuple = access->GetLocalVersion();
-    if (localTuple == nullptr) {
-        localTuple = access->m_globalRow;
-    }
-    if (localTuple != nullptr && localTuple->t_data != nullptr) {
-        return ((access->m_csn == localTuple->t_data->m_rowCSN) && (localTuple->t_data->is_latest));
+    if (access->m_type != WR && access->m_type != DEL) {
+        HeapTuple localTuple = access->GetLocalVersion();
+        if (localTuple == nullptr) {
+            localTuple = access->m_globalRow;
+        }
+        if (localTuple != nullptr && localTuple->t_data != nullptr) {
+            if ((access->m_csn == localTuple->t_data->m_rowCSN) && (localTuple->t_data->is_latest)) {
+                return true;
+            }
+        }
     }
 
     occ_sentinel sent = access->m_origSentinel;
