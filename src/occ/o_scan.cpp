@@ -19,6 +19,12 @@ Tuple O_index_getnext(IndexScanDesc scan, ScanDirection direction, bool* has_cur
             if (tid == NULL) {
                 break;
             }
+            if (IndexScanNeedSwitchPartRel(scan)) {
+                if (!GPIGetNextPartRelation(scan->xs_gpi_scan, CurrentMemoryContext, AccessShareLock)) {
+                    continue;
+                }
+                scan->heapRelation = scan->xs_gpi_scan->fakePartRelation;
+            }
         } else {
             /*
              * We are resuming scan of a HOT chain after having returned an
@@ -28,9 +34,13 @@ Tuple O_index_getnext(IndexScanDesc scan, ScanDirection direction, bool* has_cur
             Assert(ItemPointerGetBlockNumber(&scan->xs_ctup.t_self) == BufferGetBlockNumber(scan->xs_cbuf));
         }
 
-        /* 事务尚无写集时直接返回索引扫描结果，避免逐行拷贝到 OCC 本地表 */
+        /* 无写集时仍须 IndexFetchTuple 拉取 heap 行，不能直接返回 xs_ctup */
         if (!O_TxnHasActiveWriteSet()) {
-            return (Tuple)&scan->xs_ctup;
+            tuple = IndexFetchTuple(scan, has_cur_xact_write);
+            if (tuple != NULL) {
+                return tuple;
+            }
+            continue;
         }
 
         O_TxnManager* txn = GetTxnManager();
