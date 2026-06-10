@@ -22,8 +22,8 @@ inline O_TxnManager *GetTxnManager()
     if (!u_sess->occ_cxt.txn_manager)
     {
         O_TxnManager *txnManager = nullptr;
-//        void *buffer = occ_malloc(sizeof(O_TxnManager));
-        void *buffer = palloc(sizeof(O_TxnManager));
+        /* 使用 occ_malloc 分配在事务上下文之外，避免 Portal/Query 上下文回收后悬空 */
+        void *buffer = occ_malloc(sizeof(O_TxnManager));
 
         if (!buffer)
         {
@@ -36,7 +36,7 @@ inline O_TxnManager *GetTxnManager()
         if (!txnManager->Init())
         {
             txnManager->~O_TxnManager();
-            pfree(buffer);
+            occ_free(buffer);
             return nullptr;
         }
 
@@ -57,11 +57,11 @@ inline void O_SetDeltaMode(bool enable_delta)
 /* 当前会话是否存在 OCC 写集（用于跳过只读路径上的 OCC 扫描开销） */
 inline bool O_TxnHasActiveWriteSet()
 {
-    if (u_sess->occ_cxt.txn_manager == nullptr) {
+    O_TxnManager *txn = u_sess->occ_cxt.txn_manager;
+    if (txn == nullptr || txn->m_accessMgr == nullptr) {
         return false;
     }
-    O_TxnAccess *access = u_sess->occ_cxt.txn_manager->m_accessMgr;
-    return access != nullptr && access->m_Size() > 0;
+    return txn->m_accessMgr->m_Size() > 0;
 }
 
 #endif // OPENGAUSS_OCC_INTERNAL_H

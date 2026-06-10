@@ -229,9 +229,12 @@ void O_TxnManager::RollbackInternal(bool isPrepared)
 
 inline void O_TxnManager::Cleanup()
 {
-    m_accessMgr->ClearSet();
+    if (m_accessMgr != nullptr) {
+        m_accessMgr->ClearSet();
+    }
 
     m_csn = INVALID_CSN;
+    m_internalStmtCount = 0;
     m_occManager.CleanUp();
-    u_sess->occ_cxt.txn_manager = NULL;
+    /* 保留 txn_manager 供会话内复用，勿置 NULL（旧版 palloc 方案会随上下文回收悬空） */
 }
