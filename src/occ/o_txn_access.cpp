@@ -251,6 +251,24 @@ O_Access *O_TxnAccess::RowLookup(occ_sentinel const currentKey)
     return nullptr;
 }
 
+bool O_TxnAccess::EnsureRowAccessForModify(Relation rel, ItemPointer tid, HeapTuple oldHeapTuple)
+{
+    if (rel == nullptr || tid == nullptr || oldHeapTuple == nullptr || oldHeapTuple->t_data == nullptr) {
+        return false;
+    }
+
+    occ_sentinel sentinel(rel, *tid);
+    O_Access *ac = RowLookup(sentinel);
+    if (ac != nullptr) {
+        SetLastAccess(ac);
+        return true;
+    }
+
+    RC rc = RC_OK;
+    (void)MapRowtoLocalTable(RD_FOR_UPDATE, sentinel, rc, nullptr, oldHeapTuple);
+    return m_lastAcc != nullptr;
+}
+
 RC O_TxnAccess::LookupFilterRow(O_Access *curr_acc, const AccessType type, HeapTuple &r_local_Row)
 {
     r_local_Row = nullptr;
@@ -461,6 +479,10 @@ static const TxnStateMachineEntry txnStateMachine[O_TxnAccess::TSM_SIZE][O_TxnAc
 
 RC O_TxnAccess::UpdateRowState(AccessType type, O_Access *ac, bool update_index)
 {
+    if (ac == nullptr) {
+        return RC_ERROR;
+    }
+
     // 状态转换表
     AccessType currentState = ac->m_type;
     auto result = txnStateMachine[currentState][type];

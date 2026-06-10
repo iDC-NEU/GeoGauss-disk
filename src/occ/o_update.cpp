@@ -48,6 +48,10 @@ RC O_UpdateRow(O_TxnManager *txn, HeapTuple heap_tuple, TupleTableSlot *slot, ES
 
     do
     {
+        if (txn == nullptr || txn->m_accessMgr == nullptr || txn->m_accessMgr->GetLastAccess() == nullptr) {
+            return RC_ERROR;
+        }
+
         txn->m_accessMgr->SetLastAccessedEstate(estate);
 
         txn->m_accessMgr->SetLastAccessedSlot(slot);
@@ -139,6 +143,9 @@ TupleTableSlot *O_ExecUpdate(ItemPointer tupleid,
 
         occ_heap_insert(relation, (HeapTuple)tuple, estate->es_output_cid, 0, NULL, false);
 
+        if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tupleid, &oldtup)) {
+            ereport(ERROR, (errmsg("OCC: failed to establish row access for non-HOT update")));
+        }
         O_UpdateRow(txn, (HeapTuple)tuple, slot, estate, true); // 旧的版本需要无效掉
 
         if (result_rel_info->ri_NumIndices > 0)
@@ -165,6 +172,9 @@ TupleTableSlot *O_ExecUpdate(ItemPointer tupleid,
     }
     else
     {
+        if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tupleid, &oldtup)) {
+            ereport(ERROR, (errmsg("OCC: failed to establish row access for HOT update")));
+        }
         O_UpdateRow(txn, (HeapTuple)tuple, slot, estate);
     }
 

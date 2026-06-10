@@ -88,6 +88,8 @@ public:
 
     O_Access *RowLookup(occ_sentinel const currentKey);
 
+    bool EnsureRowAccessForModify(Relation rel, ItemPointer tid, HeapTuple oldHeapTuple);
+
     RC UpdateRowState(AccessType type, O_Access *ac, bool update_index);
 
     static constexpr uint8_t TSM_SIZE = 6;
