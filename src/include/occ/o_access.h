@@ -412,8 +412,11 @@ public:
 
     inline void SetEstate(EState *estate)
     {
-        /* 借用执行器 EState，避免每次 UPDATE 打开全部索引 */
-        m_estate = estate;
+        /* 仅保存 cid，提交阶段不依赖已释放的 EState */
+        if (estate != nullptr) {
+            m_outputCid = estate->es_output_cid;
+        }
+        m_estate = nullptr;
         m_ownsEstate = false;
     }
 
@@ -448,6 +451,8 @@ public:
     EState *m_estate = nullptr;
 
     TupleTableSlot *m_slot = nullptr;
+
+    CommandId m_outputCid = InvalidCommandId;
 
     bool m_ownsEstate = false;
 

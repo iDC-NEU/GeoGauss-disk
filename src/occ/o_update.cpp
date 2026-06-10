@@ -10,6 +10,7 @@
 #include "access/tableam.h"
 #include "access/sysattr.h"
 #include "access/visibilitymap.h"
+#include "catalog/index.h"
 #include "utils/lsyscache.h"
 #include "access/tuptoaster.h"
 
@@ -38,6 +39,11 @@ static Oid occ_heap_insert(Relation relation, HeapTuple tup, CommandId cid, int 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup, CommandId cid, int options);
 
 void O_FormIndexDatum(IndexInfo *indexInfo, TupleTableSlot *slot, Datum *values, bool *isnull);
+
+static void O_FormIndexDatumFromHeap(IndexInfo *indexInfo, Relation heapRel, HeapTuple tup,
+                                     Datum *values, bool *isnull);
+
+static void O_InsertIndexTuplesForHeap(Relation heapRel, HeapTuple tup, ItemPointer tupleid);
 
 List *O_ExecInsertIndexTuples(TupleTableSlot *slot, ItemPointer tupleid, EState *estate,
                               Bitmapset *modifiedIdxAttrs);
@@ -479,16 +485,17 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 
     if (!use_hot_update)
     {
-        ResultRelInfo *result_rel_info = NULL;
-        Relation result_relation_desc;
-        result_rel_info = estate->es_result_relation_info;
-        result_relation_desc = result_rel_info->ri_RelationDesc;
-
-        if (result_rel_info->ri_NumIndices > 0)
+        if (estate != nullptr && slot != nullptr)
         {
-            Bitmapset *modifiedIdxAttrs = NULL;
-
-            O_ExecInsertIndexTuples(slot, &(heaptup->t_self), estate, modifiedIdxAttrs);
+            ResultRelInfo *result_rel_info = estate->es_result_relation_info;
+            if (result_rel_info != nullptr && result_rel_info->ri_NumIndices > 0)
+            {
+                O_ExecInsertIndexTuples(slot, &(heaptup->t_self), estate, NULL);
+            }
+        }
+        else
+        {
+            O_InsertIndexTuplesForHeap(relation, heaptup, &(heaptup->t_self));
         }
     }
 
@@ -1440,6 +1447,60 @@ static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup, CommandId
 }
 
 //=========================================================
+static void O_FormIndexDatumFromHeap(IndexInfo *indexInfo, Relation heapRel, HeapTuple tup,
+                                     Datum *values, bool *isnull)
+{
+    TupleDesc tupdesc = RelationGetDescr(heapRel);
+    for (int i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+    {
+        int keycol = indexInfo->ii_KeyAttrNumbers[i];
+        if (keycol != 0)
+        {
+            values[i] = heap_getattr(tup, keycol, tupdesc, &isnull[i]);
+        }
+        else
+        {
+            ereport(ERROR,
+                    (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE), errmsg("wrong number of index expressions")));
+        }
+    }
+}
+
+static void O_InsertIndexTuplesForHeap(Relation heapRel, HeapTuple tup, ItemPointer tupleid)
+{
+    List *indexoidlist = RelationGetIndexList(heapRel);
+    ListCell *l = NULL;
+
+    foreach (l, indexoidlist)
+    {
+        Oid indexOid = lfirst_oid(l);
+        Relation indexDesc = index_open(indexOid, RowExclusiveLock);
+        IndexInfo *ii = BuildIndexInfo(indexDesc);
+
+        if (!ii->ii_ReadyForInserts)
+        {
+            index_close(indexDesc, RowExclusiveLock);
+            continue;
+        }
+
+        Datum values[INDEX_MAX_KEYS];
+        bool isnull[INDEX_MAX_KEYS];
+        IndexUniqueCheck checkUnique = UNIQUE_CHECK_NO;
+
+        O_FormIndexDatumFromHeap(ii, heapRel, tup, values, isnull);
+
+        if (u_sess->attr.attr_common.unique_checks && indexDesc->rd_index->indisunique)
+        {
+            checkUnique = indexDesc->rd_index->indimmediate ? UNIQUE_CHECK_YES : UNIQUE_CHECK_PARTIAL;
+        }
+
+        (void)index_insert(indexDesc, values, isnull, tupleid, heapRel, checkUnique);
+        index_close(indexDesc, RowExclusiveLock);
+    }
+
+    list_free_ext(indexoidlist);
+}
+
 void O_FormIndexDatum(IndexInfo *indexInfo, TupleTableSlot *slot, Datum *values, bool *isnull)
 {
     int i;

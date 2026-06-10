@@ -9,6 +9,7 @@
 #include "occ/occ_internal.h"
 
 #include "utils/rel.h"
+#include "access/xact.h"
 
 static Relation O_OpenAccessRelation(O_Access *access, bool *needClose)
 {
@@ -65,18 +66,28 @@ void O_Access::WriteGlobalChanges(uint64_t csn)
         if (newVersion == nullptr || newVersion->t_data == nullptr) {
             break;
         }
+        CommandId cid = m_outputCid;
+        if (cid == InvalidCommandId) {
+            cid = GetCurrentCommandId(false);
+        }
         newVersion->t_data->m_rowCSN = csn;
         newVersion->t_data->is_latest = true;
         if (update_index) {
-            O_heap_update2(rel, &m_origSentinel.tuple_id, newVersion, m_estate->es_output_cid, csn);
+            O_heap_update2(rel, &m_origSentinel.tuple_id, newVersion, cid, csn);
         } else {
-            O_heap_update(rel, &m_origSentinel.tuple_id, newVersion, m_estate->es_output_cid, csn, m_slot, m_estate);
+            O_heap_update(rel, &m_origSentinel.tuple_id, newVersion, cid, csn, nullptr, nullptr);
         }
         O_MirrorToDelta(this, newVersion, csn, false);
         break;
     }
-    case DEL:
-        O_heap_delete(rel, &m_origSentinel.tuple_id, m_estate->es_output_cid, csn);
+    case DEL: {
+        CommandId cid = m_outputCid;
+        if (cid == InvalidCommandId) {
+            cid = GetCurrentCommandId(false);
+        }
+        O_heap_delete(rel, &m_origSentinel.tuple_id, cid, csn);
+        break;
+    }
         O_MirrorToDelta(this, nullptr, csn, true);
         break;
     case INS: {
