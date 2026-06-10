@@ -36,7 +36,7 @@ inline O_TxnManager *GetTxnManager()
         if (!txnManager->Init())
         {
             txnManager->~O_TxnManager();
-            free(buffer);
+            pfree(buffer);
             return nullptr;
         }
 

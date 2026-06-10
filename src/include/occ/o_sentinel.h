@@ -45,20 +45,17 @@ static inline uint64_t tid_hash(const ItemPointerData *tid)
     return x;
 }
 
-static inline uint64_t sentinel_hash(const char* relname, const ItemPointerData* tid)
+static inline uint64_t sentinel_hash(Oid relid, const ItemPointerData* tid)
 {
     uint64_t t = tid_hash(tid);
-    /* FNV-1a 64-bit 快速字符串哈希 */
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (const char* p = relname; *p; ++p) {
-        h ^= (uint64_t)(uint8_t)*p;
-        h *= 0x100000001b3ULL;
-    }
+    uint64_t h = (uint64_t)relid;
+    h ^= h >> 32;
+    h *= 0x100000001b3ULL;
     uint64_t x = h ^ t;
-    x ^= x >> 32;      // 高 32 位 ↓
-    x ^= x >> 16;      // 再高 16 位 ↓
-    x ^= x >> 8;       // 再高 8 位 ↓
-    return x & 0xFFFFF;// 仍只留 20 位，但高位信息已混入
+    x ^= x >> 32;
+    x ^= x >> 16;
+    x ^= x >> 8;
+    return x & 0xFFFFF;
 }
 
 static constexpr uint64_t LOCK_BIT = 1;
@@ -94,6 +91,17 @@ inline LockTable& global_table() {
 
 class occ_sentinel {
 public:
+    occ_sentinel()
+        : relation(nullptr), tuple_id(), snapshot(nullptr), relid(InvalidOid)
+    {
+    }
+
+    occ_sentinel(Relation rel, ItemPointerData tid, Snapshot snap = nullptr)
+        : relation(rel), tuple_id(tid), snapshot(snap),
+          relid(rel != nullptr ? RelationGetRelid(rel) : InvalidOid)
+    {
+    }
+
     HeapTuple GetData(HeapTuple heap_tuple);
     HeapTuple GetData(HeapTuple heap_tuple, Buffer buffer);
 
@@ -105,8 +113,10 @@ public:
 
     bool TryLock(uint64_t /*thdid*/) const
     {
-        const char* relname = NameStr(relation->rd_rel->relname);
-        uint64_t    h       = sentinel_hash(relname, &tuple_id);
+        if (!OidIsValid(relid)) {
+            return false;
+        }
+        uint64_t    h       = sentinel_hash(relid, &tuple_id);
         LockSlot&   s       = global_table().slot(h);
 
         uint64_t self_id = thread_hash();
@@ -137,8 +147,10 @@ public:
 
     inline void Unlock() const
     {
-        const char* relname = NameStr(relation->rd_rel->relname);
-        uint64_t    h       = sentinel_hash(relname, &tuple_id);
+        if (!OidIsValid(relid)) {
+            return;
+        }
+        uint64_t    h       = sentinel_hash(relid, &tuple_id);
         LockSlot&   s       = global_table().slot(h);
 
         uint64_t self_id = thread_hash();
@@ -158,19 +170,18 @@ public:
     Relation relation;
     ItemPointerData tuple_id;
     Snapshot snapshot;
+    Oid relid;
 
     bool operator<(const occ_sentinel& other) const {
-        // 1. 先比较 relation 指针地址
-        int c = strcmp(NameStr(relation->rd_rel->relname), NameStr(other.relation->rd_rel->relname));
-        if (c != 0) return c < 0;
-
-        // 2. 再比较 ip_blkid（BlockIdData: bi_hi, bi_lo）
-        if (tuple_id.ip_blkid.bi_hi != other.tuple_id.ip_blkid.bi_hi)
+        if (relid != other.relid) {
+            return relid < other.relid;
+        }
+        if (tuple_id.ip_blkid.bi_hi != other.tuple_id.ip_blkid.bi_hi) {
             return tuple_id.ip_blkid.bi_hi < other.tuple_id.ip_blkid.bi_hi;
-        if (tuple_id.ip_blkid.bi_lo != other.tuple_id.ip_blkid.bi_lo)
+        }
+        if (tuple_id.ip_blkid.bi_lo != other.tuple_id.ip_blkid.bi_lo) {
             return tuple_id.ip_blkid.bi_lo < other.tuple_id.ip_blkid.bi_lo;
-
-        // 3. 最后比较 ip_posid
+        }
         return tuple_id.ip_posid < other.tuple_id.ip_posid;
     }
 

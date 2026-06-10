@@ -381,6 +381,7 @@ O_Access *O_TxnAccess::GetNewRowAccess(occ_sentinel const &originalSentinel, Acc
     ac->m_origSentinel.relation = originalSentinel.relation;
     ac->m_origSentinel.tuple_id = row->t_self; // 可能有重定向
     ac->m_origSentinel.snapshot = originalSentinel.snapshot;
+    ac->m_origSentinel.relid = originalSentinel.relid;
     ac->m_globalRow = row;
 
     ac->m_type = type;

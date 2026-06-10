@@ -29,8 +29,7 @@ static void CollectWriteSetByHash(O_TxnOrderedSet_t& orderedSet, std::vector<Sor
     for (const auto& raPair : orderedSet) {
         O_Access* ac = raPair.second;
         occ_sentinel sent = ac->m_origSentinel;
-        const char* relname = NameStr(sent.relation->rd_rel->relname);
-        uint64_t h = sentinel_hash(relname, &sent.tuple_id);
+        uint64_t h = sentinel_hash(sent.relid, &sent.tuple_id);
         out.push_back({h, ac, sent});
     }
     std::sort(out.begin(), out.end(),
@@ -48,6 +47,24 @@ static uint32_t CountUniqueHashes(const std::vector<SortedWriteEntry>& entries)
         }
     }
     return count;
+}
+
+static bool IsInsertOnlyWriteSet(const std::vector<SortedWriteEntry>& entries)
+{
+    if (entries.empty()) {
+        return false;
+    }
+    for (const auto& e : entries) {
+        if (e.access->m_type != INS) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool OccRelationUsable(Relation relation, Oid relid)
+{
+    return relation != nullptr && OidIsValid(relid);
 }
 
 }  // namespace
@@ -158,6 +175,19 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
         return RC_OK;
     }
 
+    /*
+     * 纯 INSERT 事务（TPC-C load 批量导入）：行由本事务创建，无需在提交时
+     * 对 heap 加锁或 ReadBuffer；用本地副本校验即可，避免 Relation 失效崩溃。
+     */
+    if (IsInsertOnlyWriteSet(entries)) {
+        for (const auto& e : entries) {
+            if (!QuickInsertCheck(e.access)) {
+                return RC_ABORT;
+            }
+        }
+        return RC_OK;
+    }
+
     const uint32_t uniqueHashCount = CountUniqueHashes(entries);
 
     while (true) {
@@ -218,12 +248,16 @@ bool OccTransactionManager::QuickHeaderValidation(O_Access* access)
 
 bool OccTransactionManager::QuickInsertCheck(O_Access* access)
 {
+    /* INSERT 优先用事务内本地副本校验，避免提交时 Relation 已失效 */
+    if (access->m_localInsertRow != nullptr && access->m_localInsertRow->t_data != nullptr) {
+        return (access->m_csn == access->m_localInsertRow->t_data->m_rowCSN);
+    }
+
     occ_sentinel sent = access->m_origSentinel;
     HeapTupleData tuple;
 
     if (g_enable_occ_delta)
     {
-        /* 优先在 delta 表中做版本校验，找不到再回退 heap */
         O_DeltaEntry deltaEntry;
         if (O_DeltaTable::Instance().Lookup(sent.relation, &sent.tuple_id, deltaEntry))
         {
@@ -236,11 +270,15 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access)
         }
     }
 
+    if (!OccRelationUsable(sent.relation, sent.relid)) {
+        return false;
+    }
+
     Buffer buffer = ReadBuffer(sent.relation, ItemPointerGetBlockNumber(&sent.tuple_id));
     LockBuffer(buffer, BUFFER_LOCK_SHARE);
     sent.GetData(&tuple, buffer);
 
-    bool result = (access->m_csn == tuple.t_data->m_rowCSN);
+    bool result = (tuple.t_data != nullptr) && (access->m_csn == tuple.t_data->m_rowCSN);
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
     ReleaseBuffer(buffer);
@@ -250,12 +288,19 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access)
 
 bool OccTransactionManager::QuickVersionCheck(O_Access* access)
 {
+    HeapTuple localTuple = access->GetLocalVersion();
+    if (localTuple == nullptr) {
+        localTuple = access->m_globalRow;
+    }
+    if (localTuple != nullptr && localTuple->t_data != nullptr) {
+        return ((access->m_csn == localTuple->t_data->m_rowCSN) && (localTuple->t_data->is_latest));
+    }
+
     occ_sentinel sent = access->m_origSentinel;
     HeapTupleData tuple;
 
     if (g_enable_occ_delta)
     {
-        /* 优先在 delta 表中校验版本和 is_latest 标记 */
         O_DeltaEntry deltaEntry;
         if (O_DeltaTable::Instance().Lookup(sent.relation, &sent.tuple_id, deltaEntry))
         {
@@ -268,11 +313,17 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access)
         }
     }
 
+    if (!OccRelationUsable(sent.relation, sent.relid)) {
+        return false;
+    }
+
     Buffer buffer = ReadBuffer(sent.relation, ItemPointerGetBlockNumber(&sent.tuple_id));
     LockBuffer(buffer, BUFFER_LOCK_SHARE);
     sent.GetData(&tuple, buffer);
 
-    bool result = ((access->m_csn == tuple.t_data->m_rowCSN) && (tuple.t_data->is_latest));
+    bool result = (tuple.t_data != nullptr) &&
+                  (access->m_csn == tuple.t_data->m_rowCSN) &&
+                  (tuple.t_data->is_latest);
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
     ReleaseBuffer(buffer);
