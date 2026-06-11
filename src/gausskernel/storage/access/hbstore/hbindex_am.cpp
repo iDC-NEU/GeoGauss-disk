@@ -31,6 +31,9 @@
 #include "catalog/pg_hashbucket_fn.h"
 #include "optimizer/bucketpruning.h"
 
+//HCJ ADDBY
+#include "occ/o_executor.h"
+
 static IndexScanDesc hbkt_idx_beginscan(Relation heapRelation,
     Relation indexRelation,
     Snapshot snapshot,
@@ -641,7 +644,12 @@ HeapTuple scan_handler_idx_getnext(IndexScanDesc scan, ScanDirection direction, 
             return hbkt_idx_getnext(scan, direction, expect_bktid);
         }
     } else {
-        return (HeapTuple)index_getnext(scan, direction, has_cur_xact_write);
+//        HCJ ADDBY
+        bool enable_occ = true;
+        if (enable_occ) {
+            return (HeapTuple)O_index_getnext(scan, direction, has_cur_xact_write);
+        }
+        else return (HeapTuple)index_getnext(scan, direction, has_cur_xact_write);
     }
 }
 

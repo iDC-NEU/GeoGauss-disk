@@ -172,6 +172,11 @@ typedef struct HeapTupleHeaderData {
 
     uint8 t_hoff; /* sizeof header incl. bitmap, padding */
 
+//    HCJ ADDBY
+    uint64_t m_rowCSN;
+    bool is_latest;
+    volatile uint64_t m_status;
+
     /* ^ - 23 bytes - ^ */
 
     bits8 t_bits[FLEXIBLE_ARRAY_MEMBER]; /* bitmap of NULLs -- VARIABLE LENGTH */

@@ -26,6 +26,8 @@ SUBDIRS = \
 	$(top_builddir)/../distribute/bin \
 	lib/elog \
 	bin \
+	occ \
+	occ-opt \
 	gausskernel \
 	common/backend/utils/mb/conversion_procs \
 	common/backend/snowball \
@@ -40,6 +42,8 @@ SUBDIRS = \
 	lib \
 	common \
 	lib/elog \
+	occ \
+	occ-opt \
 	gausskernel $(dirs_in_central_mode) \
 	gausskernel/storage/replication/pgoutput/ \
 	bin \

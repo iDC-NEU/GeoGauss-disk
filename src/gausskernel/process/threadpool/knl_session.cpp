@@ -63,6 +63,9 @@
 #include "access/datavec/vector.h"
 #include "access/datavec/shortest_dec.h"
 
+//HCJ ADDBY
+#include "occ/o_txn.h"
+
 THR_LOCAL knl_session_context* u_sess;
 
 extern pg_enc2name pg_enc2name_tbl[];
@@ -1424,6 +1427,13 @@ void knl_u_mot_init(knl_u_mot_context* mot_cxt)
 }
 #endif
 
+//HCJ ADDBY
+void knl_u_occ_init(knl_u_occ_context* occ_cxt)
+{
+    Assert(occ_cxt != NULL);
+    occ_cxt->txn_manager = NULL;
+}
+
 #ifdef USE_SPQ
 static void knl_u_spq_init(knl_u_spq_context* spq_cxt)
 {
@@ -1587,6 +1597,8 @@ void knl_session_init(knl_session_context* sess_cxt)
 #ifdef ENABLE_MOT
     knl_u_mot_init(&sess_cxt->mot_cxt);
 #endif
+//    HCJ ADDBY
+    knl_u_occ_init(&sess_cxt->occ_cxt);
 #ifdef USE_SPQ
     knl_u_spq_init(&sess_cxt->spq_cxt);
 #endif

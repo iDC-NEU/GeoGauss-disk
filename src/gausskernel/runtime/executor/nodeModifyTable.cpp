@@ -88,6 +88,9 @@
 #include "gs_ledger/ledger_utils.h"
 #include "gs_ledger/userchain.h"
 
+//HCJ ADDBY
+#include "occ/o_executor.h"
+
 #ifdef PGXC
 static void RecoredGeneratedExpr(ResultRelInfo *resultRelInfo, EState *estate, CmdType cmdtype);
 
@@ -1559,6 +1562,13 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                  * insert index entries for tuple
                  */
                 pTSelf = tableam_tops_get_t_self(result_relation_desc, tuple);
+
+                //                        HCJ ADDBY
+                bool enable_occ = true;
+                if (enable_occ) {
+                    O_InsertRow(pTSelf,estate,(HeapTuple)tuple);
+                }
+
                 if (result_rel_info->ri_NumIndices > 0 && !RelationIsColStore(result_relation_desc)) {
                     if (state->isReplace) {
                         bool specConflict = false;
@@ -3437,6 +3447,9 @@ static TupleTableSlot* ExecReplace(EState* estate, ModifyTableState* node, Tuple
  */
 static TupleTableSlot* ExecModifyTable(PlanState* state)
 {
+//    HCJ ADDBY
+    bool enable_occ = true;
+
     ModifyTableState* node = castNode(ModifyTableState, state);
     EState* estate = node->ps.state;
     CmdType operation = node->operation;
@@ -3829,18 +3842,35 @@ static TupleTableSlot* ExecModifyTable(PlanState* state)
             }
             case CMD_UPDATE:
                 if (!IS_SPQ_RUNNING) {
-                    slot = ExecUpdate(tuple_id,
-                                      old_partition_oid,
-                                      bucketid,
-                                      old_tuple,
-                                      slot,
-                                      plan_slot,
-                                      &node->mt_epqstate,
-                                      node,
-                                      node->canSetTag,
-                                      part_key_updated,
-                                      NULL,
-                                      partExprKeyStr);
+//                    HCJ ADDBY
+                    if (enable_occ) {
+                        slot = O_ExecUpdate(tuple_id,
+                                            old_partition_oid,
+                                            bucketid,
+                                            old_tuple,
+                                            slot,
+                                            plan_slot,
+                                            &node->mt_epqstate,
+                                            node,
+                                            node->canSetTag,
+                                            part_key_updated,
+                                            NULL,
+                                            partExprKeyStr);
+                    }
+                    else{
+                        slot = ExecUpdate(tuple_id,
+                                          old_partition_oid,
+                                          bucketid,
+                                          old_tuple,
+                                          slot,
+                                          plan_slot,
+                                          &node->mt_epqstate,
+                                          node,
+                                          node->canSetTag,
+                                          part_key_updated,
+                                          NULL,
+                                          partExprKeyStr);
+                    }
                 } else if (DML_INSERT == action) {
                     slot = ExecInsertT<false>(node, slot, plan_slot, estate, node->canSetTag,
                                               hi_options, &partition_list, partExprKeyStr);
@@ -3850,8 +3880,14 @@ static TupleTableSlot* ExecModifyTable(PlanState* state)
                 }
                 break;
             case CMD_DELETE:
-                slot = ExecDelete(
-                    tuple_id, old_partition_oid, bucketid, old_tuple, plan_slot, &node->mt_epqstate, node, node->canSetTag);
+//                HCJ ADDBY
+                if (enable_occ) {
+                    slot = O_ExecDelete(tuple_id, old_partition_oid, bucketid, old_tuple, plan_slot, &node->mt_epqstate, node, node->canSetTag);
+                }
+                else {
+                    slot = ExecDelete(
+                        tuple_id, old_partition_oid, bucketid, old_tuple, plan_slot, &node->mt_epqstate, node, node->canSetTag);
+                }
                 break;
             default:
                 ereport(ERROR,

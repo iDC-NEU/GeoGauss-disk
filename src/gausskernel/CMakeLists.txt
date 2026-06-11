@@ -171,6 +171,8 @@ list(APPEND gaussdb_objects
     $<TARGET_OBJECTS:common_backend_pgxc_single_barrier>
     $<TARGET_OBJECTS:common_backend_pgxc_single_copy>
     $<TARGET_OBJECTS:gausskernel_storage_access_heap>
+#HCJ ADDBY
+    $<TARGET_OBJECTS:gausskernel_storage_access_occ>
     $<TARGET_OBJECTS:gausskernel_storage_access_index>
     $<TARGET_OBJECTS:gausskernel_storage_access_nbtree>
     $<TARGET_OBJECTS:gausskernel_storage_access_psort>

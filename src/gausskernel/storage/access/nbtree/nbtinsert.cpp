@@ -33,6 +33,9 @@
 #include "utils/inval.h"
 #include "utils/snapmgr.h"
 
+//HCJ ADDBY
+#include "occ/o_executor.h"
+
 #define MarkItemDeadAndDirtyBuffer(itemid, opaque, buf, nbuf) \
     do {                                                      \
         ItemIdMarkDead((itemid));                             \
@@ -454,6 +457,16 @@ TransactionId _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel, 
                     if (!_bt_isequal(rel, page, offset, indnkeyatts, itup_key->scankeys))
                         break;
                     cur_index_itup = (IndexTuple)PageGetItem(page, cur_item_id);
+
+//                    //                    HCJ ADDBY
+//                    bool enable_occ = true;
+//                    if (enable_occ) {
+//                        bool res = O_check_unique(heapRel, cur_index_itup->t_tid);
+//                        if (res) {
+//                            break;
+//                        }
+//                    }
+
                     Assert(!btree_tuple_is_pivot(cur_index_itup));
                 }
 

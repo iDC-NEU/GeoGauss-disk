@@ -70,6 +70,9 @@
 #include "tcop/dest.h"
 #include "og_record_time.h"
 
+//HCJ ADDBY
+class O_TxnManager;
+
 #define TSRANK_WEIGHTS_LEN    4
 
 typedef void (*pg_on_exit_callback)(int code, Datum arg);
@@ -2772,6 +2775,11 @@ typedef struct knl_u_mot_context {
 } knl_u_mot_context;
 #endif
 
+//HCJ ADDBY
+typedef struct knl_u_occ_context {
+    O_TxnManager* txn_manager;
+} knl_u_occ_context;
+
 #ifdef USE_SPQ
 namespace spqdxl {
     class CDXLMemoryManager;
@@ -3129,6 +3137,9 @@ typedef struct knl_session_context {
     knl_u_mot_context mot_cxt;
 #endif
 
+//    HCJ ADDBY
+    knl_u_occ_context occ_cxt;
+
 #ifdef USE_SPQ
     knl_u_spq_context spq_cxt;
 #endif
@@ -3228,6 +3239,9 @@ extern THR_LOCAL knl_session_context* u_sess;
 #ifdef ENABLE_MOT
 extern void knl_u_mot_init(knl_u_mot_context* mot_cxt);
 #endif
+
+//HCJ ADDBY
+void knl_u_occ_init(knl_u_occ_context* occ_cxt);
 
 inline bool stp_disable_xact_and_set_err_msg(bool *save_commit_rollback_state, stp_xact_err_type type) 
 {

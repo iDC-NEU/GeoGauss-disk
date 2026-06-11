@@ -41,6 +41,10 @@ set(CMAKE_MODULE_PATH
 add_subdirectory(bin)
 add_subdirectory(common)
 add_subdirectory(lib)
+#HCJ ADDBY
+add_subdirectory(occ)
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/occ DESTINATION include/postgresql/server)
+
 add_subdirectory(gausskernel)
 add_subdirectory(test)
 

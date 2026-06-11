@@ -45,7 +45,7 @@ inline O_TxnManager *GetTxnManager()
     return u_sess->occ_cxt.txn_manager;
 }
 
-/* 开关：是否启用 OCC delta 覆盖表（true = 使用 delta，不直接写 heap） */
+/* 开关：true = commit 写 heap 后镜像 delta，读路径优先查 delta 分片表 */
 extern bool g_enable_occ_delta;
 
 /* 简单 C 接口，方便测试或后续挂接到 GUC */

@@ -152,6 +152,9 @@ typedef struct IndexScanDescData {
     IndexTuple xs_itup;    /* index tuple returned by AM */
     TupleDesc xs_itupdesc; /* rowtype descriptor of xs_itup */
 
+    //HCJ ADDBY
+    uint64_t xs_rowcsn;
+
     /* xs_ctup/xs_cbuf/xs_recheck are valid after a successful index_getnext */
     HeapTupleData xs_ctup; /* current heap tuple, if any */
     Buffer xs_cbuf;        /* current heap buffer in scan, if any */

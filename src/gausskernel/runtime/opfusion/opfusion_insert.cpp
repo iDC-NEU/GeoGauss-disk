@@ -34,6 +34,9 @@
 #include "parser/parse_coerce.h"
 #include "utils/partitionmap.h"
 
+//HCJ ADDBY
+#include "occ/o_executor.h"
+
 extern void ExecEndPlan(PlanState* planstate, EState* estate);
 
 inline bool check_attisnull_exist(ResultRelInfo* ResultRelInfo, TupleTableSlot* slot);
@@ -376,6 +379,13 @@ unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_i
 
     /* insert index entries for tuple */
     List* recheck_indexes = NIL;
+
+//    HCJ ADDBY
+    bool enable_occ = true;
+    if (enable_occ) {
+        O_InsertRow(&(((HeapTuple)tuple)->t_self),m_c_local.m_estate,(HeapTuple)tuple);
+    }
+
     if (result_rel_info->ri_NumIndices > 0) {
         recheck_indexes = ExecInsertIndexTuples(m_local.m_reslot,
                                                 &(((HeapTuple)tuple)->t_self),
