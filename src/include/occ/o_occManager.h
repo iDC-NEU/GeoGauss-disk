@@ -48,10 +48,10 @@ public:
     void CleanUp();
 
 private:
-    uint64_t m_txnCounter;
+    uint64_t m_txnCounter{0};
 
     /** @var aborts counter   */
-    uint64_t m_abortsCounter;
+    uint64_t m_abortsCounter{0};
 
     /** @var Write set size. */
     uint32_t m_writeSetSize;
@@ -63,7 +63,7 @@ private:
 
     bool m_validationNoWait{true};
 
-    bool m_preAbort{false};
+    bool m_preAbort{true};
 
     /** @var 已加锁的 hash 槽代表 sentinel（去重后），用于按序释放 */
     std::vector<occ_sentinel> m_lockedSentinels;

@@ -127,6 +127,7 @@ RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
     if (rc == RC_OK) {
         m_rowsLocked = true;
     } else {
+        m_abortsCounter++;
         if (numSentinelLock > 0) {
             ReleaseHeaderLocks(txMan, numSentinelLock);
         }
@@ -163,10 +164,8 @@ bool OccTransactionManager::PreAbortCheck(O_TxnManager* txMan)
                 break;
         }
 
-        if (m_preAbort) {
-            if (!QuickHeaderValidation(ac)) {
-                return false;
-            }
+        if (!QuickHeaderValidation(ac)) {
+            return false;
         }
         (void)++itr;
     }

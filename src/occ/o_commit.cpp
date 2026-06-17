@@ -32,7 +32,9 @@ void OCCXactCallback(XactEvent event)
         {
             ereport(ERROR,
                     (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-                     errmsg("could not serialize access due to concurrent update")));
+                     errmsg("occ: could not serialize access due to concurrent update"),
+                     errhidestmt(true),
+                     errhidecontext(true)));
         }
     }
     else if (event == XACT_EVENT_RECORD_COMMIT)
