@@ -7,6 +7,7 @@
 
 #include <vector>
 #include "occ/o_sentinel.h"
+#include "occ/occ_stats.h"
 
 class O_TxnManager;
 
@@ -64,6 +65,8 @@ private:
     bool m_validationNoWait{true};
 
     bool m_preAbort{true};
+
+    OccAbortReason m_lastAbortReason{OCC_ABORT_NONE};
 
     /** @var 已加锁的 hash 槽代表 sentinel（去重后），用于按序释放 */
     std::vector<occ_sentinel> m_lockedSentinels;

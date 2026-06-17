@@ -5,6 +5,7 @@
 #include "occ/o_txn.h"
 #include "occ/o_delta_table.h"
 #include "occ/occ_internal.h"
+#include "occ/occ_stats.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -111,12 +112,18 @@ RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
     do {
         /* 1.Perform pre-abort check and pre-processing */
         if (!PreAbortCheck(txMan)) {
+            m_lastAbortReason = OCC_ABORT_PRE_VALIDATION;
+            O_OccStatsRecordAbort(OCC_ABORT_PRE_VALIDATION);
             rc = RC_ABORT;
             break;
         }
 
+        m_lastAbortReason = OCC_ABORT_NONE;
         rc = LockHeaders(txMan, numSentinelLock);
         if (rc != RC_OK) {
+            if (m_lastAbortReason != OCC_ABORT_NONE) {
+                O_OccStatsRecordAbort(m_lastAbortReason);
+            }
             break;
         }
 
@@ -193,6 +200,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
     if (IsInsertOnlyWriteSet(entries)) {
         for (const auto& e : entries) {
             if (!QuickInsertCheck(e.access)) {
+                m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
                 return RC_ABORT;
             }
         }
@@ -223,6 +231,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
             if (!QuickHeaderValidation(e.access)) {
                 ReleaseHeaderLocks(txMan, numSentinelsLock);
                 numSentinelsLock = 0;
+                m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
                 return RC_ABORT;
             }
         }
@@ -237,12 +246,14 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
         if (m_preAbort) {
             for (const auto& e : entries) {
                 if (!QuickHeaderValidation(e.access)) {
+                    m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
                     return RC_ABORT;
                 }
             }
         }
 
         if (sleepTime > OCC_LOCK_TIME_OUT) {
+            m_lastAbortReason = OCC_ABORT_LOCK_TIMEOUT;
             return RC_ABORT;
         }
 

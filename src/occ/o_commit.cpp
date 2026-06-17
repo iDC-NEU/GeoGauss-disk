@@ -3,6 +3,7 @@
 #include "occ/o_csn_manager.h"
 #include "occ/occ_internal.h"
 #include "occ/occ_mem.h"
+#include "occ/occ_stats.h"
 #include "utils/elog.h"
 
 static O_CSNManager csnManager;
@@ -34,6 +35,10 @@ void OCCXactCallback(XactEvent event)
                     (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
                      errmsg("occ: could not serialize access due to concurrent update"),
                      errhidestmt(true)));
+        }
+        else
+        {
+            O_OccStatsRecordCommit();
         }
     }
     else if (event == XACT_EVENT_RECORD_COMMIT)
