@@ -7,6 +7,8 @@
 #include "occ/occ_internal.h"
 #include "occ/occ_stats.h"
 
+#include "utils/rel.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <vector>
@@ -78,9 +80,46 @@ static bool IsInsertOnlyWriteSet(const std::vector<SortedWriteEntry>& entries)
     return true;
 }
 
-static bool OccRelationUsable(Relation relation, Oid relid)
+static Relation O_OpenRelationForValidation(Oid relid, Relation cachedRel, bool* needClose)
 {
-    return relation != nullptr && OidIsValid(relid);
+    *needClose = false;
+    if (cachedRel != nullptr && OidIsValid(relid)) {
+        return cachedRel;
+    }
+    if (!OidIsValid(relid)) {
+        return nullptr;
+    }
+    *needClose = true;
+    return heap_open(relid, RowExclusiveLock);
+}
+
+static void O_CloseRelationIfOpened(Relation rel, bool needClose)
+{
+    if (needClose && rel != nullptr) {
+        heap_close(rel, RowExclusiveLock);
+    }
+}
+
+static bool OccVersionNeedsLatestCheck(O_Access* access, bool preAbortPhase)
+{
+    if (preAbortPhase && (access->m_type == WR || access->m_type == DEL)) {
+        return false;
+    }
+    return true;
+}
+
+static bool OccTupleVersionMatches(O_Access* access, HeapTupleHeader hdr, bool checkLatest)
+{
+    if (hdr == nullptr) {
+        return false;
+    }
+    if (access->m_csn != hdr->m_rowCSN) {
+        return false;
+    }
+    if (checkLatest && !hdr->is_latest) {
+        return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -171,7 +210,9 @@ bool OccTransactionManager::PreAbortCheck(O_TxnManager* txMan)
                 break;
         }
 
-        if (!QuickHeaderValidation(ac)) {
+        m_lastPreAbortFailReason = OCC_PRE_FAIL_UNKNOWN;
+        if (!QuickHeaderValidation(ac, true)) {
+            O_OccStatsRecordPreAbortDetail(m_lastPreAbortFailReason);
             return false;
         }
         (void)++itr;
@@ -199,7 +240,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
      */
     if (IsInsertOnlyWriteSet(entries)) {
         for (const auto& e : entries) {
-            if (!QuickInsertCheck(e.access)) {
+            if (!QuickInsertCheck(e.access, false)) {
                 m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
                 return RC_ABORT;
             }
@@ -264,64 +305,95 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
     }
 }
 
-bool OccTransactionManager::QuickHeaderValidation(O_Access* access)
+bool OccTransactionManager::QuickHeaderValidation(O_Access* access, bool preAbortPhase)
 {
     if (access->m_type != INS) {
-        return QuickVersionCheck(access);
-    } else {
-        return QuickInsertCheck(access);
+        return QuickVersionCheck(access, preAbortPhase);
     }
+    return QuickInsertCheck(access, preAbortPhase);
 }
 
-bool OccTransactionManager::QuickInsertCheck(O_Access* access)
+bool OccTransactionManager::QuickInsertCheck(O_Access* access, bool preAbortPhase)
 {
+    (void)preAbortPhase;
+
+    auto notePreFail = [&](OccPreAbortFailReason reason) {
+        if (preAbortPhase) {
+            m_lastPreAbortFailReason = reason;
+        }
+    };
+
     /* INSERT 优先用事务内本地副本校验，避免提交时 Relation 已失效 */
     if (access->m_localInsertRow != nullptr && access->m_localInsertRow->t_data != nullptr) {
-        return (access->m_csn == access->m_localInsertRow->t_data->m_rowCSN);
+        if (access->m_csn == access->m_localInsertRow->t_data->m_rowCSN) {
+            return true;
+        }
+        notePreFail(OCC_PRE_FAIL_CSN);
+        return false;
     }
 
     occ_sentinel sent = access->m_origSentinel;
     HeapTupleData tuple;
-
-    if (g_enable_occ_delta)
-    {
-        O_DeltaEntry deltaEntry;
-        if (O_DeltaTable::Instance().Lookup(sent.relation, &sent.tuple_id, deltaEntry))
-        {
-            if (deltaEntry.deleted || deltaEntry.tuple == nullptr)
-            {
-                return false;
-            }
-            tuple = *deltaEntry.tuple;
-            return (access->m_csn == tuple.t_data->m_rowCSN);
-        }
-    }
-
-    if (!OccRelationUsable(sent.relation, sent.relid)) {
+    bool relClosed = false;
+    Relation rel = O_OpenRelationForValidation(sent.relid, sent.relation, &relClosed);
+    if (rel == nullptr) {
+        notePreFail(OCC_PRE_FAIL_RELATION);
         return false;
     }
 
-    Buffer buffer = ReadBuffer(sent.relation, ItemPointerGetBlockNumber(&sent.tuple_id));
+    if (g_enable_occ_delta) {
+        O_DeltaEntry deltaEntry;
+        if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
+            if (deltaEntry.deleted || deltaEntry.tuple == nullptr) {
+                notePreFail(OCC_PRE_FAIL_INSERT);
+                O_CloseRelationIfOpened(rel, relClosed);
+                return false;
+            }
+            tuple = *deltaEntry.tuple;
+            bool ok = (access->m_csn == tuple.t_data->m_rowCSN);
+            if (!ok) {
+                notePreFail(OCC_PRE_FAIL_CSN);
+            }
+            O_CloseRelationIfOpened(rel, relClosed);
+            return ok;
+        }
+    }
+
+    Buffer buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(&sent.tuple_id));
     LockBuffer(buffer, BUFFER_LOCK_SHARE);
-    sent.GetData(&tuple, buffer);
+    occ_sentinel readSent = sent;
+    readSent.relation = rel;
+    readSent.GetData(&tuple, buffer);
 
-    bool result = (tuple.t_data != nullptr) && (access->m_csn == tuple.t_data->m_rowCSN);
+    bool ok = (tuple.t_data != nullptr) && (access->m_csn == tuple.t_data->m_rowCSN);
+    if (!ok) {
+        notePreFail(tuple.t_data == nullptr ? OCC_PRE_FAIL_INSERT : OCC_PRE_FAIL_CSN);
+    }
+
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-
     ReleaseBuffer(buffer);
+    O_CloseRelationIfOpened(rel, relClosed);
 
-    return result;
+    return ok;
 }
 
-bool OccTransactionManager::QuickVersionCheck(O_Access* access)
+bool OccTransactionManager::QuickVersionCheck(O_Access* access, bool preAbortPhase)
 {
+    const bool checkLatest = OccVersionNeedsLatestCheck(access, preAbortPhase);
+
+    auto notePreFail = [&](OccPreAbortFailReason reason) {
+        if (preAbortPhase) {
+            m_lastPreAbortFailReason = reason;
+        }
+    };
+
     if (access->m_type != WR && access->m_type != DEL) {
         HeapTuple localTuple = access->GetLocalVersion();
         if (localTuple == nullptr) {
             localTuple = access->m_globalRow;
         }
         if (localTuple != nullptr && localTuple->t_data != nullptr) {
-            if ((access->m_csn == localTuple->t_data->m_rowCSN) && (localTuple->t_data->is_latest)) {
+            if (OccTupleVersionMatches(access, localTuple->t_data, checkLatest)) {
                 return true;
             }
         }
@@ -329,37 +401,57 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access)
 
     occ_sentinel sent = access->m_origSentinel;
     HeapTupleData tuple;
-
-    if (g_enable_occ_delta)
-    {
-        O_DeltaEntry deltaEntry;
-        if (O_DeltaTable::Instance().Lookup(sent.relation, &sent.tuple_id, deltaEntry))
-        {
-            if (deltaEntry.deleted || deltaEntry.tuple == nullptr)
-            {
-                return false;
-            }
-            tuple = *deltaEntry.tuple;
-            return ((access->m_csn == tuple.t_data->m_rowCSN) && (tuple.t_data->is_latest));
-        }
-    }
-
-    if (!OccRelationUsable(sent.relation, sent.relid)) {
+    bool relClosed = false;
+    Relation rel = O_OpenRelationForValidation(sent.relid, sent.relation, &relClosed);
+    if (rel == nullptr) {
+        notePreFail(OCC_PRE_FAIL_RELATION);
         return false;
     }
 
-    Buffer buffer = ReadBuffer(sent.relation, ItemPointerGetBlockNumber(&sent.tuple_id));
+    if (g_enable_occ_delta) {
+        O_DeltaEntry deltaEntry;
+        if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
+            if (deltaEntry.deleted || deltaEntry.tuple == nullptr) {
+                notePreFail(OCC_PRE_FAIL_CSN);
+                O_CloseRelationIfOpened(rel, relClosed);
+                return false;
+            }
+            tuple = *deltaEntry.tuple;
+            bool ok = OccTupleVersionMatches(access, tuple.t_data, checkLatest);
+            if (!ok) {
+                if (tuple.t_data != nullptr && access->m_csn == tuple.t_data->m_rowCSN && checkLatest &&
+                    !tuple.t_data->is_latest) {
+                    notePreFail(OCC_PRE_FAIL_NOT_LATEST);
+                } else {
+                    notePreFail(OCC_PRE_FAIL_CSN);
+                }
+            }
+            O_CloseRelationIfOpened(rel, relClosed);
+            return ok;
+        }
+    }
+
+    Buffer buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(&sent.tuple_id));
     LockBuffer(buffer, BUFFER_LOCK_SHARE);
-    sent.GetData(&tuple, buffer);
+    occ_sentinel readSent = sent;
+    readSent.relation = rel;
+    readSent.GetData(&tuple, buffer);
 
-    bool result = (tuple.t_data != nullptr) &&
-                  (access->m_csn == tuple.t_data->m_rowCSN) &&
-                  (tuple.t_data->is_latest);
+    bool ok = OccTupleVersionMatches(access, tuple.t_data, checkLatest);
+    if (!ok) {
+        if (tuple.t_data != nullptr && access->m_csn == tuple.t_data->m_rowCSN && checkLatest &&
+            !tuple.t_data->is_latest) {
+            notePreFail(OCC_PRE_FAIL_NOT_LATEST);
+        } else {
+            notePreFail(OCC_PRE_FAIL_CSN);
+        }
+    }
+
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-
     ReleaseBuffer(buffer);
+    O_CloseRelationIfOpened(rel, relClosed);
 
-    return result;
+    return ok;
 }
 
 bool OccTransactionManager::ValidateWriteSet(O_TxnManager* txMan)

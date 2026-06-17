@@ -12,8 +12,18 @@ enum OccAbortReason {
     OCC_ABORT_LOCK_TIMEOUT,     /* TryLock 自旋超时 */
 };
 
+/* PreAbortCheck 失败子类（仅 abort_pre_validation 时累加） */
+enum OccPreAbortFailReason {
+    OCC_PRE_FAIL_UNKNOWN = 0,
+    OCC_PRE_FAIL_RELATION,      /* 无法打开 relation */
+    OCC_PRE_FAIL_CSN,           /* 全局 m_rowCSN 与事务内快照不一致 */
+    OCC_PRE_FAIL_NOT_LATEST,    /* is_latest 为 false */
+    OCC_PRE_FAIL_INSERT,        /* INSERT 行校验失败 */
+};
+
 void O_OccStatsRecordCommit();
 void O_OccStatsRecordAbort(OccAbortReason reason);
+void O_OccStatsRecordPreAbortDetail(OccPreAbortFailReason reason);
 
 /* 将当前累计计数写入 pg_log（LOG 级别，前缀 OCC_STATS） */
 void O_OccStatsLogSummary();

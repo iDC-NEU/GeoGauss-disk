@@ -23,13 +23,13 @@ public:
     bool PreAbortCheck(O_TxnManager* txMan);
 
     /** @brief Validate Header for insert   */
-    bool QuickHeaderValidation(O_Access* access);
+    bool QuickHeaderValidation(O_Access* access, bool preAbortPhase = false);
 
     /** @brief Perform validation of current access   */
-    bool QuickVersionCheck(O_Access* access);
+    bool QuickVersionCheck(O_Access* access, bool preAbortPhase = false);
 
     /** @brief Perform validation of current access   */
-    bool QuickInsertCheck(O_Access* access);
+    bool QuickInsertCheck(O_Access* access, bool preAbortPhase = false);
 
     /** @brief Lock all keys   */
     RC LockHeaders(O_TxnManager* txMan, uint32_t& numSentinelsLock);
@@ -67,6 +67,8 @@ private:
     bool m_preAbort{true};
 
     OccAbortReason m_lastAbortReason{OCC_ABORT_NONE};
+
+    OccPreAbortFailReason m_lastPreAbortFailReason{OCC_PRE_FAIL_UNKNOWN};
 
     /** @var 已加锁的 hash 槽代表 sentinel（去重后），用于按序释放 */
     std::vector<occ_sentinel> m_lockedSentinels;
