@@ -33,6 +33,7 @@
 
 //HCJ ADDBY
 #include "occ/o_executor.h"
+#include "occ/occ_internal.h"
 
 static IndexScanDesc hbkt_idx_beginscan(Relation heapRelation,
     Relation indexRelation,
@@ -647,9 +648,12 @@ HeapTuple scan_handler_idx_getnext(IndexScanDesc scan, ScanDirection direction, 
 //        HCJ ADDBY
         bool enable_occ = true;
         if (enable_occ) {
+            if (!O_TxnHasActiveWriteSet()) {
+                return (HeapTuple)index_getnext(scan, direction, has_cur_xact_write);
+            }
             return (HeapTuple)O_index_getnext(scan, direction, has_cur_xact_write);
         }
-        else return (HeapTuple)index_getnext(scan, direction, has_cur_xact_write);
+        return (HeapTuple)index_getnext(scan, direction, has_cur_xact_write);
     }
 }
 

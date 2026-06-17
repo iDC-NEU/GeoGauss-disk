@@ -102,6 +102,20 @@ HeapTuple O_TxnManager::RowLookup(const AccessType type, occ_sentinel const &ori
     case RC::RC_LOCAL_ROW_FOUND:
         break;
     case RC::RC_LOCAL_ROW_NOT_FOUND:
+        /*
+         * 纯读且写集未命中：不拷贝进 hash，避免 Payment 等「先 UPDATE 再 SELECT」
+         * 对无关行重复 IndexFetchTuple + heap_copytuple（off-CPU 主要热点）。
+         */
+        if (type == AccessType::RD && !g_enable_occ_delta) {
+            if (scan != nullptr) {
+                Tuple tuple = IndexFetchTuple(scan, nullptr);
+                return (HeapTuple)tuple;
+            }
+            if (heap_tuple != nullptr) {
+                return heap_tuple;
+            }
+            return nullptr;
+        }
         local_row = m_accessMgr->MapRowtoLocalTable(type, originalSentinel, rc, scan, heap_tuple);
         break;
     case RC::RC_LOCAL_ROW_NOT_VISIBLE:

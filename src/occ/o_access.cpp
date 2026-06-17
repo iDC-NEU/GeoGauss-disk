@@ -86,10 +86,9 @@ void O_Access::WriteGlobalChanges(uint64_t csn)
             cid = GetCurrentCommandId(false);
         }
         O_heap_delete(rel, &m_origSentinel.tuple_id, cid, csn);
-        break;
-    }
         O_MirrorToDelta(this, nullptr, csn, true);
         break;
+    }
     case INS: {
         HeapTuple insTuple = m_localInsertRow ? m_localInsertRow : m_localRow;
         if (insTuple != nullptr && insTuple->t_data != nullptr) {
