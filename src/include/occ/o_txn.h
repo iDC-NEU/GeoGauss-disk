@@ -69,8 +69,17 @@ public:
 
     inline void Cleanup();
 
+    Relation GetCachedRelation(Oid relid, Relation hint, bool *needClose);
+    void ReleaseCachedRelations();
+
 private:
+    static constexpr uint32_t OCC_REL_CACHE_MAX = 16;
+
     uint32_t m_internalStmtCount;
+
+    Oid m_cachedRelids[OCC_REL_CACHE_MAX];
+    Relation m_cachedRels[OCC_REL_CACHE_MAX];
+    uint32_t m_cachedRelCnt;
 
     void CommitInternal();
 

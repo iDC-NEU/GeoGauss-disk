@@ -7,18 +7,17 @@
 
 enum OccAbortReason {
     OCC_ABORT_NONE = 0,
-    OCC_ABORT_PRE_VALIDATION,   /* PreAbortCheck 阶段 CSN/版本校验失败 */
+    OCC_ABORT_PRE_VALIDATION,   /* PreAbortCheck 阶段失败（当前仅写集整理异常） */
     OCC_ABORT_LOCK_VERSION,     /* LockHeaders 阶段版本校验失败 */
     OCC_ABORT_LOCK_TIMEOUT,     /* TryLock 自旋超时 */
 };
 
-/* PreAbortCheck 失败子类（仅 abort_pre_validation 时累加） */
 enum OccPreAbortFailReason {
     OCC_PRE_FAIL_UNKNOWN = 0,
-    OCC_PRE_FAIL_RELATION,      /* 无法打开 relation */
-    OCC_PRE_FAIL_CSN,           /* 全局 m_rowCSN 与事务内快照不一致 */
-    OCC_PRE_FAIL_NOT_LATEST,    /* is_latest 为 false */
-    OCC_PRE_FAIL_INSERT,        /* INSERT 行校验失败 */
+    OCC_PRE_FAIL_RELATION,
+    OCC_PRE_FAIL_CSN,
+    OCC_PRE_FAIL_NOT_LATEST,
+    OCC_PRE_FAIL_INSERT,
 };
 
 void O_OccStatsRecordCommit();
@@ -27,5 +26,8 @@ void O_OccStatsRecordPreAbortDetail(OccPreAbortFailReason reason);
 
 /* 将当前累计计数写入 pg_log（LOG 级别，前缀 OCC_STATS） */
 void O_OccStatsLogSummary();
+
+/* 默认 false：不在 abort 热路径打 LOG；true 时每次 abort 打一行 */
+extern bool g_occ_enable_stats_log;
 
 #endif  // OPENGAUSS_OCC_STATS_H

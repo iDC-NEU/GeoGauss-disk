@@ -8,6 +8,8 @@
 
 #include <atomic>
 
+bool g_occ_enable_stats_log = false;
+
 static std::atomic<uint64_t> g_occStatCommits{0};
 static std::atomic<uint64_t> g_occStatAbortPre{0};
 static std::atomic<uint64_t> g_occStatAbortLockVer{0};
@@ -18,6 +20,8 @@ static std::atomic<uint64_t> g_occStatPreFailCsn{0};
 static std::atomic<uint64_t> g_occStatPreFailNotLatest{0};
 static std::atomic<uint64_t> g_occStatPreFailInsert{0};
 static std::atomic<uint64_t> g_occStatPreFailUnknown{0};
+
+static constexpr uint64_t OCC_STATS_LOG_INTERVAL = 1024;
 
 void O_OccStatsRecordCommit()
 {
@@ -65,18 +69,25 @@ void O_OccStatsRecordPreAbortDetail(OccPreAbortFailReason reason)
 
 void O_OccStatsRecordAbort(OccAbortReason reason)
 {
+    uint64_t totalAborts = 0;
+
     switch (reason) {
         case OCC_ABORT_PRE_VALIDATION:
-            g_occStatAbortPre.fetch_add(1, std::memory_order_relaxed);
+            totalAborts = g_occStatAbortPre.fetch_add(1, std::memory_order_relaxed) + 1;
             break;
         case OCC_ABORT_LOCK_VERSION:
-            g_occStatAbortLockVer.fetch_add(1, std::memory_order_relaxed);
+            totalAborts = g_occStatAbortLockVer.fetch_add(1, std::memory_order_relaxed) + 1;
             break;
         case OCC_ABORT_LOCK_TIMEOUT:
-            g_occStatAbortLockTo.fetch_add(1, std::memory_order_relaxed);
+            totalAborts = g_occStatAbortLockTo.fetch_add(1, std::memory_order_relaxed) + 1;
             break;
         default:
             break;
     }
-    O_OccStatsLogSummary();
+
+    if (g_occ_enable_stats_log) {
+        O_OccStatsLogSummary();
+    } else if (totalAborts > 0 && (totalAborts % OCC_STATS_LOG_INTERVAL) == 0) {
+        O_OccStatsLogSummary();
+    }
 }

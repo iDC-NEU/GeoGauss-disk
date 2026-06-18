@@ -5,24 +5,16 @@
 #ifndef OPENGAUSS_O_TXN_ACCESS_H
 #define OPENGAUSS_O_TXN_ACCESS_H
 
-#include <unordered_map>
 #include "occ/o_txn_insert_action.h"
 #include "occ/o_sentinel.h"
 #include "occ/o_access.h"
 #include "occ/occ_mem.h"
-class O_TxnManager;
 
-struct OccSentinelHash
-{
-    size_t operator()(const occ_sentinel &s) const noexcept
-    {
-        return (size_t)sentinel_hash(s.relid, &s.tuple_id);
-    }
-};
+class O_TxnManager;
 
 struct OccSentinelEqual
 {
-    bool operator()(const occ_sentinel &a, const occ_sentinel &b) const noexcept
+    static bool Match(const occ_sentinel &a, const occ_sentinel &b) noexcept
     {
         return a.relid == b.relid &&
                a.tuple_id.ip_blkid.bi_hi == b.tuple_id.ip_blkid.bi_hi &&
@@ -31,13 +23,11 @@ struct OccSentinelEqual
     }
 };
 
-typedef std::unordered_map<occ_sentinel, O_Access *, OccSentinelHash, OccSentinelEqual> O_TxnOrderedSet_t;
-
-typedef std::pair<occ_sentinel, O_Access *> O_RowAccessPair_t;
-
 class O_TxnAccess
 {
 public:
+    static constexpr uint32_t OCC_WRITE_SET_MAX = 32;
+
     O_TxnAccess();
 
     ~O_TxnAccess();
@@ -56,15 +46,26 @@ public:
 
     bool ReallocAccessSet();
 
-    inline O_TxnOrderedSet_t &GetOrderedRowSet()
-    {
-        return *m_rowsSet;
-    }
-
     inline uint32_t m_Size() const
     {
-        return m_rowCnt;
+        return m_writeSetCnt;
     }
+
+    template <typename Fn>
+    void ForEachWriteEntry(Fn &&fn) const
+    {
+        for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
+            if (m_writeSet[i].occupied) {
+                fn(m_writeSet[i].key, m_writeSet[i].access);
+            }
+        }
+    }
+
+    bool WriteSetInsert(const occ_sentinel &key, O_Access *access);
+    O_Access *WriteSetFind(const occ_sentinel &key) const;
+    bool WriteSetErase(const occ_sentinel &key);
+    void WriteSetRemoveReadEntries();
+    void WriteSetClear();
 
     HeapTuple MapRowtoLocalTable(const AccessType type, occ_sentinel const &originalSentinel, RC &rc, IndexScanDesc scan, HeapTuple heap_tuple = nullptr);
 
@@ -73,7 +74,6 @@ public:
     O_Access *AllocNewAccess(uint32_t rowCnt)
     {
         void *buffer = occ_malloc(sizeof(O_Access));
-//        void *buffer = palloc(sizeof(O_Access));
         O_Access *ac = new (buffer) O_Access();
         return ac;
     }
@@ -138,11 +138,18 @@ public:
     }
 
 private:
-    static constexpr uint32_t DEFAULT_ACCESS_SIZE = 500;
+    static constexpr uint32_t DEFAULT_ACCESS_SIZE = 64;
 
     static constexpr uint32_t ACCESS_SET_EXTEND_FACTOR = 2;
 
-    O_TxnOrderedSet_t *m_rowsSet = nullptr;
+    struct WriteSetSlot {
+        occ_sentinel key;
+        O_Access *access;
+        bool occupied;
+    };
+
+    WriteSetSlot m_writeSet[OCC_WRITE_SET_MAX];
+    uint32_t m_writeSetCnt;
 
     O_TxnInsertAction *m_insertManager = nullptr;
 

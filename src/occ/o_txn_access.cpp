@@ -122,35 +122,112 @@ static FORCE_INLINE
 //}
 
 O_TxnAccess::O_TxnAccess()
-    : m_rowCnt(0),
+    : m_writeSetCnt(0),
+      m_rowCnt(0),
       m_accessesSetBuff(nullptr),
       m_txnManager(nullptr),
       m_insertManager(nullptr),
       m_lastAcc(nullptr)
 {
+    for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
+        m_writeSet[i].occupied = false;
+        m_writeSet[i].access = nullptr;
+    }
 }
 
 O_TxnAccess::~O_TxnAccess()
 {
-    if (m_rowsSet)
-    {
-        delete m_rowsSet;
-    }
     if (m_insertManager)
     {
         delete m_insertManager;
     }
 
-    if (m_accessesSetBuff)
-    {
-//        occ_free(m_accessesSetBuff);
-    }
-
     m_txnManager = nullptr;
     m_insertManager = nullptr;
     m_accessesSetBuff = nullptr;
-    m_rowsSet = nullptr;
     m_lastAcc = nullptr;
+}
+
+bool O_TxnAccess::WriteSetInsert(const occ_sentinel &key, O_Access *access)
+{
+    O_Access *existing = WriteSetFind(key);
+    if (existing != nullptr) {
+        return true;
+    }
+
+    for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
+        if (!m_writeSet[i].occupied) {
+            m_writeSet[i].key = key;
+            m_writeSet[i].access = access;
+            m_writeSet[i].occupied = true;
+            m_writeSetCnt++;
+            return true;
+        }
+    }
+    return false;
+}
+
+O_Access *O_TxnAccess::WriteSetFind(const occ_sentinel &key) const
+{
+    for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
+        if (m_writeSet[i].occupied && OccSentinelEqual::Match(m_writeSet[i].key, key)) {
+            return m_writeSet[i].access;
+        }
+    }
+    return nullptr;
+}
+
+bool O_TxnAccess::WriteSetErase(const occ_sentinel &key)
+{
+    for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
+        if (m_writeSet[i].occupied && OccSentinelEqual::Match(m_writeSet[i].key, key)) {
+            m_writeSet[i].occupied = false;
+            m_writeSet[i].access = nullptr;
+            uint32_t cnt = 0;
+            for (uint32_t j = 0; j < OCC_WRITE_SET_MAX; ++j) {
+                if (m_writeSet[j].occupied) {
+                    cnt++;
+                }
+            }
+            m_writeSetCnt = cnt;
+            return true;
+        }
+    }
+    return false;
+}
+
+void O_TxnAccess::WriteSetRemoveReadEntries()
+{
+    for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
+        if (!m_writeSet[i].occupied) {
+            continue;
+        }
+        O_Access *ac = m_writeSet[i].access;
+        if (ac == nullptr) {
+            continue;
+        }
+        if (ac->m_type == RD || ac->m_type == RD_FOR_UPDATE) {
+            m_writeSet[i].occupied = false;
+            m_writeSet[i].access = nullptr;
+        }
+    }
+
+    uint32_t cnt = 0;
+    for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
+        if (m_writeSet[i].occupied) {
+            cnt++;
+        }
+    }
+    m_writeSetCnt = cnt;
+}
+
+void O_TxnAccess::WriteSetClear()
+{
+    for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
+        m_writeSet[i].occupied = false;
+        m_writeSet[i].access = nullptr;
+    }
+    m_writeSetCnt = 0;
 }
 
 bool O_TxnAccess::Init(O_TxnManager *manager)
@@ -173,22 +250,15 @@ bool O_TxnAccess::Init(O_TxnManager *manager)
         m_accessesSetBuff[idx] = nullptr;
     }
 
-    m_rowsSet = new (std::nothrow) O_TxnOrderedSet_t();
-    if (!m_rowsSet)
-    {
-        OccLogMemoryAllocationFailure(__FUNCTION__, __FILE__, __LINE__, sizeof(O_TxnOrderedSet_t));
-        free(ptr);
-        return false;
-    }
     m_insertManager = new (std::nothrow) O_TxnInsertAction();
     if (!m_insertManager)
     {
         OccLogMemoryAllocationFailure(__FUNCTION__, __FILE__, __LINE__, sizeof(O_TxnInsertAction));
-        delete m_rowsSet;
         free(ptr);
         return false;
     }
     m_insertManager->Init(manager);
+    WriteSetClear();
     return true;
 }
 
@@ -196,14 +266,12 @@ HeapTuple O_TxnAccess::AddInsertToLocalAccess(occ_sentinel org_sentinel, HeapTup
 {
     O_Access *curr_access = nullptr;
 
-    // Search key from the unordered_map
-    auto search = m_rowsSet->find(org_sentinel);
-    if (likely(search == m_rowsSet->end()))
+    if (WriteSetFind(org_sentinel) == nullptr)
     {
         curr_access = GetNewInsertAccess(org_sentinel, heap_tuple);
         curr_access->m_origSentinel = org_sentinel;
 
-        auto ret = m_rowsSet->insert(O_RowAccessPair_t(org_sentinel, curr_access));
+        WriteSetInsert(org_sentinel, curr_access);
         return curr_access->GetTxnRow();
     }
     return nullptr;
@@ -227,28 +295,19 @@ O_Access *O_TxnAccess::GetNewInsertAccess(occ_sentinel const &sentinel, HeapTupl
 
 RC O_TxnAccess::AccessLookup(const AccessType type, occ_sentinel const originalSentinel, HeapTuple &r_local_Row)
 {
-    if (m_rowCnt == 0)
+    if (m_writeSetCnt == 0)
     {
         return RC::RC_LOCAL_ROW_NOT_FOUND;
     }
 
-    O_Access *curr_acc = nullptr;
-
-    curr_acc = RowLookup(originalSentinel);
+    O_Access *curr_acc = RowLookup(originalSentinel);
 
     return LookupFilterRow(curr_acc, type, r_local_Row);
 }
 
 O_Access *O_TxnAccess::RowLookup(occ_sentinel const currentKey)
 {
-    O_Access *current_access = nullptr;
-    auto search = m_rowsSet->find(currentKey);
-    if (search != m_rowsSet->end())
-    {
-        current_access = search->second;
-        return current_access;
-    }
-    return nullptr;
+    return WriteSetFind(currentKey);
 }
 
 bool O_TxnAccess::EnsureRowAccessForModify(Relation rel, ItemPointer tid, HeapTuple oldHeapTuple)
@@ -285,7 +344,7 @@ bool O_TxnAccess::EnsureRowAccessForModify(Relation rel, ItemPointer tid, HeapTu
     ac->m_type = RD_FOR_UPDATE;
     ac->m_stmtCount = m_txnManager->GetStmtCount();
 
-    m_rowsSet->insert(O_RowAccessPair_t(sentinel, ac));
+    WriteSetInsert(sentinel, ac);
     m_rowCnt++;
     SetLastAccess(ac);
     return true;
@@ -302,8 +361,7 @@ RC O_TxnAccess::LookupFilterRow(O_Access *curr_acc, const AccessType type, HeapT
             // Cached row is not valid remove it!!
             if (curr_acc->m_stmtCount != m_txnManager->GetStmtCount())
             {
-                auto it = m_rowsSet->find(curr_acc->m_origSentinel);
-                auto res = m_rowsSet->erase(it);
+                WriteSetErase(curr_acc->m_origSentinel);
                 return RC::RC_LOCAL_ROW_NOT_FOUND;
             }
             break;
@@ -347,9 +405,7 @@ HeapTuple O_TxnAccess::MapRowtoLocalTable(const AccessType type, occ_sentinel co
 
     current_access->m_type = (type != RD_FOR_UPDATE) ? RD : RD_FOR_UPDATE;
 
-    auto ret = m_rowsSet->insert(O_RowAccessPair_t(originalSentinel, current_access)); // 这里的key目前选择是假的tupleid，与索引对齐
-    // 旧tid可以直接找回，真的tid作为key的意义是什么？
-    //    auto ret = m_rowsSet->insert(O_RowAccessPair_t(current_access->m_origSentinel, current_access)); //这里的key目前选择是真的tupleid，重定向
+    WriteSetInsert(originalSentinel, current_access);
 
     SetLastAccess(current_access);
     current_access->m_stmtCount = m_txnManager->GetStmtCount();
@@ -574,7 +630,7 @@ RC O_TxnAccess::CreateMVCCDraft(O_Access *ac, AccessType acType)
 void O_TxnAccess::ClearSet()
 {
     m_lastAcc = nullptr;
-    m_rowsSet->clear();
+    WriteSetClear();
 
     for (unsigned int i = 0; i < m_rowCnt; i++)
     {

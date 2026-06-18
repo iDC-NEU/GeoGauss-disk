@@ -13,6 +13,11 @@
 
 static Relation O_OpenAccessRelation(O_Access *access, bool *needClose)
 {
+    O_TxnManager *txn = GetTxnManager();
+    if (txn != nullptr) {
+        return txn->GetCachedRelation(access->m_origSentinel.relid, access->m_origSentinel.relation, needClose);
+    }
+
     *needClose = false;
     if (access->m_origSentinel.relation != nullptr && OidIsValid(access->m_origSentinel.relid)) {
         return access->m_origSentinel.relation;

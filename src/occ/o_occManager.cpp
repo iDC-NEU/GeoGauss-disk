@@ -24,31 +24,18 @@ struct SortedWriteEntry {
     occ_sentinel sent;
 };
 
-static void CollectWriteSetByHash(O_TxnOrderedSet_t& orderedSet, std::vector<SortedWriteEntry>& out)
+static void CollectWriteSetByHash(O_TxnAccess* access, std::vector<SortedWriteEntry>& out)
 {
     out.clear();
-    out.reserve(orderedSet.size());
-    for (const auto& raPair : orderedSet) {
-        O_Access* ac = raPair.second;
-        occ_sentinel sent = ac->m_origSentinel;
+    if (access == nullptr) {
+        return;
+    }
+    access->ForEachWriteEntry([&](const occ_sentinel& sent, O_Access* ac) {
         uint64_t h = sentinel_hash(sent.relid, &sent.tuple_id);
         out.push_back({h, ac, sent});
-    }
+    });
     std::sort(out.begin(), out.end(),
               [](const SortedWriteEntry& a, const SortedWriteEntry& b) { return a.hash < b.hash; });
-}
-
-static uint32_t CountUniqueHashes(const std::vector<SortedWriteEntry>& entries)
-{
-    uint32_t count = 0;
-    uint64_t prev = UINT64_MAX;
-    for (const auto& e : entries) {
-        if (e.hash != prev) {
-            count++;
-            prev = e.hash;
-        }
-    }
-    return count;
 }
 
 static uint32_t CountLockableHashes(const std::vector<SortedWriteEntry>& entries)
@@ -80,8 +67,12 @@ static bool IsInsertOnlyWriteSet(const std::vector<SortedWriteEntry>& entries)
     return true;
 }
 
-static Relation O_OpenRelationForValidation(Oid relid, Relation cachedRel, bool* needClose)
+static Relation O_OpenRelationForValidation(O_TxnManager* txMan, Oid relid, Relation cachedRel, bool* needClose)
 {
+    if (txMan != nullptr) {
+        return txMan->GetCachedRelation(relid, cachedRel, needClose);
+    }
+
     *needClose = false;
     if (cachedRel != nullptr && OidIsValid(relid)) {
         return cachedRel;
@@ -98,14 +89,6 @@ static void O_CloseRelationIfOpened(Relation rel, bool needClose)
     if (needClose && rel != nullptr) {
         heap_close(rel, RowExclusiveLock);
     }
-}
-
-static bool OccVersionNeedsLatestCheck(O_Access* access, bool preAbortPhase)
-{
-    if (preAbortPhase && (access->m_type == WR || access->m_type == DEL)) {
-        return false;
-    }
-    return true;
 }
 
 static bool OccTupleVersionMatches(O_Access* access, HeapTupleHeader hdr, bool checkLatest)
@@ -127,13 +110,12 @@ static bool OccTupleVersionMatches(O_Access* access, HeapTupleHeader hdr, bool c
 void OccTransactionManager::WriteChanges(O_TxnManager* txMan)
 {
     uint64_t commit_csn = txMan->GetCommitSequenceNumber();
-    O_TxnOrderedSet_t& orderedSet = txMan->m_accessMgr->GetOrderedRowSet();
+    O_TxnAccess* accessMgr = txMan->m_accessMgr;
 
-    for (const auto& raPair : orderedSet) {
-        O_Access* access = raPair.second;
+    accessMgr->ForEachWriteEntry([&](const occ_sentinel& sent, O_Access* access) {
+        (void)sent;
         access->WriteGlobalChanges(commit_csn);
-    }
-
+    });
 }
 
 RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
@@ -142,14 +124,14 @@ RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
     m_rowsLocked = false;
     O_TxnAccess* txnAccess = txMan->m_accessMgr;
     RC rc = RC_OK;
-    const uint32_t rowCount = txnAccess->m_Size();
 
     m_writeSetSize = 0;
     m_insertSetSize = 0;
     m_txnCounter++;
+    SetActiveTxn(txMan);
 
     do {
-        /* 1.Perform pre-abort check and pre-processing */
+        /* 1. 写集整理：剥离纯读条目，不在此阶段做 heap 校验 */
         if (!PreAbortCheck(txMan)) {
             m_lastAbortReason = OCC_ABORT_PRE_VALIDATION;
             O_OccStatsRecordAbort(OCC_ABORT_PRE_VALIDATION);
@@ -166,8 +148,6 @@ RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
             break;
         }
 
-        /* LockHeaders / insert-only 快速路径已完成逐行校验，无需重复 ValidateWriteSet */
-
     } while (0);
 
     if (rc == RC_OK) {
@@ -180,20 +160,19 @@ RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
         m_rowsLocked = false;
     }
 
+    SetActiveTxn(nullptr);
     return rc;
 }
 
 bool OccTransactionManager::PreAbortCheck(O_TxnManager* txMan)
 {
     O_TxnAccess* tx = txMan->m_accessMgr;
-    O_TxnOrderedSet_t& orderedSet = tx->GetOrderedRowSet();
-    auto itr = orderedSet.begin();
-    while (itr != orderedSet.end()) {
-        O_Access* ac = (*itr).second;
+    tx->WriteSetRemoveReadEntries();
+
+    tx->ForEachWriteEntry([&](const occ_sentinel& sent, O_Access* ac) {
+        (void)sent;
         switch (ac->m_type) {
             case WR:
-                m_writeSetSize++;
-                break;
             case DEL:
                 m_writeSetSize++;
                 break;
@@ -201,22 +180,10 @@ bool OccTransactionManager::PreAbortCheck(O_TxnManager* txMan)
                 m_insertSetSize++;
                 m_writeSetSize++;
                 break;
-            case RD_FOR_UPDATE:
-            case RD:
-                itr = orderedSet.erase(itr);
-                //只验证写集
-                continue;
             default:
                 break;
         }
-
-        m_lastPreAbortFailReason = OCC_PRE_FAIL_UNKNOWN;
-        if (!QuickHeaderValidation(ac, true)) {
-            O_OccStatsRecordPreAbortDetail(m_lastPreAbortFailReason);
-            return false;
-        }
-        (void)++itr;
-    }
+    });
     return true;
 }
 
@@ -224,20 +191,16 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
 {
     uint64_t sleepTime = 1;
     uint64_t thdId = txMan->GetThdId();
-    O_TxnOrderedSet_t& orderedSet = txMan->m_accessMgr->GetOrderedRowSet();
+    O_TxnAccess* accessMgr = txMan->m_accessMgr;
     numSentinelsLock = 0;
     m_lockedSentinels.clear();
 
     std::vector<SortedWriteEntry> entries;
-    CollectWriteSetByHash(orderedSet, entries);
+    CollectWriteSetByHash(accessMgr, entries);
     if (entries.empty()) {
         return RC_OK;
     }
 
-    /*
-     * 纯 INSERT 事务（TPC-C load 批量导入）：行由本事务创建，无需在提交时
-     * 对 heap 加锁或 ReadBuffer；用本地副本校验即可，避免 Relation 失效崩溃。
-     */
     if (IsInsertOnlyWriteSet(entries)) {
         for (const auto& e : entries) {
             if (!QuickInsertCheck(e.access, false)) {
@@ -269,7 +232,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
                 }
             }
 
-            if (!QuickHeaderValidation(e.access)) {
+            if (!QuickHeaderValidation(e.access, false)) {
                 ReleaseHeaderLocks(txMan, numSentinelsLock);
                 numSentinelsLock = 0;
                 m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
@@ -286,7 +249,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
 
         if (m_preAbort) {
             for (const auto& e : entries) {
-                if (!QuickHeaderValidation(e.access)) {
+                if (!QuickHeaderValidation(e.access, false)) {
                     m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
                     return RC_ABORT;
                 }
@@ -317,27 +280,15 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, bool preAbortPhas
 {
     (void)preAbortPhase;
 
-    auto notePreFail = [&](OccPreAbortFailReason reason) {
-        if (preAbortPhase) {
-            m_lastPreAbortFailReason = reason;
-        }
-    };
-
-    /* INSERT 优先用事务内本地副本校验，避免提交时 Relation 已失效 */
     if (access->m_localInsertRow != nullptr && access->m_localInsertRow->t_data != nullptr) {
-        if (access->m_csn == access->m_localInsertRow->t_data->m_rowCSN) {
-            return true;
-        }
-        notePreFail(OCC_PRE_FAIL_CSN);
-        return false;
+        return (access->m_csn == access->m_localInsertRow->t_data->m_rowCSN);
     }
 
     occ_sentinel sent = access->m_origSentinel;
     HeapTupleData tuple;
     bool relClosed = false;
-    Relation rel = O_OpenRelationForValidation(sent.relid, sent.relation, &relClosed);
+    Relation rel = O_OpenRelationForValidation(m_activeTxn, sent.relid, sent.relation, &relClosed);
     if (rel == nullptr) {
-        notePreFail(OCC_PRE_FAIL_RELATION);
         return false;
     }
 
@@ -345,15 +296,11 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, bool preAbortPhas
         O_DeltaEntry deltaEntry;
         if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
             if (deltaEntry.deleted || deltaEntry.tuple == nullptr) {
-                notePreFail(OCC_PRE_FAIL_INSERT);
                 O_CloseRelationIfOpened(rel, relClosed);
                 return false;
             }
             tuple = *deltaEntry.tuple;
             bool ok = (access->m_csn == tuple.t_data->m_rowCSN);
-            if (!ok) {
-                notePreFail(OCC_PRE_FAIL_CSN);
-            }
             O_CloseRelationIfOpened(rel, relClosed);
             return ok;
         }
@@ -366,9 +313,6 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, bool preAbortPhas
     readSent.GetData(&tuple, buffer);
 
     bool ok = (tuple.t_data != nullptr) && (access->m_csn == tuple.t_data->m_rowCSN);
-    if (!ok) {
-        notePreFail(tuple.t_data == nullptr ? OCC_PRE_FAIL_INSERT : OCC_PRE_FAIL_CSN);
-    }
 
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
     ReleaseBuffer(buffer);
@@ -379,13 +323,8 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, bool preAbortPhas
 
 bool OccTransactionManager::QuickVersionCheck(O_Access* access, bool preAbortPhase)
 {
-    const bool checkLatest = OccVersionNeedsLatestCheck(access, preAbortPhase);
-
-    auto notePreFail = [&](OccPreAbortFailReason reason) {
-        if (preAbortPhase) {
-            m_lastPreAbortFailReason = reason;
-        }
-    };
+    (void)preAbortPhase;
+    const bool checkLatest = true;
 
     if (access->m_type != WR && access->m_type != DEL) {
         HeapTuple localTuple = access->GetLocalVersion();
@@ -402,9 +341,8 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, bool preAbortPha
     occ_sentinel sent = access->m_origSentinel;
     HeapTupleData tuple;
     bool relClosed = false;
-    Relation rel = O_OpenRelationForValidation(sent.relid, sent.relation, &relClosed);
+    Relation rel = O_OpenRelationForValidation(m_activeTxn, sent.relid, sent.relation, &relClosed);
     if (rel == nullptr) {
-        notePreFail(OCC_PRE_FAIL_RELATION);
         return false;
     }
 
@@ -412,20 +350,11 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, bool preAbortPha
         O_DeltaEntry deltaEntry;
         if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
             if (deltaEntry.deleted || deltaEntry.tuple == nullptr) {
-                notePreFail(OCC_PRE_FAIL_CSN);
                 O_CloseRelationIfOpened(rel, relClosed);
                 return false;
             }
             tuple = *deltaEntry.tuple;
             bool ok = OccTupleVersionMatches(access, tuple.t_data, checkLatest);
-            if (!ok) {
-                if (tuple.t_data != nullptr && access->m_csn == tuple.t_data->m_rowCSN && checkLatest &&
-                    !tuple.t_data->is_latest) {
-                    notePreFail(OCC_PRE_FAIL_NOT_LATEST);
-                } else {
-                    notePreFail(OCC_PRE_FAIL_CSN);
-                }
-            }
             O_CloseRelationIfOpened(rel, relClosed);
             return ok;
         }
@@ -438,14 +367,6 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, bool preAbortPha
     readSent.GetData(&tuple, buffer);
 
     bool ok = OccTupleVersionMatches(access, tuple.t_data, checkLatest);
-    if (!ok) {
-        if (tuple.t_data != nullptr && access->m_csn == tuple.t_data->m_rowCSN && checkLatest &&
-            !tuple.t_data->is_latest) {
-            notePreFail(OCC_PRE_FAIL_NOT_LATEST);
-        } else {
-            notePreFail(OCC_PRE_FAIL_CSN);
-        }
-    }
 
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
     ReleaseBuffer(buffer);
@@ -456,14 +377,15 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, bool preAbortPha
 
 bool OccTransactionManager::ValidateWriteSet(O_TxnManager* txMan)
 {
-    O_TxnOrderedSet_t& orderedSet = txMan->m_accessMgr->GetOrderedRowSet();
-    for (const auto& raPair : orderedSet) {
-        O_Access* ac = raPair.second;
-        if (!QuickHeaderValidation(ac)) {
-            return false;
+    O_TxnAccess* accessMgr = txMan->m_accessMgr;
+    bool ok = true;
+    accessMgr->ForEachWriteEntry([&](const occ_sentinel& sent, O_Access* ac) {
+        (void)sent;
+        if (ok && !QuickHeaderValidation(ac, false)) {
+            ok = false;
         }
-    }
-    return true;
+    });
+    return ok;
 }
 
 void OccTransactionManager::ReleaseHeaderLocks(O_TxnManager* txMan, uint32_t numOfLocks)
@@ -489,4 +411,5 @@ void OccTransactionManager::CleanUp()
     m_writeSetSize = 0;
     m_insertSetSize = 0;
     m_lockedSentinels.clear();
+    SetActiveTxn(nullptr);
 }

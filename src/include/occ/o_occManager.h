@@ -48,7 +48,13 @@ public:
 
     void CleanUp();
 
+    void SetActiveTxn(O_TxnManager *txn)
+    {
+        m_activeTxn = txn;
+    }
+
 private:
+    O_TxnManager *m_activeTxn{nullptr};
     uint64_t m_txnCounter{0};
 
     /** @var aborts counter   */

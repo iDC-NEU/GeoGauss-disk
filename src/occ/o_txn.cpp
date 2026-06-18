@@ -6,11 +6,14 @@
 #include "occ/o_txn.h"
 #include "occ/occ_internal.h"
 
+#include "utils/rel.h"
+
 O_TxnManager::O_TxnManager(bool global)
     : m_threadId((uint64_t)-1),
       m_occManager(),
       m_csn(INVALID_CSN),
       m_internalStmtCount(0),
+      m_cachedRelCnt(0),
       m_global(global)
 {
 }
@@ -243,6 +246,8 @@ void O_TxnManager::RollbackInternal(bool isPrepared)
 
 inline void O_TxnManager::Cleanup()
 {
+    ReleaseCachedRelations();
+
     if (m_accessMgr != nullptr) {
         m_accessMgr->ClearSet();
     }
@@ -251,4 +256,44 @@ inline void O_TxnManager::Cleanup()
     m_internalStmtCount = 0;
     m_occManager.CleanUp();
     /* 保留 txn_manager 供会话内复用，勿置 NULL（旧版 palloc 方案会随上下文回收悬空） */
+}
+
+Relation O_TxnManager::GetCachedRelation(Oid relid, Relation hint, bool *needClose)
+{
+    *needClose = false;
+    if (hint != nullptr && OidIsValid(relid)) {
+        return hint;
+    }
+    if (!OidIsValid(relid)) {
+        return nullptr;
+    }
+
+    for (uint32_t i = 0; i < m_cachedRelCnt; ++i) {
+        if (m_cachedRelids[i] == relid) {
+            return m_cachedRels[i];
+        }
+    }
+
+    if (m_cachedRelCnt < OCC_REL_CACHE_MAX) {
+        Relation rel = heap_open(relid, RowExclusiveLock);
+        m_cachedRelids[m_cachedRelCnt] = relid;
+        m_cachedRels[m_cachedRelCnt] = rel;
+        m_cachedRelCnt++;
+        return rel;
+    }
+
+    *needClose = true;
+    return heap_open(relid, RowExclusiveLock);
+}
+
+void O_TxnManager::ReleaseCachedRelations()
+{
+    for (uint32_t i = 0; i < m_cachedRelCnt; ++i) {
+        if (m_cachedRels[i] != nullptr) {
+            heap_close(m_cachedRels[i], RowExclusiveLock);
+            m_cachedRels[i] = nullptr;
+            m_cachedRelids[i] = InvalidOid;
+        }
+    }
+    m_cachedRelCnt = 0;
 }
