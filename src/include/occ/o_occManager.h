@@ -23,13 +23,13 @@ public:
     bool PreAbortCheck(O_TxnManager* txMan);
 
     /** @brief Validate Header for insert   */
-    bool QuickHeaderValidation(O_Access* access, bool preAbortPhase = false);
+    bool QuickHeaderValidation(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase = false);
 
     /** @brief Perform validation of current access   */
-    bool QuickVersionCheck(O_Access* access, bool preAbortPhase = false);
+    bool QuickVersionCheck(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase = false);
 
     /** @brief Perform validation of current access   */
-    bool QuickInsertCheck(O_Access* access, bool preAbortPhase = false);
+    bool QuickInsertCheck(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase = false);
 
     /** @brief Lock all keys   */
     RC LockHeaders(O_TxnManager* txMan, uint32_t& numSentinelsLock);
@@ -70,7 +70,7 @@ private:
 
     bool m_validationNoWait{true};
 
-    bool m_preAbort{true};
+    bool m_preAbort{false};
 
     OccAbortReason m_lastAbortReason{OCC_ABORT_NONE};
 

@@ -2010,8 +2010,11 @@ void EmitErrorReport(void)
     oldcontext = MemoryContextSwitchTo(ErrorContext);
 
     /* Send to server log, if enabled */
-    if (edata->output_to_server && is_errmodule_enable(edata->elevel, edata->mod_id))
+//HCJ ADDBY
+    if (edata->output_to_server && is_errmodule_enable(edata->elevel, edata->mod_id) &&
+        !(edata->onlyfrontmsg && edata->sqlerrcode == ERRCODE_T_R_SERIALIZATION_FAILURE)) {
         send_message_to_server_log(edata);
+    }
 
     /* Send to client, if enabled */
     if (edata->output_to_client) {
@@ -4028,6 +4031,10 @@ void send_message_to_frontend(ErrorData* edata)
         /* get mpp internal errcode */
         if (edata->elevel >= ERROR) {
             if (0 == edata->internalerrcode && edata->filename && edata->lineno > 0) {
+//HCJ ADDBY
+                if (edata->onlyfrontmsg) {
+                    edata->internalerrcode = ERRCODE_SUCCESSFUL_COMPLETION;
+                } else
 #ifdef ENABLE_MOT
                 /*
                  * In case of error from MOT module we skip getting the internal error code,

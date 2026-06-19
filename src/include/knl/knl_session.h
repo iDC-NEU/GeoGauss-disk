@@ -2776,8 +2776,20 @@ typedef struct knl_u_mot_context {
 #endif
 
 //HCJ ADDBY
+#define OCC_ARENA_CHUNK_SIZE ((size_t)(2 * 1024 * 1024))
+#define OCC_ARENA_MAX_CHUNKS 8
+typedef struct OccTxnArena {
+    char *chunks[OCC_ARENA_MAX_CHUNKS];
+    size_t chunk_sizes[OCC_ARENA_MAX_CHUNKS];
+    uint8_t num_chunks;
+    uint8_t active_chunk;
+    size_t offset;
+} OccTxnArena;
+
 typedef struct knl_u_occ_context {
     O_TxnManager* txn_manager;
+//HCJ ADDBY
+    OccTxnArena txn_arena;
 } knl_u_occ_context;
 
 #ifdef USE_SPQ

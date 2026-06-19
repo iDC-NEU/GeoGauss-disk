@@ -876,8 +876,11 @@ bool checkDMLRelation(const Relation rel, const PlannedStmt *plannedstmt, bool i
         RelationInRedistribute(rel) || plannedstmt->hasReturning || RelationIsSubPartitioned(rel)) {
         result = true;
     }
+//HCJ ADDBY
     if (rel->rd_rel->relhastriggers) {
-        if (!u_sess->attr.attr_common.foreign_key_checks) {
+        if (isInsert && CheckIsRIConstraintTrigger(rel->trigdesc)) {
+            /* INSERT with RI-only triggers may use InsertFusion; UPDATE still blocked below. */
+        } else if (!u_sess->attr.attr_common.foreign_key_checks) {
             result = !CheckIsRIConstraintTrigger(rel->trigdesc);
         } else {
             result = true;

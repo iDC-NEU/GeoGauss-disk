@@ -13,20 +13,20 @@
 
 static Relation O_OpenAccessRelation(O_Access *access, bool *needClose)
 {
-    O_TxnManager *txn = GetTxnManager();
-    if (txn != nullptr) {
-        return txn->GetCachedRelation(access->m_origSentinel.relid, access->m_origSentinel.relation, needClose);
-    }
-
-    *needClose = false;
-    if (access->m_origSentinel.relation != nullptr && OidIsValid(access->m_origSentinel.relid)) {
-        return access->m_origSentinel.relation;
-    }
-    if (!OidIsValid(access->m_origSentinel.relid)) {
+    Oid relid = OccResolveAccessRelid(access, nullptr);
+    if (!OidIsValid(relid)) {
+        *needClose = false;
         return nullptr;
     }
+    access->m_origSentinel.relid = relid;
+
+    O_TxnManager *txn = GetTxnManager();
+    if (txn != nullptr) {
+        return txn->GetCachedRelation(relid, nullptr, needClose);
+    }
+
     *needClose = true;
-    return heap_open(access->m_origSentinel.relid, RowExclusiveLock);
+    return heap_open(relid, RowExclusiveLock);
 }
 
 static void O_MirrorToDelta(O_Access *access, HeapTuple tuple, uint64_t csn, bool deleted)
@@ -50,15 +50,30 @@ static void O_MirrorToDelta(O_Access *access, HeapTuple tuple, uint64_t csn, boo
 
 void O_Access::WriteGlobalChanges(uint64_t csn)
 {
+    WriteGlobalChanges(csn, m_origSentinel);
+}
+
+void O_Access::WriteGlobalChanges(uint64_t csn, const occ_sentinel &key)
+{
     if (m_type == RD) {
+        return;
+    }
+
+    Oid relid = InvalidOid;
+    ItemPointerData tid;
+    if (!OccPrepareAccessTarget(this, &key, &relid, &tid)) {
         return;
     }
 
     bool relClosed = false;
     Relation rel = O_OpenAccessRelation(this, &relClosed);
-    if (rel == nullptr) {
+    if (rel == nullptr || !OccTidIsPlausible(&tid, rel)) {
+        if (relClosed && rel != nullptr) {
+            heap_close(rel, RowExclusiveLock);
+        }
         return;
     }
+    m_origSentinel.tuple_id = tid;
 
     /*
      * 始终以 heap 为权威存储落盘；delta 仅作读路径覆盖缓存。

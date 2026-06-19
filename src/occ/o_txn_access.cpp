@@ -150,14 +150,28 @@ O_TxnAccess::~O_TxnAccess()
 
 bool O_TxnAccess::WriteSetInsert(const occ_sentinel &key, O_Access *access)
 {
-    O_Access *existing = WriteSetFind(key);
+    occ_sentinel storeKey = key;
+    if (access != nullptr) {
+        Oid relid = OccResolveAccessRelid(access, &key);
+        if (OidIsValid(relid)) {
+            access->m_origSentinel.relid = relid;
+            storeKey.relid = relid;
+        }
+        ItemPointerData tid = OccResolveAccessTid(access, &key);
+        if (OccTidIsPlausible(&tid)) {
+            access->m_origSentinel.tuple_id = tid;
+            storeKey.tuple_id = tid;
+        }
+    }
+
+    O_Access *existing = WriteSetFind(storeKey);
     if (existing != nullptr) {
         return true;
     }
 
     for (uint32_t i = 0; i < OCC_WRITE_SET_MAX; ++i) {
         if (!m_writeSet[i].occupied) {
-            m_writeSet[i].key = key;
+            m_writeSet[i].key = storeKey;
             m_writeSet[i].access = access;
             m_writeSet[i].occupied = true;
             m_writeSetCnt++;
@@ -235,7 +249,7 @@ bool O_TxnAccess::Init(O_TxnManager *manager)
     m_txnManager = manager;
 
     uint32_t alloc_size = sizeof(O_Access *) * m_accessSetSize;
-    void *ptr = occ_malloc(alloc_size);
+    void *ptr = occ_session_malloc(alloc_size);
 //    void *ptr = palloc(alloc_size);
 //    void* ptr = MemAlloc(alloc_size, m_txnManager->m_global);
     if (!ptr)
@@ -289,6 +303,16 @@ O_Access *O_TxnAccess::GetNewInsertAccess(occ_sentinel const &sentinel, HeapTupl
     ac->m_localInsertRow = O_heap_copytuple_impl(heap_tuple);
     ac->m_type = INS;
     ac->m_csn = heap_tuple->t_data->m_rowCSN;
+    ac->m_origSentinel = sentinel;
+    if (!OidIsValid(ac->m_origSentinel.relid)) {
+        ac->m_origSentinel.relid = OccResolveRelid(sentinel);
+    }
+    if (!OidIsValid(ac->m_origSentinel.relid) && OidIsValid(heap_tuple->t_tableOid)) {
+        ac->m_origSentinel.relid = heap_tuple->t_tableOid;
+    }
+    if (!OccTidIsPlausible(&ac->m_origSentinel.tuple_id) && OccTidIsPlausible(&heap_tuple->t_self)) {
+        ac->m_origSentinel.tuple_id = heap_tuple->t_self;
+    }
     m_rowCnt++;
     return ac;
 }
@@ -475,10 +499,19 @@ O_Access *O_TxnAccess::GetNewRowAccess(occ_sentinel const &originalSentinel, Acc
     }
 
     ac->m_origSentinel.relation = originalSentinel.relation;
-    ac->m_origSentinel.tuple_id = row->t_self; // 可能有重定向
     ac->m_origSentinel.snapshot = originalSentinel.snapshot;
-    ac->m_origSentinel.relid = originalSentinel.relid;
+    ac->m_origSentinel.relid = OccResolveRelid(originalSentinel);
     ac->m_globalRow = row;
+    if (!OidIsValid(ac->m_origSentinel.relid) && OidIsValid(row->t_tableOid)) {
+        ac->m_origSentinel.relid = row->t_tableOid;
+    }
+    ac->m_origSentinel.tuple_id = row->t_self;
+    if (!OccTidIsPlausible(&ac->m_origSentinel.tuple_id)) {
+        ItemPointerData tid = OccResolveAccessTid(ac, &originalSentinel);
+        if (OccTidIsPlausible(&tid)) {
+            ac->m_origSentinel.tuple_id = tid;
+        }
+    }
 
     ac->m_type = type;
 
@@ -632,12 +665,11 @@ void O_TxnAccess::ClearSet()
     m_lastAcc = nullptr;
     WriteSetClear();
 
-    for (unsigned int i = 0; i < m_rowCnt; i++)
-    {
-        DestroyAccess(m_accessesSetBuff[i]);
-        // 调用析构函数并释放内存
-        m_accessesSetBuff[i]->~O_Access();
-//        occ_free(m_accessesSetBuff[i]);
+    /*
+     * Do not run ~O_Access() here: txn-scoped objects live in the OCC arena and
+     * are bulk-reclaimed by O_ResetOccTxnMemory() in O_TxnManager::Cleanup().
+     */
+    for (unsigned int i = 0; i < m_rowCnt; i++) {
         m_accessesSetBuff[i] = nullptr;
     }
     m_rowCnt = 0;
@@ -666,13 +698,13 @@ bool O_TxnAccess::ReallocAccessSet()
     uint64_t new_array_size = m_accessSetSize * ACCESS_SET_EXTEND_FACTOR;
 
     uint64_t alloc_size = sizeof(O_Access *) * new_array_size;
-    void *ptr = occ_malloc(alloc_size);
+    void *ptr = occ_session_malloc(alloc_size);
 
     errno_t erc = memset_s(ptr, sizeof(O_Access *) * new_array_size, 0, sizeof(O_Access *) * new_array_size);
     securec_check(erc, "\0", "\0");
     erc = memcpy_s(ptr, sizeof(O_Access *) * new_array_size, m_accessesSetBuff, sizeof(O_Access *) * m_accessSetSize);
     securec_check(erc, "\0", "\0");
-    occ_free(m_accessesSetBuff);
+    occ_session_free(m_accessesSetBuff);
     //    MemFree(m_accessesSetBuff, m_txnManager->m_global);
     SetAccessesSet(reinterpret_cast<O_Access **>(ptr));
     m_accessSetSize = new_array_size;

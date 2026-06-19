@@ -13,6 +13,9 @@
 extern void O_InsertRow(ItemPointer tupleid, EState* estate,
                  HeapTuple heap_tuple);
 
+extern bool O_OpFusionExecUpdate(Relation relation, ItemPointer tupleid, HeapTuple newtuple,
+    TupleTableSlot* slot, EState* estate, int2 bucketid, bool* needsIndexUpdate, bool* indexUpdateDone);
+
 extern TupleTableSlot* O_ExecUpdate(ItemPointer tupleid,
                                     Oid oldPartitionOid,
                                     int2 bucketid, HeapTupleHeader oldtuple, TupleTableSlot* slot, TupleTableSlot* planSlot, EPQState* epqstate,

@@ -191,6 +191,93 @@ TupleTableSlot *O_ExecUpdate(ItemPointer tupleid,
     return NULL;
 }
 
+bool O_OpFusionExecUpdate(Relation relation, ItemPointer tupleid, HeapTuple newtuple, TupleTableSlot *slot,
+    EState *estate, int2 bucketid, bool *needsIndexUpdate, bool *indexUpdateDone)
+{
+    O_TxnManager *txn = GetTxnManager();
+    ResultRelInfo *result_rel_info = estate->es_result_relation_info;
+    Tuple tuple = (Tuple)newtuple;
+
+    Bitmapset *hot_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_ALL);
+    Bitmapset *key_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
+    Bitmapset *id_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
+
+    bool satisfies_hot = false;
+    bool satisfies_key = false;
+    bool satisfies_id = false;
+
+    BlockNumber block = ItemPointerGetBlockNumber(tupleid);
+    Buffer buffer = ReadBuffer(relation, block);
+    Page page = BufferGetPage(buffer);
+
+    LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+    ItemId lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tupleid));
+
+    HeapTupleData oldtup;
+    oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
+    oldtup.t_len = ItemIdGetLength(lp);
+    oldtup.t_self = *tupleid;
+    oldtup.t_tableOid = RelationGetRelid(relation);
+    oldtup.t_bucketId = RelationGetBktid(relation);
+
+    HeapSatisfiesHOTUpdate(relation, hot_attrs, key_attrs, id_attrs, &satisfies_hot,
+                           &satisfies_key, &satisfies_id, &oldtup, newtuple, page);
+
+    *needsIndexUpdate = !satisfies_hot || satisfies_key;
+    *indexUpdateDone = false;
+
+    if (!satisfies_hot) {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+        occ_heap_insert(relation, newtuple, estate->es_output_cid, 0, NULL, false);
+
+        if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tupleid, &oldtup)) {
+            ReleaseBuffer(buffer);
+            ereport(ERROR, (errmsg("OCC: failed to establish row access for non-HOT update")));
+        }
+        O_UpdateRow(txn, newtuple, slot, estate, true);
+
+        if (result_rel_info->ri_NumIndices > 0) {
+            Bitmapset *modifiedIdxAttrs = NULL;
+            TupleTableSlot *oldslot = NULL;
+
+            ExecIndexTuplesState exec_index_tuples_state;
+            exec_index_tuples_state.estate = estate;
+            exec_index_tuples_state.targetPartRel = NULL;
+            exec_index_tuples_state.p = NULL;
+            exec_index_tuples_state.conflict = NULL;
+            exec_index_tuples_state.rollbackIndex = false;
+            tableam_tops_exec_update_index_tuples(slot, oldslot, relation, NULL, tuple, tupleid,
+                                                  exec_index_tuples_state, bucketid, modifiedIdxAttrs);
+        }
+
+        LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+        ItemPointer pTSelf = tableam_tops_get_t_self(relation, tuple);
+        O_InsertRow(pTSelf, estate, newtuple);
+        *indexUpdateDone = true;
+    } else {
+        if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tupleid, &oldtup)) {
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+            ereport(ERROR, (errmsg("OCC: failed to establish row access for HOT update")));
+        }
+        O_UpdateRow(txn, newtuple, slot, estate);
+        *needsIndexUpdate = satisfies_key;
+    }
+
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(buffer);
+
+    bms_free(hot_attrs);
+    bms_free(key_attrs);
+    bms_free(id_attrs);
+
+    (void)GetCurrentTransactionId();
+    return true;
+}
+
 void O_heap_commit_insert_csn(Relation relation, ItemPointer otid, uint64_t csn)
 {
     Buffer buffer;

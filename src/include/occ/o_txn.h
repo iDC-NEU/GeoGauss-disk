@@ -70,6 +70,7 @@ public:
     inline void Cleanup();
 
     Relation GetCachedRelation(Oid relid, Relation hint, bool *needClose);
+    Relation GetValidationRelation(Oid relid, bool *needClose);
     void ReleaseCachedRelations();
 
 private:
@@ -80,6 +81,10 @@ private:
     Oid m_cachedRelids[OCC_REL_CACHE_MAX];
     Relation m_cachedRels[OCC_REL_CACHE_MAX];
     uint32_t m_cachedRelCnt;
+
+    Oid m_shareCachedRelids[OCC_REL_CACHE_MAX];
+    Relation m_shareCachedRels[OCC_REL_CACHE_MAX];
+    uint32_t m_shareCachedRelCnt;
 
     void CommitInternal();
 

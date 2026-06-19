@@ -73,7 +73,13 @@ public:
 
     O_Access *AllocNewAccess(uint32_t rowCnt)
     {
+        (void)rowCnt;
         void *buffer = occ_malloc(sizeof(O_Access));
+        if (buffer == nullptr) {
+            return nullptr;
+        }
+        errno_t rc = memset_s(buffer, sizeof(O_Access), 0, sizeof(O_Access));
+        securec_check(rc, "\0", "\0");
         O_Access *ac = new (buffer) O_Access();
         return ac;
     }

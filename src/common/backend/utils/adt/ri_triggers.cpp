@@ -53,6 +53,10 @@
 #include "utils/snapmgr.h"
 #include "access/tableam.h"
 #include "utils/syscache.h"
+//HCJ ADDBY
+#include "access/genam.h"
+#include "catalog/index.h"
+#include "utils/relcache.h"
 
 #ifdef PGXC
 #include "pgxc/pgxc.h"
@@ -223,6 +227,74 @@ static inline bool IsShareLockForForeignKey(Relation relation)
 #else
     return RelationIsUstoreFormat(relation);
 #endif
+}
+
+//HCJ ADDBY
+static int ri_TryFastPkIndexLookup(const RI_ConstraintInfo* riinfo, Relation pk_rel, Relation val_rel,
+    HeapTuple row, int key_idx, const Oid* eq_oprs, int32 queryno)
+{
+    Oid pkIndexOid;
+    Relation pkIndex;
+    ScanKeyData skey[RI_MAX_NUMKEYS];
+    IndexScanDesc scan;
+    HeapTuple tup;
+    Datum vals[RI_MAX_NUMKEYS];
+    char nulls[RI_MAX_NUMKEYS];
+    RI_QueryKey qkey;
+    int i;
+
+    if (riinfo->nkeys <= 0 || riinfo->nkeys > RI_MAX_NUMKEYS) {
+        return -1;
+    }
+    if (riinfo->confmatchtype != FKCONSTR_MATCH_UNSPECIFIED &&
+        riinfo->confmatchtype != FKCONSTR_MATCH_FULL) {
+        return -1;
+    }
+
+    pkIndexOid = RelationGetPrimaryKeyIndex(pk_rel);
+    if (!OidIsValid(pkIndexOid)) {
+        return -1;
+    }
+
+    if (queryno == RI_PLAN_CHECK_LOOKUPPK) {
+        ri_BuildQueryKeyFull(&qkey, riinfo, queryno);
+    } else {
+        ri_BuildQueryKeyPkCheck(&qkey, riinfo, queryno);
+    }
+    ri_ExtractValues(&qkey, key_idx, val_rel, row, vals, nulls);
+
+    for (i = 0; i < riinfo->nkeys; i++) {
+        if (nulls[i] == 'n') {
+            return -1;
+        }
+    }
+
+    pkIndex = index_open(pkIndexOid, RowShareLock);
+    for (i = 0; i < riinfo->nkeys; i++) {
+        ScanKeyInit(&skey[i],
+            i + 1,
+            BTEqualStrategyNumber,
+            get_opcode(eq_oprs[i]),
+            vals[i]);
+    }
+
+    scan = index_beginscan(pk_rel, pkIndex, GetActiveSnapshot(), riinfo->nkeys, 0);
+    index_rescan(scan, skey, riinfo->nkeys, NULL, 0);
+    tup = (HeapTuple)index_getnext(scan, ForwardScanDirection);
+    index_endscan(scan);
+    index_close(pkIndex, RowShareLock);
+
+    return (tup != NULL) ? 1 : 0;
+}
+
+/*
+ * Fast PK existence check for simple FK inserts/updates.
+ * Returns 1 if referenced row exists, 0 if not found, -1 if SPI fallback is required.
+ */
+static int ri_TryFastLookupPk(const RI_ConstraintInfo* riinfo, Relation fk_rel, Relation pk_rel, HeapTuple fk_row)
+{
+    return ri_TryFastPkIndexLookup(riinfo, pk_rel, fk_rel, fk_row, RI_KEYPAIR_FK_IDX,
+        riinfo->pf_eq_oprs, RI_PLAN_CHECK_LOOKUPPK);
 }
 
 /* ----------
@@ -435,6 +507,18 @@ static Datum RI_FKey_check(PG_FUNCTION_ARGS)
             break;
     }
 
+//HCJ ADDBY
+    {
+        int fast = ri_TryFastLookupPk(&riinfo, fk_rel, pk_rel, new_row);
+        if (fast == 1) {
+            heap_close(pk_rel, RowShareLock);
+            return PointerGetDatum(NULL);
+        }
+        if (fast == 0) {
+            ri_ReportViolation(&qkey, NameStr(riinfo.conname), pk_rel, fk_rel, new_row, NULL, false);
+        }
+    }
+
     SPI_STACK_LOG("connect", NULL, NULL);
     if (SPI_connect() != SPI_OK_CONNECT) {
         heap_close(pk_rel, RowShareLock);
@@ -585,6 +669,15 @@ static bool ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel, HeapTuple old_ro
              * of MATCH.
              */
             break;
+    }
+
+//HCJ ADDBY
+    {
+        int fast = ri_TryFastPkIndexLookup(riinfo, pk_rel, pk_rel, old_row, RI_KEYPAIR_PK_IDX,
+            riinfo->pp_eq_oprs, RI_PLAN_CHECK_LOOKUPPK);
+        if (fast >= 0) {
+            return (fast == 1);
+        }
     }
 
     SPI_STACK_LOG("connect", NULL, NULL);

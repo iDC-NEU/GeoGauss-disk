@@ -7,6 +7,7 @@
 #include "occ/occ_internal.h"
 #include "occ/occ_stats.h"
 
+#include "access/heapam.h"
 #include "utils/rel.h"
 
 #include <algorithm>
@@ -67,27 +68,23 @@ static bool IsInsertOnlyWriteSet(const std::vector<SortedWriteEntry>& entries)
     return true;
 }
 
-static Relation O_OpenRelationForValidation(O_TxnManager* txMan, Oid relid, Relation cachedRel, bool* needClose)
+static Relation O_OpenRelationForValidation(O_TxnManager* txMan, Oid relid, bool* needClose)
 {
-    if (txMan != nullptr) {
-        return txMan->GetCachedRelation(relid, cachedRel, needClose);
-    }
-
     *needClose = false;
-    if (cachedRel != nullptr && OidIsValid(relid)) {
-        return cachedRel;
-    }
     if (!OidIsValid(relid)) {
         return nullptr;
     }
+    if (txMan != nullptr) {
+        return txMan->GetValidationRelation(relid, needClose);
+    }
     *needClose = true;
-    return heap_open(relid, RowExclusiveLock);
+    return try_relation_open(relid, AccessShareLock);
 }
 
 static void O_CloseRelationIfOpened(Relation rel, bool needClose)
 {
     if (needClose && rel != nullptr) {
-        heap_close(rel, RowExclusiveLock);
+        heap_close(rel, AccessShareLock);
     }
 }
 
@@ -113,8 +110,7 @@ void OccTransactionManager::WriteChanges(O_TxnManager* txMan)
     O_TxnAccess* accessMgr = txMan->m_accessMgr;
 
     accessMgr->ForEachWriteEntry([&](const occ_sentinel& sent, O_Access* access) {
-        (void)sent;
-        access->WriteGlobalChanges(commit_csn);
+        access->WriteGlobalChanges(commit_csn, sent);
     });
 }
 
@@ -203,7 +199,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
 
     if (IsInsertOnlyWriteSet(entries)) {
         for (const auto& e : entries) {
-            if (!QuickInsertCheck(e.access, false)) {
+            if (!QuickInsertCheck(e.access, e.sent, false, false)) {
                 m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
                 return RC_ABORT;
             }
@@ -232,7 +228,9 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
                 }
             }
 
-            if (!QuickHeaderValidation(e.access, false)) {
+            const bool hashLocked = (e.access->m_type == INS) ||
+                                    (e.hash == lastHash && !lockIncomplete);
+            if (!QuickHeaderValidation(e.access, e.sent, hashLocked, false)) {
                 ReleaseHeaderLocks(txMan, numSentinelsLock);
                 numSentinelsLock = 0;
                 m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
@@ -249,7 +247,7 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
 
         if (m_preAbort) {
             for (const auto& e : entries) {
-                if (!QuickHeaderValidation(e.access, false)) {
+                if (!QuickHeaderValidation(e.access, e.sent, false, false)) {
                     m_lastAbortReason = OCC_ABORT_LOCK_VERSION;
                     return RC_ABORT;
                 }
@@ -268,27 +266,35 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
     }
 }
 
-bool OccTransactionManager::QuickHeaderValidation(O_Access* access, bool preAbortPhase)
+bool OccTransactionManager::QuickHeaderValidation(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase)
 {
     if (access->m_type != INS) {
-        return QuickVersionCheck(access, preAbortPhase);
+        return QuickVersionCheck(access, key, lockHeld, preAbortPhase);
     }
-    return QuickInsertCheck(access, preAbortPhase);
+    return QuickInsertCheck(access, key, lockHeld, preAbortPhase);
 }
 
-bool OccTransactionManager::QuickInsertCheck(O_Access* access, bool preAbortPhase)
+bool OccTransactionManager::QuickInsertCheck(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase)
 {
+    (void)lockHeld;
     (void)preAbortPhase;
 
     if (access->m_localInsertRow != nullptr && access->m_localInsertRow->t_data != nullptr) {
         return (access->m_csn == access->m_localInsertRow->t_data->m_rowCSN);
     }
 
+    Oid relid = InvalidOid;
+    ItemPointerData tid;
+    if (!OccPrepareAccessTarget(access, &key, &relid, &tid)) {
+        return false;
+    }
+
     occ_sentinel sent = access->m_origSentinel;
     HeapTupleData tuple;
     bool relClosed = false;
-    Relation rel = O_OpenRelationForValidation(m_activeTxn, sent.relid, sent.relation, &relClosed);
-    if (rel == nullptr) {
+    Relation rel = O_OpenRelationForValidation(m_activeTxn, relid, &relClosed);
+    if (rel == nullptr || !OccTidIsPlausible(&tid, rel)) {
+        O_CloseRelationIfOpened(rel, relClosed);
         return false;
     }
 
@@ -321,8 +327,9 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, bool preAbortPhas
     return ok;
 }
 
-bool OccTransactionManager::QuickVersionCheck(O_Access* access, bool preAbortPhase)
+bool OccTransactionManager::QuickVersionCheck(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase)
 {
+    (void)lockHeld;
     (void)preAbortPhase;
     const bool checkLatest = true;
 
@@ -338,11 +345,18 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, bool preAbortPha
         }
     }
 
+    Oid relid = InvalidOid;
+    ItemPointerData tid;
+    if (!OccPrepareAccessTarget(access, &key, &relid, &tid)) {
+        return false;
+    }
+
     occ_sentinel sent = access->m_origSentinel;
     HeapTupleData tuple;
     bool relClosed = false;
-    Relation rel = O_OpenRelationForValidation(m_activeTxn, sent.relid, sent.relation, &relClosed);
-    if (rel == nullptr) {
+    Relation rel = O_OpenRelationForValidation(m_activeTxn, relid, &relClosed);
+    if (rel == nullptr || !OccTidIsPlausible(&tid, rel)) {
+        O_CloseRelationIfOpened(rel, relClosed);
         return false;
     }
 
@@ -380,8 +394,7 @@ bool OccTransactionManager::ValidateWriteSet(O_TxnManager* txMan)
     O_TxnAccess* accessMgr = txMan->m_accessMgr;
     bool ok = true;
     accessMgr->ForEachWriteEntry([&](const occ_sentinel& sent, O_Access* ac) {
-        (void)sent;
-        if (ok && !QuickHeaderValidation(ac, false)) {
+        if (ok && !QuickHeaderValidation(ac, sent, false, false)) {
             ok = false;
         }
     });

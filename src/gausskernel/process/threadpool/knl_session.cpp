@@ -1432,6 +1432,10 @@ void knl_u_occ_init(knl_u_occ_context* occ_cxt)
 {
     Assert(occ_cxt != NULL);
     occ_cxt->txn_manager = NULL;
+//HCJ ADDBY
+    occ_cxt->txn_arena.num_chunks = 0;
+    occ_cxt->txn_arena.active_chunk = 0;
+    occ_cxt->txn_arena.offset = 0;
 }
 
 #ifdef USE_SPQ

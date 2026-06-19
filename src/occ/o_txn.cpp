@@ -6,6 +6,7 @@
 #include "occ/o_txn.h"
 #include "occ/occ_internal.h"
 
+#include "access/heapam.h"
 #include "utils/rel.h"
 
 O_TxnManager::O_TxnManager(bool global)
@@ -14,6 +15,7 @@ O_TxnManager::O_TxnManager(bool global)
       m_csn(INVALID_CSN),
       m_internalStmtCount(0),
       m_cachedRelCnt(0),
+      m_shareCachedRelCnt(0),
       m_global(global)
 {
 }
@@ -34,7 +36,7 @@ bool O_TxnManager::Init()
 
     //    m_accessMgr = MemAllocAlignedObject<TxnAccess>(L1_CACHE_LINE, m_global);
 
-    void *buffer = occ_malloc(sizeof(O_TxnAccess));
+    void *buffer = occ_session_malloc(sizeof(O_TxnAccess));
 //    void *buffer = palloc(sizeof(O_TxnAccess));
     if (!buffer)
     {
@@ -255,15 +257,43 @@ inline void O_TxnManager::Cleanup()
     m_csn = INVALID_CSN;
     m_internalStmtCount = 0;
     m_occManager.CleanUp();
+    O_ResetOccTxnMemory();
     /* 保留 txn_manager 供会话内复用，勿置 NULL（旧版 palloc 方案会随上下文回收悬空） */
+}
+
+Relation O_TxnManager::GetValidationRelation(Oid relid, bool *needClose)
+{
+    *needClose = false;
+    if (!OidIsValid(relid)) {
+        return nullptr;
+    }
+
+    for (uint32_t i = 0; i < m_shareCachedRelCnt; ++i) {
+        if (m_shareCachedRelids[i] == relid) {
+            return m_shareCachedRels[i];
+        }
+    }
+
+    Relation rel = try_relation_open(relid, AccessShareLock);
+    if (rel == nullptr) {
+        return nullptr;
+    }
+
+    if (m_shareCachedRelCnt < OCC_REL_CACHE_MAX) {
+        m_shareCachedRelids[m_shareCachedRelCnt] = relid;
+        m_shareCachedRels[m_shareCachedRelCnt] = rel;
+        m_shareCachedRelCnt++;
+        return rel;
+    }
+
+    *needClose = true;
+    return rel;
 }
 
 Relation O_TxnManager::GetCachedRelation(Oid relid, Relation hint, bool *needClose)
 {
+    (void)hint;
     *needClose = false;
-    if (hint != nullptr && OidIsValid(relid)) {
-        return hint;
-    }
     if (!OidIsValid(relid)) {
         return nullptr;
     }
@@ -288,6 +318,15 @@ Relation O_TxnManager::GetCachedRelation(Oid relid, Relation hint, bool *needClo
 
 void O_TxnManager::ReleaseCachedRelations()
 {
+    for (uint32_t i = 0; i < m_shareCachedRelCnt; ++i) {
+        if (m_shareCachedRels[i] != nullptr) {
+            heap_close(m_shareCachedRels[i], AccessShareLock);
+            m_shareCachedRels[i] = nullptr;
+            m_shareCachedRelids[i] = InvalidOid;
+        }
+    }
+    m_shareCachedRelCnt = 0;
+
     for (uint32_t i = 0; i < m_cachedRelCnt; ++i) {
         if (m_cachedRels[i] != nullptr) {
             heap_close(m_cachedRels[i], RowExclusiveLock);

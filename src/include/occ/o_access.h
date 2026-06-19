@@ -118,34 +118,24 @@ static void O_ExecSetSlotDescriptor(TupleTableSlot *slot, /* slot to change */
      * Release any old descriptor.  Also release old Datum/isnull arrays if
      * present (we don't bother to check if they could be re-used).
      */
+    /*
+     * Release old descriptor arrays without libc free/pfree: they live in the
+     * OCC txn arena and are bulk-reclaimed at transaction end.
+     */
     if (slot->tts_tupleDescriptor != NULL)
     {
-        if (slot->tts_tupleDescriptor->initdefvals)
-        {
-            free(slot->tts_tupleDescriptor->initdefvals);
-        }
-        free(slot->tts_tupleDescriptor);
+        slot->tts_tupleDescriptor = NULL;
     }
 #ifdef PGXC
-    /* XXX there in no routine to release AttInMetadata instance */
     if (slot->tts_attinmeta != NULL)
     {
         slot->tts_attinmeta = NULL;
     }
 #endif
 
-    if (slot->tts_values != NULL)
-    {
-        free(slot->tts_values);
-    }
-    if (slot->tts_isnull != NULL)
-    {
-        free(slot->tts_isnull);
-    }
-    if (slot->tts_lobPointers != NULL)
-    {
-        free(slot->tts_lobPointers);
-    }
+    slot->tts_values = NULL;
+    slot->tts_isnull = NULL;
+    slot->tts_lobPointers = NULL;
     /*
      * Install the new descriptor
      */
@@ -277,7 +267,7 @@ static TupleTableSlot *O_ExecCopySlot(TupleTableSlot *dst_slot, TupleTableSlot *
     new_tuple = O_heap_copytuple((HeapTuple)src_slot->tts_tuple);
     //    MemoryContextSwitchTo(old_context);
 
-    return ExecStoreTuple(new_tuple, dst_slot, InvalidBuffer, true);
+    return ExecStoreTuple(new_tuple, dst_slot, InvalidBuffer, false);
 }
 
 class O_Access
@@ -289,21 +279,23 @@ public:
 
     ~O_Access()
     {
-        if (m_localRow != nullptr)
+        const bool sharedGlobalLocal = (m_globalRow != nullptr && m_globalRow == m_localRow);
+
+        if (m_localRow != nullptr && !sharedGlobalLocal)
         {
-            //        occ_free(access->m_localRow);
-            m_localRow = nullptr;
+            occ_free(m_localRow);
         }
+        m_localRow = nullptr;
 
         if (m_localInsertRow != nullptr)
         {
-            //        occ_free(access->m_localInsertRow);
+            occ_free(m_localInsertRow);
             m_localInsertRow = nullptr;
         }
 
         if (m_globalRow != nullptr)
         {
-            //        occ_free(access->m_globalRow);
+            occ_free(m_globalRow);
             m_globalRow = nullptr;
         }
 
@@ -331,6 +323,11 @@ public:
 
         if (m_ownsSlot && m_slot)
         {
+            if (m_slot->tts_tuple != nullptr)
+            {
+                occ_free(m_slot->tts_tuple);
+                m_slot->tts_tuple = nullptr;
+            }
             if (m_slot->tts_tupleDescriptor)
             {
                 if (m_slot->tts_tupleDescriptor->initdefvals)
@@ -366,6 +363,8 @@ public:
     }
 
     void WriteGlobalChanges(uint64_t csn);
+
+    void WriteGlobalChanges(uint64_t csn, const occ_sentinel &key);
 
     uint32_t GetStmtCount() const
     {

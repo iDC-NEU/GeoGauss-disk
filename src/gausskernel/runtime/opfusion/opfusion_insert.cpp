@@ -380,7 +380,7 @@ unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_i
     /* insert index entries for tuple */
     List* recheck_indexes = NIL;
 
-//    HCJ ADDBY
+//HCJ ADDBY
     bool enable_occ = true;
     if (enable_occ) {
         O_InsertRow(&(((HeapTuple)tuple)->t_self),m_c_local.m_estate,(HeapTuple)tuple);

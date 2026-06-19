@@ -103,6 +103,12 @@ ifneq ($(enable_lite_mode), yes)
     OBJS += $(top_builddir)/src/lib/hotpatch/client/libhotpatchclient.a
 endif
 
+#HCJ ADDBY
+OBJS += $(top_builddir)/src/occ/objfiles.txt
+
+$(top_builddir)/src/occ/objfiles.txt:
+	$(MAKE) -C $(top_builddir)/src/occ all
+
 # We put libpgport into OBJS, so remove it from LIBS; also add libldap
 LIBS := $(filter-out -lpgport, $(LIBS)) $(LDAP_LIBS_BE)
 
