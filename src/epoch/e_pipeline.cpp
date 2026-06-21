@@ -479,6 +479,7 @@ static void EpochPipelineTrySealEpochs(void)
 void EpochPipelinePoll(void)
 {
     EpochNetMaybePublishHello();
+    EpochMaybeRequestMissingTxns();
     EpochPipelineDrainLocalQueue();
     if (EpochGetTotalNodes() > 1) {
         EpochPipelineConsumeRemote();

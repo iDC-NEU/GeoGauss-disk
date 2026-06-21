@@ -4,7 +4,6 @@
 
 #include "epoch/e_statistician.h"
 #include "epoch/e_config.h"
-#include "epoch/e_epoch.h"
 #include "epoch/e_node_manager.h"
 #include "epoch/e_types.h"
 #include "epoch/e_net.h"
@@ -122,9 +121,30 @@ void EpochOnEpochEndWireReceived(const E_WireTxn& txn)
         return;
     }
     uint64_t epoch = txn.commit_epoch;
+    uint64_t logical = E_NodeManager::GetLogicalEpoch();
+    /*
+     * 只接受当前 logical 窗口的 epoch-end；未来/过期的线消息不得改写 peer send/recv 状态。
+     */
+    if (epoch != logical) {
+        const char* tag = (epoch > logical) ? "RECV_FUTURE" : "RECV_STALE";
+        char buf[160];
+        int rc = snprintf_s(buf,
+            sizeof(buf),
+            sizeof(buf) - 1,
+            "%s epoch=%lu logical=%lu peer=%u pack=%lu",
+            tag,
+            epoch,
+            logical,
+            txn.server_id,
+            txn.csn);
+        securec_check_ss(rc, "\0", "\0");
+        EpochRecvDiagAppendLine(buf);
+        return;
+    }
     uint32_t from_node = txn.server_id;
     uint64_t pack_count = txn.csn;
 
+    E_NodeManager::EnsureEpochSlot(epoch);
     E_NodeManager::SetStoreShouldReceivedPackCounters(epoch, from_node, pack_count);
     /* 对端 epoch-end 的 pack 数同步到本节点视图，便于 seal / logical 推进 */
     E_NodeManager::SetLocalPackTxnCounters(epoch, from_node, pack_count);
@@ -139,6 +159,13 @@ bool EpochCheckAndSetNodeReceiveCompleted(uint64_t epochId, uint64_t nodeId)
     uint64_t should_receive = E_NodeManager::GetStoreShouldReceivedPackCounters(epochId, nodeId);
     uint64_t received = E_NodeManager::GetStoreReceivedPackCounters(epochId, nodeId);
     bool done = (should_receive == received);
+    /*
+     * 空 epoch（pack=0）时 should==received==0 不能单独判定完成；
+     * 须等对端真正 seal 并发出 epoch-end（IsNodeSendCompleted）。
+     */
+    if (done && should_receive == 0 && received == 0) {
+        done = E_NodeManager::IsNodeSendCompleted(epochId, nodeId);
+    }
     E_NodeManager::SetNodeReceiveCompleted(epochId, nodeId, done);
     return done;
 }
@@ -281,32 +308,38 @@ bool EpochTrySealEpoch(uint64_t epoch)
     return true;
 }
 
-void EpochRebroadcastSealedEpochEnds(void)
+void EpochMaybeRequestMissingTxns(void)
 {
-    if (EpochGetTotalNodes() <= 1) {
+    if (!g_enable_epoch_multimaster || EpochGetTotalNodes() <= 1 || !EpochAllPeersConnected()) {
         return;
     }
-
-    /*
-     * ZMQ slow-joiner / 双节点先后启动：重发已 seal 的历史 epoch-end 与缓存写集。
-     */
     uint64_t logical = E_NodeManager::GetLogicalEpoch();
     uint32_t self = EpochGetNodeId();
-    for (uint64_t epoch = 1; epoch < logical; ++epoch) {
-        if (!E_NodeManager::IsNodeSendCompleted(epoch, self)) {
-            continue;
+    uint32_t peer = (self == 0) ? 1 : 0;
+    uint64_t request_epoch = 0;
+    for (uint64_t epoch = 1; epoch <= logical; ++epoch) {
+        if (!E_NodeManager::IsNodeReceiveCompleted(epoch, peer)) {
+            request_epoch = epoch;
+            break;
         }
-        EpochPipelineRebroadcastCachedTxns(epoch);
-        E_WireTxn end_wire;
-        if (!EpochBuildEpochEndWire(epoch, &end_wire)) {
-            continue;
-        }
-        std::string payload;
-        if (!E_WireSerializeTxn(end_wire, &payload)) {
-            continue;
-        }
-        (void)EpochNetPublish(payload);
     }
+    if (request_epoch == 0) {
+        return;
+    }
+    static int tick = 0;
+    if (++tick % 50 != 0) {
+        return;
+    }
+    /*
+     * GeoGauss mot_internal.cpp: cache_txn_request / server_txn_request：
+     * 对端 pack 未收齐时主动请求，由 EpochHandleTxnRequest 重放 cache + epoch-end。
+     */
+    EpochPublishTxnRequest(request_epoch);
+    char buf[96];
+    int rc = snprintf_s(buf, sizeof(buf), sizeof(buf) - 1,
+        "TXN_REQ_SENT epoch=%lu peer=%u", request_epoch, peer);
+    securec_check_ss(rc, "\0", "\0");
+    EpochRecvDiagAppendLine(buf);
 }
 
 void EpochOnPeerConnected(uint32_t peerId)
@@ -314,13 +347,9 @@ void EpochOnPeerConnected(uint32_t peerId)
     if (peerId == EpochGetNodeId() || EpochGetTotalNodes() <= 1) {
         return;
     }
-    /* GeoGauss 用 cache_txn_request 补发；磁盘表端口用 epoch-end 重广播 */
-    EpochRebroadcastSealedEpochEnds();
     /*
-     * 勿 burst 推进 logical：对端可能尚未 seal 同 epoch，会造成双节点 logical 分叉。
-     * 正常由 epoch worker 每轮 TryAdvanceLogical 逐步对齐。
+     * GeoGauss 不在上线时主动重播 epoch；缺包由对端发 cache_txn_request 拉取。
      */
-    (void)EpochTryAdvanceLogical();
 }
 
 void EpochDiagReset(void)
@@ -468,7 +497,25 @@ void EpochHandleTxnRequest(const E_WireTxn& txn)
     if (epoch == 0) {
         return;
     }
+    E_NodeManager::EnsureEpochSlot(epoch);
     EpochPipelineRebroadcastCachedTxns(epoch);
+    /*
+     * GeoGauss SendCacheTxn：仅对本机已 seal 的 epoch 重播 cache + epoch-end。
+     * 未 seal 时发假 epoch-end 会让对端误判 peer_send/recv，logical 单方面狂飙。
+     */
+    uint32_t self = EpochGetNodeId();
+    if (!E_NodeManager::IsNodeSendCompleted(epoch, self)) {
+        char buf[160];
+        int rc = snprintf_s(buf,
+            sizeof(buf),
+            sizeof(buf) - 1,
+            "TXN_REQ_IGNORE epoch=%lu from_peer=%u reason=not_sealed",
+            epoch,
+            txn.server_id);
+        securec_check_ss(rc, "\0", "\0");
+        EpochRecvDiagAppendLine(buf);
+        return;
+    }
     E_WireTxn end_wire;
     if (EpochBuildEpochEndWire(epoch, &end_wire)) {
         std::string payload;
@@ -519,17 +566,21 @@ void EpochRecvDiagLogStall(uint64_t epoch, const char* reason)
     uint32_t peer = (self == 0) ? 1 : 0;
     char buf[512];
     uint32_t node_id = EpochGetNodeId();
-    if (strcmp(reason, "commit_path_incomplete") == 0 || strcmp(reason, "record_incomplete") == 0) {
+    if (strcmp(reason, "commit_path_incomplete") == 0 || strcmp(reason, "record_incomplete") == 0 ||
+        strcmp(reason, "local_commit_pending") == 0) {
         int rc = snprintf_s(buf,
             sizeof(buf),
             sizeof(buf) - 1,
-            "STALL epoch=%lu reason=%s pack=%lu prod=%lu rec=%lu rcd=%lu merged=%lu committed=%lu remote_exec=%d",
+            "STALL epoch=%lu reason=%s pack=%lu prod=%lu rec=%lu rcd=%lu chg=%lu read=%lu abort=%lu merged=%lu committed=%lu remote_exec=%d",
             epoch,
             reason,
             E_NodeManager::GetLocalPackTxnCounters(epoch, node_id),
             E_NodeManager::GetLocalProduceTxnCounters(epoch, node_id),
             E_NodeManager::GetLocalRecordCommitCounters(epoch, node_id),
             E_NodeManager::GetLocalRecordCommittedCounters(epoch, node_id),
+            E_NodeManager::GetChangeSetTxnCounters(epoch, node_id),
+            E_NodeManager::GetReadCommittedTxnCounters(epoch, node_id),
+            E_NodeManager::GetAbortTxnCounters(epoch, node_id),
             E_NodeManager::GetMergedTxnCounters(epoch, node_id),
             E_NodeManager::GetCommittedTxnCounters(epoch, node_id),
             E_NodeManager::IsRemoteExeced() ? 1 : 0);
@@ -553,6 +604,11 @@ void EpochRecvDiagLogStall(uint64_t epoch, const char* reason)
         !E_NodeManager::IsNodeReceiveCompleted(epoch, peer) &&
         g_recvdiag_stall_count % 200 == 1) {
         EpochPublishTxnRequest(epoch);
+        char req[96];
+        int req_rc = snprintf_s(req, sizeof(req), sizeof(req) - 1,
+            "TXN_REQ_SENT epoch=%lu peer=%u", epoch, peer);
+        securec_check_ss(req_rc, "\0", "\0");
+        EpochRecvDiagAppendLine(req);
     }
 }
 

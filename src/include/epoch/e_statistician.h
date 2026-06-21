@@ -25,7 +25,7 @@ void EpochWireDiagLogTxnRecv(const E_WireTxn& txn);
 void EpochRecvDiagLogHello(const char* tag, uint32_t from_node);
 void EpochPublishTxnRequest(uint64_t epoch);
 void EpochHandleTxnRequest(const E_WireTxn& txn);
-void EpochRebroadcastSealedEpochEnds(void);
+void EpochMaybeRequestMissingTxns(void);
 void EpochOnPeerConnected(uint32_t peerId);
 
 /* 当前 logical epoch 尚有 change_set 未 pack/abort 完，不可继续推高 physical */
