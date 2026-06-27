@@ -1,0 +1,1 @@
+/home/hcj2003/2025-9/openGauss-server/./src/gausskernel/storage/access/rmgrdesc/replorigindesc.cpp

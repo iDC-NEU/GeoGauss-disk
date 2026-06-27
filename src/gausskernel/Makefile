@@ -105,9 +105,17 @@ endif
 
 #HCJ ADDBY
 OBJS += $(top_builddir)/src/occ/objfiles.txt
+OBJS += $(top_builddir)/src/epoch/objfiles.txt
+OBJS += $(top_builddir)/src/dynamic-net/objfiles.txt
 
 $(top_builddir)/src/occ/objfiles.txt:
 	$(MAKE) -C $(top_builddir)/src/occ all
+
+$(top_builddir)/src/epoch/objfiles.txt:
+	$(MAKE) -C $(top_builddir)/src/epoch all
+
+$(top_builddir)/src/dynamic-net/objfiles.txt:
+	$(MAKE) -C $(top_builddir)/src/dynamic-net all
 
 # We put libpgport into OBJS, so remove it from LIBS; also add libldap
 LIBS := $(filter-out -lpgport, $(LIBS)) $(LDAP_LIBS_BE)

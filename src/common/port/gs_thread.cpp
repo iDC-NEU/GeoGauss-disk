@@ -337,6 +337,10 @@ static void check_boot_name(char** argv, int argc, char** name_thread)
         case CBMWriterProcess:
             *name_thread = "CBMWriter";
             break;
+//HCJ ADDBY
+        case EpochWorkerProcess:
+            *name_thread = "EpochWorker";
+            break;
         case RemoteServiceProcess:
             *name_thread = "RemoteService";
             break;

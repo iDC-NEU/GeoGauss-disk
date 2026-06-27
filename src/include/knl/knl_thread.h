@@ -850,6 +850,12 @@ typedef struct knl_t_cbm_context {
     char* preReadBuff;
 } knl_t_cbm_context;
 
+//HCJ ADDBY
+typedef struct knl_t_epoch_worker_context {
+    volatile sig_atomic_t got_SIGHUP;
+    volatile sig_atomic_t shutdown_requested;
+} knl_t_epoch_worker_context;
+
 /* thread local pointer to the shared memory */
 typedef struct knl_t_shemem_ptr_context {
     struct ss_scan_locations_t* scan_locations;
@@ -3513,6 +3519,8 @@ typedef struct knl_thrd_context {
     knl_t_buf_context buf_cxt;
     knl_t_bulkload_context bulk_cxt;
     knl_t_cbm_context cbm_cxt;
+//HCJ ADDBY
+    knl_t_epoch_worker_context epoch_worker_cxt;
     knl_t_checkpoint_context checkpoint_cxt;
     knl_t_codegen_context codegen_cxt;
     knl_t_comm_context comm_cxt;

@@ -5,10 +5,11 @@
 #include "occ/o_txn.h"
 #include "occ/occ_internal.h"
 #include "occ/o_executor.h"
+#include "occ/o_staging.h"
 
 Tuple O_index_getnext(IndexScanDesc scan, ScanDirection direction, bool* has_cur_xact_write)
 {
-    if (!g_enable_occ_delta && !O_TxnHasActiveWriteSet()) {
+    if (!OccStagingOverlayEnabled() && !O_TxnHasActiveWriteSet()) {
         return index_getnext(scan, direction, has_cur_xact_write);
     }
 

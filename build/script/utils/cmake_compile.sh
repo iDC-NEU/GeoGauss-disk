@@ -122,7 +122,7 @@ function make_gaussdb_kernel()
     if [ $? -ne 0 ]; then
         die "cmake failed."
     fi
-    cpus_num=$(grep -w processor /proc/cpuinfo|wc -l)
+    cpus_num=40
     make -sj ${cpus_num}
     if [ $? -ne 0 ]; then
         die "make failed."

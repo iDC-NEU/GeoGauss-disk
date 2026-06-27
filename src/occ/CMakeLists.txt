@@ -10,6 +10,7 @@ set(TGT_occ_INC
         ${PROJECT_SRC_DIR}/include/iprange
         ${PROJECT_SRC_DIR}/include/libcomm
         ${PROJECT_SRC_DIR}/include
+        ${PROJECT_SRC_DIR}/occ-opt
         ${PROJECT_SRC_DIR}/lib/gstrace
         ${LIBCGROUP_INCLUDE_PATH}
         ${PROJECT_SRC_DIR}/include/libcomm

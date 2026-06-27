@@ -6,6 +6,7 @@
 #include "occ/occ_mem.h"
 #include "occ/occ_internal.h"
 #include "occ/o_delta_table.h"
+#include "occ/o_staging.h"
 
 static FORCE_INLINE
     HeapTuple
@@ -442,7 +443,69 @@ O_Access *O_TxnAccess::GetNewRowAccess(occ_sentinel const &originalSentinel, Acc
     HeapTuple row;
     Tuple tuple;
 
-    if (g_enable_occ_delta)
+    if (OccStagingOverlayEnabled())
+    {
+        HeapTuple staged = nullptr;
+        bool deleted = false;
+        if (OccStagingTryReadTuple(originalSentinel.relation,
+                                   const_cast<ItemPointer>(&originalSentinel.tuple_id),
+                                   &staged, &deleted))
+        {
+            if (deleted || staged == nullptr) {
+                if (staged != nullptr) {
+                    heap_freetuple(staged);
+                }
+                return nullptr;
+            }
+            row = staged;
+        }
+        else if (g_enable_occ_delta && !g_enable_occ_staging)
+        {
+            O_DeltaEntry deltaEntry;
+            bool hasDelta = O_DeltaTable::Instance().Lookup(
+                originalSentinel.relation,
+                const_cast<ItemPointer>(&originalSentinel.tuple_id),
+                deltaEntry);
+
+            if (hasDelta)
+            {
+                if (deltaEntry.deleted) {
+                    return nullptr;
+                }
+                row = O_DeltaTable::Instance().LookupCopyTuple(
+                    originalSentinel.relation,
+                    const_cast<ItemPointer>(&originalSentinel.tuple_id));
+                if (row == nullptr) {
+                    return nullptr;
+                }
+            }
+            else
+            {
+                if (scan)
+                {
+                    tuple = IndexFetchTuple(scan, nullptr);
+                    row = O_heap_copytuple_impl((HeapTuple)tuple);
+                }
+                else
+                {
+                    row = O_heap_copytuple_impl(heap_tuple);
+                }
+            }
+        }
+        else
+        {
+            if (scan)
+            {
+                tuple = IndexFetchTuple(scan, nullptr);
+                row = O_heap_copytuple_impl((HeapTuple)tuple);
+            }
+            else
+            {
+                row = O_heap_copytuple_impl(heap_tuple);
+            }
+        }
+    }
+    else if (g_enable_occ_delta)
     {
         /* delta 模式：先读 delta，失败再回退 heap */
         O_DeltaEntry deltaEntry;
@@ -457,7 +520,12 @@ O_Access *O_TxnAccess::GetNewRowAccess(occ_sentinel const &originalSentinel, Acc
             {
                 return nullptr;
             }
-            row = O_heap_copytuple_impl(deltaEntry.tuple);
+            row = O_DeltaTable::Instance().LookupCopyTuple(
+                originalSentinel.relation,
+                const_cast<ItemPointer>(&originalSentinel.tuple_id));
+            if (row == nullptr) {
+                return nullptr;
+            }
         }
         else
         {

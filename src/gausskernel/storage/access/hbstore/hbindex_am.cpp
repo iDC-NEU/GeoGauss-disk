@@ -34,6 +34,7 @@
 //HCJ ADDBY
 #include "occ/o_executor.h"
 #include "occ/occ_internal.h"
+#include "occ/o_config.h"
 
 static IndexScanDesc hbkt_idx_beginscan(Relation heapRelation,
     Relation indexRelation,
@@ -646,7 +647,7 @@ HeapTuple scan_handler_idx_getnext(IndexScanDesc scan, ScanDirection direction, 
         }
     } else {
 //        HCJ ADDBY
-        bool enable_occ = true;
+        bool enable_occ = OccDiskAccessHooksEnabled();
         if (enable_occ) {
             if (!O_TxnHasActiveWriteSet()) {
                 return (HeapTuple)index_getnext(scan, direction, has_cur_xact_write);

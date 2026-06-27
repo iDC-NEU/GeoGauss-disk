@@ -1,0 +1,172 @@
+================================================================================
+  openGauss GeoGauss 扩展版 — 代码相关版本说明
+================================================================================
+
+基线分支 : openGauss 6.0.0（tag/branch 6.0.0）
+开发分支 : occ
+Patch 文件 : opengauss-geogauss-vs-6.0.0.patch（约 1.4 MB，190 个文件，+35018/-450 行）
+
+================================================================================
+一、版本概述
+================================================================================
+
+本版本在 openGauss 6.0.0 基础上合入以下能力，面向三节点 WAN TPCC
+多主（Epoch Multimaster）实验环境：
+
+  1. OCC 磁盘表事务引擎（src/occ/）
+     - 乐观并发控制（OCC）读写路径、Sentinel 锁、CSN 管理、OpFusion 接入
+     - Delta Table / 写集 / 统计与 pre-abort 优化
+
+  2. Epoch 多主复制模块（src/epoch/）
+     - 物理/逻辑 Epoch 推进、ZMQ 网络收发、CRDT 合并、异步提交流水线
+     - TPCC 基准脚本（scripts/epoch_benchmark/）
+
+  3. occ-opt 版本暂存与延迟写回（src/occ-opt/，设计文档 §GeoGauss 磁盘表）
+     - 分片哈希暂存表 O_StagingTable、脏页追踪、后台刷脏、heap 写回回调
+     - 通过 occ_staging_bridge 接入 OCC 读写/校验路径
+
+  4. dynamic-net 异构网络复制协议（src/dynamic-net/，设计文档 §异构网络）
+     - FIXED / CATCHUP Epoch 推进、Proxy Merge、慢节点 PartialSnapshot
+     - 流量整形（Up/Down/Bi Limit）、消息分发与 CRDT 合并框架
+     - 通过 e_dyn_net / e_dyn_net_bridge 接入 Epoch 网络层
+
+设计原则：
+  - 新模块始终编译链接进 gaussdb，**默认运行时关闭**，行为与 6.0.0 一致
+  - 开关通过 postgresql.conf GUC 控制，由 scripts/epoch_benchmark/configure_node.sh 统一写入
+
+================================================================================
+二、Patch 文件说明
+================================================================================
+
+文件名   : opengauss-geogauss-vs-6.0.0.patch
+对比基准 : 6.0.0 分支
+
+应用方法（在 openGauss 6.0.0 源码根目录）：
+
+  git checkout 6.0.0
+  git apply --check opengauss-geogauss-vs-6.0.0.patch    # 预检
+  git apply opengauss-geogauss-vs-6.0.0.patch            # 打补丁
+
+================================================================================
+三、目录与文件变更摘要
+================================================================================
+
+【新增目录】
+  src/occ/                  OCC 事务引擎实现
+  src/occ-opt/              版本暂存哈希表 + 延迟写回
+  src/dynamic-net/          异构网络复制协议框架
+  src/epoch/                Epoch 多主模块（含 CMake/Makefile）
+  src/include/occ/          OCC 公共头文件
+  src/include/epoch/        Epoch 公共头文件
+  src/include/neu_concurrency_tools/  并发队列/线程池（moodycamel 等）
+  src/include/postmaster/epoch_worker.h
+  src/include/zmq.hpp         cppzmq 头（ZMQ C++ 绑定）
+  scripts/epoch_benchmark/  三节点部署与 TPCC 脚本
+
+【修改的核心内核文件】
+  src/gausskernel/process/postmaster/postmaster.cpp   Epoch Worker 注册
+  src/gausskernel/storage/access/transam/xact.cpp     OCC/Epoch 事务钩子
+  src/gausskernel/storage/ipc/ipci.cpp                共享内存初始化
+  src/gausskernel/runtime/executor/nodeModifyTable.cpp
+  src/gausskernel/runtime/opfusion/opfusion_*.cpp     OpFusion OCC 路径
+  src/CMakeLists.txt / src/Makefile                   增加 occ/epoch/dynamic-net 子目录
+  src/gausskernel/CMakeLists.txt / Makefile           链接新模块 OBJECT 库
+
+【occ-opt 主要源文件】
+  o_staging_table.*       分片暂存哈希表
+  o_staging_api.*         C 门面 API（O_StagingStageCommit 等）
+  o_staging_flush.*       可插拔 flush 回调
+  o_staging_heap_write.*  heap 写回（O_heap_update/delete）
+  o_background_flusher.*  后台定时刷脏
+  o_dirty_page_tracker.*  页级 dirty 阈值
+  o_delta_table.cpp       旧 DeltaTable API 兼容层
+  occ_staging_bridge.cpp  GUC 注册与 OCC 桥接（src/occ/）
+
+【dynamic-net 主要源文件】
+  dn_api.*                DnRuntime / DnInit 门面
+  dn_epoch_manager.*      FIXED / CATCHUP / Jump 策略
+  dn_timer_handler.*      物理定时器 tick
+  dn_network_module.*     虚拟网络 TX/RX、PredictiveEpochRewrite
+  dn_traffic_shaper.*     带宽限制（Up/Down/Bi）
+  dn_proxy_merge.*        metadata-only Proxy 路径
+  dn_crdt_merge.*         CRDT LWW 合并
+  dn_message_dispatch.*   AppendEntries / PartialSnapshot 分发
+  dn_snapshot_validator.* 慢节点双层校验
+  e_dyn_net.cpp           Epoch ↔ dynamic-net 桥接（src/epoch/）
+
+================================================================================
+四、基准测试脚本（scripts/epoch_benchmark/）
+================================================================================
+
+  env.sh              环境变量与节点 IP/端口定义
+  configure_node.sh   写入 postgresql.conf / pg_hba.conf
+  init_node.sh        单节点 initdb
+  start_node.sh       启动单节点
+  stop_node.sh        停止单节点
+  deploy_to_remote.sh 远程部署
+  run_tpcc_node.sh    单节点 TPCC
+  run_tpcc_cluster.sh 三节点 TPCC
+  drop_tpcc_database.sh / shard_hist_id_seq.sh  辅助脚本
+
+================================================================================
+五、运行时 GUC 参数（新增/相关）
+================================================================================
+
+【Epoch 多主】
+  enable_epoch_multimaster       多主总开关
+  epoch_node_id / epoch_total_nodes / epoch_peer_hosts
+  epoch_physical_interval_ms     物理 Epoch 间隔（ms）
+  epoch_phys_logical_gap_limit   物理-逻辑 Epoch 差距上限
+  epoch_commit_sync              同步/异步提交模式
+  epoch_async_*                  异步模式调优参数
+
+【dynamic-net 异构网络】（默认均为 off/false）
+  enable_epoch_dyn_net           异构网络总开关
+  epoch_dyn_net_catchup          CATCHUP 模式（否则 FIXED）
+  epoch_dyn_net_proxy            Proxy Merge 路径
+  epoch_dyn_net_slow_nodes       慢节点 ID 列表
+  epoch_dyn_net_lag_tolerance    lag 跳变阈值
+  epoch_dyn_net_queue_tolerance  队列跳变阈值
+  epoch_dyn_net_catchup_k        CATCHUP 跳跃系数
+  epoch_dyn_net_rtt_ms           RTT 补偿（ms）
+  epoch_dyn_net_upload_bps       上行带宽限制（bytes/s，0=不限）
+  epoch_dyn_net_download_bps     下行带宽限制
+  epoch_dyn_net_bw_mode          带宽模式枚举
+
+【OCC / occ-opt】
+  enable_occ_disk                OCC 磁盘表（默认 on，与多主联动）
+  enable_occ_staging             版本暂存哈希表
+  occ_enable_stats_log           OCC 统计日志
+
+修改 GUC 后需 restart 数据库实例。
+
+================================================================================
+六、构建说明
+================================================================================
+
+依赖：
+  - openGauss third_party binarylibs（与 6.0.0 匹配）
+  - libzmq
+
+【CMake 构建】
+  sh build.sh -m debug -3rd /path/to/openGauss-third_party_binarylibs --cmake
+  产物：tmp_build/src/gausskernel/gaussdb
+
+================================================================================
+七、模块接入关系（运行时）
+================================================================================
+
+  客户端 SQL
+      ↓
+  OpFusion / Executor ──→ OCC (o_access / o_txn_access / o_occManager)
+      │                        ↓ 
+      │                   occ-opt (O_StagingTable 读写/flush)
+      ↓
+  xact.cpp ──→ Epoch (e_xact / e_pipeline / e_statistician)
+      │            ↓ 
+      │       dynamic-net (DnEpochManager / DnTransport / DnProxyMerge)
+      ↓
+  postmaster ──→ epoch_worker (e_worker_main 物理定时器 + ZMQ 收发)
+
+================================================================================
+

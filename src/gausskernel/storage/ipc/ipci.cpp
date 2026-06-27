@@ -47,6 +47,11 @@
 #include "postmaster/pagewriter.h"
 #include "postmaster/pagerepair.h"
 #include "postmaster/postmaster.h"
+//HCJ ADDBY
+#include "epoch/e_config.h"
+#include "epoch/e_types.h"
+#include "epoch/e_shmem.h"
+#include "epoch/e_txn_queue.h"
 #include "postmaster/snapcapturer.h"
 #include "postmaster/cfs_shrinker.h"
 #include "postmaster/rbcleaner.h"
@@ -209,6 +214,11 @@ Size ComputeTotalSizeOfShmem()
         }
         if (g_instance.attr.attr_storage.enable_mmap) {
             size = add_size(size, MmapShmemSize());
+        }
+//HCJ ADDBY
+        if (g_enable_epoch_multimaster) {
+            size = add_size(size, EpochShmemSize());
+            size = add_size(size, EpochTxnQueueShmemSize(EPOCH_TXN_QUEUE_CAPACITY));
         }
         return size;
 }
@@ -415,6 +425,12 @@ void CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
         BTreeShmemInit();
         SyncScanShmemInit();
         AsyncShmemInit();
+
+//HCJ ADDBY
+        if (g_enable_epoch_multimaster) {
+            EpochShmemInit();
+            EpochTxnQueueShmemInit(EPOCH_TXN_QUEUE_CAPACITY);
+        }
 
 #ifdef PGXC
         NodeTablesShmemInit();

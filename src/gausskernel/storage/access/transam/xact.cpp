@@ -118,6 +118,20 @@
 
 //HCJ ADDBY
 #include "occ/o_commit.h"
+#include "occ/o_config.h"
+#include "epoch/e_xact.h"
+#include "epoch/e_config.h"
+
+static void HcjOccEpochXactDispatch(XactEvent event)
+{
+    if (g_enable_epoch_multimaster) {
+        EpochXactCallback(event);
+        return;
+    }
+    if (OccDiskAccessHooksEnabled()) {
+        OCCXactCallback(event);
+    }
+}
 
 extern void CodeGenThreadTearDown();
 extern void deleteGlobalOBSInstrumentation();
@@ -1491,7 +1505,7 @@ static TransactionId RecordTransactionCommit(void)
 #endif
 
         //        HCJ ADDBY
-        OCCXactCallback(XACT_EVENT_RECORD_COMMIT);
+        HcjOccEpochXactDispatch(XACT_EVENT_RECORD_COMMIT);
 
         /*
          * If we didn't create XLOG entries, we're done here; otherwise we
@@ -1594,7 +1608,7 @@ static TransactionId RecordTransactionCommit(void)
 
 //        HCJ ADDBY
         END_CRIT_SECTION();
-        OCCXactCallback(XACT_EVENT_RECORD_COMMIT);
+        HcjOccEpochXactDispatch(XACT_EVENT_RECORD_COMMIT);
         START_CRIT_SECTION();
 
         UpdateNextMaxKnownCSN(GetCommitCsn());
@@ -2573,7 +2587,7 @@ static void StartTransaction(bool begin_on_gtm)
 #endif
 
 //    HCJ ADDBY
-    OCCXactCallback(XACT_EVENT_START);
+    HcjOccEpochXactDispatch(XACT_EVENT_START);
 
     if (module_logging_is_on(MOD_TRANS_XACT)) {
         ereport(LOG, (errmodule(MOD_TRANS_XACT),
@@ -2925,7 +2939,7 @@ static void CommitTransaction(bool STP_commit)
     CallXactCallbacks(XACT_EVENT_COMMIT);
 
 //    HCJ ADDBY
-    OCCXactCallback(XACT_EVENT_COMMIT);
+    HcjOccEpochXactDispatch(XACT_EVENT_COMMIT);
     /*
      * Here is where we really truly local commit.
      */
@@ -3028,7 +3042,7 @@ static void CommitTransaction(bool STP_commit)
 #endif
 
 //    HCJ ADDBY
-    OCCXactCallback(XACT_EVENT_END_TRANSACTION);
+    HcjOccEpochXactDispatch(XACT_EVENT_END_TRANSACTION);
 
     /*
      * This is all post-commit cleanup.  Note that if an error is raised here,
@@ -3992,7 +4006,7 @@ static void AbortTransaction(bool PerfectRollback, bool STP_rollback)
         CallXactCallbacks(XACT_EVENT_ABORT);
 
 //        HCJ ADDBY
-        OCCXactCallback(XACT_EVENT_ABORT);
+        HcjOccEpochXactDispatch(XACT_EVENT_ABORT);
 
         AtEOXact_SysDBCache(false);
         ResourceOwnerRelease(t_thrd.utils_cxt.TopTransactionResourceOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
