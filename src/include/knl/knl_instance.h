@@ -194,6 +194,8 @@ typedef struct knl_g_pid_context {
     ThreadId CPMonitorPID;
     ThreadId AlarmCheckerPID;
     ThreadId CBMWriterPID;
+//HCJ ADDBY
+    ThreadId EpochWorkerPID;
     ThreadId AioCompleterStarted;
     ThreadId HeartbeatPID;
     ThreadId CsnminSyncPID;

@@ -22,4 +22,5 @@ objfiles.txt
 /ereport.txt
 
 /build/script/version.cfg
-/cmake_build
+/cmake_buildopengauss_debug.tar.gz
+opengauss_debug.tar.gz

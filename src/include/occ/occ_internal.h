@@ -51,7 +51,7 @@ inline O_TxnManager *GetTxnManager()
 /* 开关：true = commit 写 heap 后镜像 delta，读路径优先查 delta 分片表 */
 extern bool g_enable_occ_delta;
 
-/* 设为 true 时每次 abort 写 OCC_STATS 到 pg_log；默认 false，每 1024 次 abort 采样一行 */
+/* occ_enable_stats_log GUC：true 时每次 commit/abort 写 OCC_STATS；false 时每 1024 次采样 */
 extern bool g_occ_enable_stats_log;
 
 /* 简单 C 接口，方便测试或后续挂接到 GUC */

@@ -1438,6 +1438,17 @@ void knl_u_occ_init(knl_u_occ_context* occ_cxt)
     occ_cxt->txn_arena.offset = 0;
 }
 
+//HCJ ADDBY
+void knl_u_epoch_init(knl_u_epoch_context* epoch_cxt)
+{
+    Assert(epoch_cxt != NULL);
+    epoch_cxt->start_epoch = 0;
+    epoch_cxt->commit_epoch = 0;
+    epoch_cxt->epoch_assigned = false;
+    epoch_cxt->deferred_commit = false;
+    epoch_cxt->epoch_exec_counted = false;
+}
+
 #ifdef USE_SPQ
 static void knl_u_spq_init(knl_u_spq_context* spq_cxt)
 {
@@ -1603,6 +1614,8 @@ void knl_session_init(knl_session_context* sess_cxt)
 #endif
 //    HCJ ADDBY
     knl_u_occ_init(&sess_cxt->occ_cxt);
+//HCJ ADDBY
+    knl_u_epoch_init(&sess_cxt->epoch_cxt);
 #ifdef USE_SPQ
     knl_u_spq_init(&sess_cxt->spq_cxt);
 #endif

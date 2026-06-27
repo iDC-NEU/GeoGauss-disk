@@ -4,6 +4,7 @@
 
 #include "occ/o_txn.h"
 #include "occ/o_delta_table.h"
+#include "occ/o_staging.h"
 #include "occ/occ_internal.h"
 #include "occ/occ_stats.h"
 
@@ -298,15 +299,41 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, const occ_sentine
         return false;
     }
 
-    if (g_enable_occ_delta) {
-        O_DeltaEntry deltaEntry;
-        if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
-            if (deltaEntry.deleted || deltaEntry.tuple == nullptr) {
+    if (OccStagingOverlayEnabled()) {
+        HeapTuple staged = nullptr;
+        bool deleted = false;
+        if (OccStagingTryReadTuple(rel, &sent.tuple_id, &staged, &deleted)) {
+            if (deleted || staged == nullptr || staged->t_data == nullptr) {
+                if (staged != nullptr) {
+                    heap_freetuple(staged);
+                }
                 O_CloseRelationIfOpened(rel, relClosed);
                 return false;
             }
-            tuple = *deltaEntry.tuple;
-            bool ok = (access->m_csn == tuple.t_data->m_rowCSN);
+            bool ok = (access->m_csn == staged->t_data->m_rowCSN);
+            heap_freetuple(staged);
+            O_CloseRelationIfOpened(rel, relClosed);
+            return ok;
+        }
+    }
+
+    if (g_enable_occ_delta && !g_enable_occ_staging) {
+        O_DeltaEntry deltaEntry;
+        if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
+            if (deltaEntry.deleted) {
+                O_CloseRelationIfOpened(rel, relClosed);
+                return false;
+            }
+            HeapTuple copy = O_DeltaTable::Instance().LookupCopyTuple(rel, &sent.tuple_id);
+            if (copy == nullptr || copy->t_data == nullptr) {
+                if (copy != nullptr) {
+                    heap_freetuple(copy);
+                }
+                O_CloseRelationIfOpened(rel, relClosed);
+                return false;
+            }
+            bool ok = (access->m_csn == copy->t_data->m_rowCSN);
+            heap_freetuple(copy);
             O_CloseRelationIfOpened(rel, relClosed);
             return ok;
         }
@@ -360,15 +387,41 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, const occ_sentin
         return false;
     }
 
-    if (g_enable_occ_delta) {
-        O_DeltaEntry deltaEntry;
-        if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
-            if (deltaEntry.deleted || deltaEntry.tuple == nullptr) {
+    if (OccStagingOverlayEnabled()) {
+        HeapTuple staged = nullptr;
+        bool deleted = false;
+        if (OccStagingTryReadTuple(rel, &sent.tuple_id, &staged, &deleted)) {
+            if (deleted || staged == nullptr || staged->t_data == nullptr) {
+                if (staged != nullptr) {
+                    heap_freetuple(staged);
+                }
                 O_CloseRelationIfOpened(rel, relClosed);
                 return false;
             }
-            tuple = *deltaEntry.tuple;
-            bool ok = OccTupleVersionMatches(access, tuple.t_data, checkLatest);
+            bool ok = OccTupleVersionMatches(access, staged->t_data, checkLatest);
+            heap_freetuple(staged);
+            O_CloseRelationIfOpened(rel, relClosed);
+            return ok;
+        }
+    }
+
+    if (g_enable_occ_delta && !g_enable_occ_staging) {
+        O_DeltaEntry deltaEntry;
+        if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
+            if (deltaEntry.deleted) {
+                O_CloseRelationIfOpened(rel, relClosed);
+                return false;
+            }
+            HeapTuple copy = O_DeltaTable::Instance().LookupCopyTuple(rel, &sent.tuple_id);
+            if (copy == nullptr || copy->t_data == nullptr) {
+                if (copy != nullptr) {
+                    heap_freetuple(copy);
+                }
+                O_CloseRelationIfOpened(rel, relClosed);
+                return false;
+            }
+            bool ok = OccTupleVersionMatches(access, copy->t_data, checkLatest);
+            heap_freetuple(copy);
             O_CloseRelationIfOpened(rel, relClosed);
             return ok;
         }

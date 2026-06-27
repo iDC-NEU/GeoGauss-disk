@@ -36,6 +36,7 @@
 
 //HCJ ADDBY
 #include "occ/o_executor.h"
+#include "occ/o_config.h"
 
 extern void ExecEndPlan(PlanState* planstate, EState* estate);
 
@@ -381,7 +382,7 @@ unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_i
     List* recheck_indexes = NIL;
 
 //HCJ ADDBY
-    bool enable_occ = true;
+    bool enable_occ = OccDiskAccessHooksEnabled();
     if (enable_occ) {
         O_InsertRow(&(((HeapTuple)tuple)->t_self),m_c_local.m_estate,(HeapTuple)tuple);
     }

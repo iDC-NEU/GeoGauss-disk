@@ -218,6 +218,13 @@ static void knl_t_cbm_init(knl_t_cbm_context* cbm_cxt)
     cbm_cxt->cbmwriter_page_context = NULL;
 }
 
+//HCJ ADDBY
+static void knl_t_epoch_worker_init(knl_t_epoch_worker_context* epoch_worker_cxt)
+{
+    epoch_worker_cxt->got_SIGHUP = false;
+    epoch_worker_cxt->shutdown_requested = false;
+}
+
 static void knl_t_shemem_ptr_init(knl_t_shemem_ptr_context* shemem_ptr_cxt)
 {
     shemem_ptr_cxt->scan_locations = NULL;
@@ -1884,6 +1891,8 @@ void knl_thread_init(knl_thread_role role)
     knl_t_barrier_creator_init(&t_thrd.barrier_creator_cxt);
     knl_t_bulkload_init(&t_thrd.bulk_cxt);
     knl_t_cbm_init(&t_thrd.cbm_cxt);
+//HCJ ADDBY
+    knl_t_epoch_worker_init(&t_thrd.epoch_worker_cxt);
     knl_t_checkpoint_init(&t_thrd.checkpoint_cxt);
     knl_t_codegen_init(&t_thrd.codegen_cxt);
     knl_t_comm_init(&t_thrd.comm_cxt);
