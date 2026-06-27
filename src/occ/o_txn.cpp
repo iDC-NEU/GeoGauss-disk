@@ -5,6 +5,7 @@
 #include "occ/occ_mem.h"
 #include "occ/o_txn.h"
 #include "occ/occ_internal.h"
+#include "epoch/e_exec_track.h"
 
 #include "access/heapam.h"
 #include "utils/rel.h"
@@ -160,11 +161,15 @@ bool O_TxnManager::CheckUnique(const AccessType type, occ_sentinel const &origin
 
 RC O_TxnManager::AccessLookup(const AccessType type, occ_sentinel const &originalSentinel, HeapTuple &localRow)
 {
+    if (type == INS || type == WR || type == DEL) {
+        EpochMaybeMarkTxnExecuting();
+    }
     return m_accessMgr->AccessLookup(type, originalSentinel, localRow);
 }
 
 RC O_TxnManager::InsertRow(HeapTuple heap_tuple, occ_sentinel sentinel)
 {
+    EpochMaybeMarkTxnExecuting();
     RC rc;
     m_accessMgr->GetInsertMgr()->ExecuteOptimisticInsert(heap_tuple, sentinel);
     return rc;
@@ -172,6 +177,9 @@ RC O_TxnManager::InsertRow(HeapTuple heap_tuple, occ_sentinel sentinel)
 
 RC O_TxnManager::UpdateLastRowState(AccessType state, bool update_index)
 {
+    if (state == WR || state == DEL) {
+        EpochMaybeMarkTxnExecuting();
+    }
     O_Access *ac = m_accessMgr->GetLastAccess();
     if (ac == nullptr) {
         return RC_ERROR;
@@ -202,6 +210,19 @@ void O_TxnManager::RecordCommit()
     CommitInternal();
 }
 
+void O_TxnManager::ReleaseOccLocks()
+{
+    m_occManager.ReleaseLocks(this);
+}
+
+bool O_TxnManager::RevalidateWriteSet()
+{
+    m_occManager.SetActiveTxn(this);
+    bool ok = m_occManager.ValidateWriteSet(this);
+    m_occManager.SetActiveTxn(nullptr);
+    return ok;
+}
+
 void O_TxnManager::CommitInternal()
 {
     m_occManager.WriteChanges(this);
@@ -210,6 +231,7 @@ void O_TxnManager::CommitInternal()
 
 RC O_TxnManager::DeleteLastRow()
 {
+    EpochMaybeMarkTxnExecuting();
     RC rc;
     O_Access *access = m_accessMgr->GetLastAccess();
     if (access == nullptr)

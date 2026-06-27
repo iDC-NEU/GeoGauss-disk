@@ -90,6 +90,7 @@
 
 //HCJ ADDBY
 #include "occ/o_executor.h"
+#include "occ/o_config.h"
 
 #ifdef PGXC
 static void RecoredGeneratedExpr(ResultRelInfo *resultRelInfo, EState *estate, CmdType cmdtype);
@@ -1564,7 +1565,7 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                 pTSelf = tableam_tops_get_t_self(result_relation_desc, tuple);
 
                 //                        HCJ ADDBY
-                bool enable_occ = true;
+                bool enable_occ = OccDiskAccessHooksEnabled();
                 if (enable_occ) {
                     O_InsertRow(pTSelf,estate,(HeapTuple)tuple);
                 }
@@ -3448,7 +3449,7 @@ static TupleTableSlot* ExecReplace(EState* estate, ModifyTableState* node, Tuple
 static TupleTableSlot* ExecModifyTable(PlanState* state)
 {
 //    HCJ ADDBY
-    bool enable_occ = true;
+    bool enable_occ = OccDiskAccessHooksEnabled();
 
     ModifyTableState* node = castNode(ModifyTableState, state);
     EState* estate = node->ps.state;

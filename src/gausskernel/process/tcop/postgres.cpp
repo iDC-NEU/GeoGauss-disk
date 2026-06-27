@@ -65,6 +65,8 @@
 #include "libpq/pqsignal.h"
 #include "libpq/crypt.h"
 #include "miscadmin.h"
+//HCJ ADDBY
+#include "epoch/e_init.h"
 #include "nodes/print.h"
 #include "optimizer/planner.h"
 #include "optimizer/bucketpruning.h"
@@ -8114,6 +8116,10 @@ int PostgresMain(int argc, char* argv[], const char* dbname, const char* usernam
      */
     if (!IsUnderPostmaster) {
         InitializeGUCOptions();
+        //HCJ ADDBY
+        u_sess->misc_cxt.process_shared_preload_libraries_in_progress = true;
+        EpochBootStrap();
+        u_sess->misc_cxt.process_shared_preload_libraries_in_progress = false;
     }
 
     /* set user-defined params */

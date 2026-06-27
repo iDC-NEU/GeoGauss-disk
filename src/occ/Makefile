@@ -3,13 +3,18 @@ subdir = src/occ
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 
-
 # 所有 cpp 文件对象（含 occ-opt 优化路径）
+OCC_OPT_CPPFLAGS = -I$(top_srcdir)/src/occ-opt
+CPPFLAGS += $(OCC_OPT_CPPFLAGS)
+
 OBJS = $(patsubst %.cpp,%.o,$(wildcard *.cpp)) \
        $(patsubst ../occ-opt/%.cpp,../occ-opt/%.o,$(wildcard ../occ-opt/*.cpp))
 
 ../occ-opt/%.o: ../occ-opt/%.cpp
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(OCC_OPT_CPPFLAGS) -c -o $@ $<
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(OCC_OPT_CPPFLAGS) -c -o $@ $<
 
 # 生成所有对象文件
 all: $(OBJS) SUBSYS.o objfiles.txt
@@ -24,3 +29,5 @@ objfiles.txt: $(OBJS)
 
 clean:
 	rm -f *.o ../occ-opt/*.o SUBSYS.o objfiles.txt
+
+.PHONY: all clean

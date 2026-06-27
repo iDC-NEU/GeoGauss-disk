@@ -59,10 +59,10 @@ public:
     static O_DeltaTable &Instance();
 
     /* Upsert committed version into delta table. */
-    void Upsert(Relation relation, ItemPointer tid, HeapTuple tuple, uint64 csn);
+    void Upsert(Relation relation, ItemPointer tid, HeapTuple tuple, uint64_t csn);
 
     /* Mark tuple as deleted in delta table. */
-    void MarkDeleted(Relation relation, ItemPointer tid, uint64 csn);
+    void MarkDeleted(Relation relation, ItemPointer tid, uint64_t csn);
 
     /*
      * Lookup latest committed entry in delta table.
@@ -92,4 +92,3 @@ private:
 };
 
 #endif // OPENGAUSS_O_DELTA_TABLE_H
-

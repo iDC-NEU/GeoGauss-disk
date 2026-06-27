@@ -2792,6 +2792,15 @@ typedef struct knl_u_occ_context {
     OccTxnArena txn_arena;
 } knl_u_occ_context;
 
+//HCJ ADDBY
+typedef struct knl_u_epoch_context {
+    uint64_t start_epoch;
+    uint64_t commit_epoch;
+    bool epoch_assigned;
+    bool deferred_commit;
+    bool epoch_exec_counted;
+} knl_u_epoch_context;
+
 #ifdef USE_SPQ
 namespace spqdxl {
     class CDXLMemoryManager;
@@ -3151,6 +3160,8 @@ typedef struct knl_session_context {
 
 //    HCJ ADDBY
     knl_u_occ_context occ_cxt;
+//HCJ ADDBY
+    knl_u_epoch_context epoch_cxt;
 
 #ifdef USE_SPQ
     knl_u_spq_context spq_cxt;
@@ -3254,6 +3265,7 @@ extern void knl_u_mot_init(knl_u_mot_context* mot_cxt);
 
 //HCJ ADDBY
 void knl_u_occ_init(knl_u_occ_context* occ_cxt);
+void knl_u_epoch_init(knl_u_epoch_context* epoch_cxt);
 
 inline bool stp_disable_xact_and_set_err_msg(bool *save_commit_rollback_state, stp_xact_err_type type) 
 {

@@ -116,6 +116,7 @@
 //HCJ ADDBY
 #include "occ/o_executor.h"
 #include "occ/occ_internal.h"
+#include "occ/o_config.h"
 
 #define DECOMPRESS_HEAP_TUPLE(_isCompressed, _heapTuple, _destTupleData, _rd_att, _heapPage)  \
     do {                                                                                      \
@@ -2206,7 +2207,7 @@ hcj1:
     Assert(!HEAP_TUPLE_IS_COMPRESSED(scan->rs_ctup.t_data));
 
     //    HCJ ADDBY
-    enable_occ = true;
+    enable_occ = OccDiskAccessHooksEnabled();
     if (enable_occ && O_TxnHasActiveWriteSet()) {
         currRow = O_seq_scan(scan);
         if (currRow != NULL) {

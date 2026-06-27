@@ -5,13 +5,13 @@
 #include "occ/o_txn.h"
 #include "occ/occ_mem.h"
 #include "occ/o_delta_table.h"
+#include "occ/o_staging.h"
 #include "occ/occ_internal.h"
 
 // 应该不需要在进行hot扫描
 bool O_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, HeapTuple heap_tuple, Snapshot snapshot)
 {
     TransactionId prev_xmax = InvalidTransactionId;
-    // t_data指向实际内存
     Page dp = (Page)BufferGetPage(buffer);
     BlockNumber blkno;
     OffsetNumber offnum;
@@ -27,18 +27,14 @@ bool O_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
         ItemId lp;
         lp = PageGetItemId(dp, offnum);
 
-        /* check for unused, dead, or redirected items */
         if (!ItemIdIsNormal(lp))
         {
-            /* We should only see a redirect at start of chain */
             if (ItemIdIsRedirected(lp) && at_chain_start)
             {
-                /* Follow the redirect */
                 offnum = ItemIdGetRedirect(lp);
                 at_chain_start = false;
                 continue;
             }
-            /* else must be end of chain */
             return false;
         }
 
@@ -54,7 +50,7 @@ bool O_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
             return false;
         }
 
-        return true; // 此处直接返回
+        return true;
 
         if (snapshot == nullptr)
         {
@@ -84,7 +80,7 @@ bool O_heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
         }
         else
         {
-            return false; /* end of chain */
+            return false;
         }
     }
     return false;
@@ -94,9 +90,24 @@ HeapTuple occ_sentinel::GetData(HeapTuple heap_tuple, Buffer buffer)
 {
     ItemPointer tid = &tuple_id;
 
-    if (g_enable_occ_delta)
+    if (OccStagingOverlayEnabled())
     {
-        /* delta 模式：若 overlay 里有最新版本，直接返回 */
+        HeapTuple copy = nullptr;
+        bool deleted = false;
+        if (OccStagingTryReadTuple(relation, tid, &copy, &deleted))
+        {
+            if (deleted || copy == nullptr) {
+                if (copy != nullptr) {
+                    heap_freetuple(copy);
+                }
+                return nullptr;
+            }
+            return copy;
+        }
+    }
+
+    if (g_enable_occ_delta && !g_enable_occ_staging)
+    {
         O_DeltaEntry deltaEntry;
         if (O_DeltaTable::Instance().Lookup(relation, tid, deltaEntry))
         {
@@ -123,9 +134,24 @@ HeapTuple occ_sentinel::GetData(HeapTuple heap_tuple)
 {
     ItemPointer tid = &tuple_id;
 
-    if (g_enable_occ_delta)
+    if (OccStagingOverlayEnabled())
     {
-        /* delta 模式：优先从 overlay 读取 */
+        HeapTuple copy = nullptr;
+        bool deleted = false;
+        if (OccStagingTryReadTuple(relation, tid, &copy, &deleted))
+        {
+            if (deleted || copy == nullptr) {
+                if (copy != nullptr) {
+                    heap_freetuple(copy);
+                }
+                return nullptr;
+            }
+            return copy;
+        }
+    }
+
+    if (g_enable_occ_delta && !g_enable_occ_staging)
+    {
         O_DeltaEntry deltaEntry;
         if (O_DeltaTable::Instance().Lookup(relation, tid, deltaEntry))
         {

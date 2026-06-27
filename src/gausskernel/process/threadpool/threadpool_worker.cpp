@@ -35,6 +35,9 @@
 
 #include "threadpool/threadpool.h"
 
+//HCJ ADDBY
+#include "epoch/e_init.h"
+
 #include "access/xact.h"
 #include "access/multi_redo_api.h"
 #include "commands/prepare.h"
@@ -833,6 +836,10 @@ static bool InitSession(knl_session_context* session)
 
     /* Init GUC option for this session. */
     InitializeGUCOptions();
+    //HCJ ADDBY
+    u_sess->misc_cxt.process_shared_preload_libraries_in_progress = true;
+    EpochBootStrap();
+    u_sess->misc_cxt.process_shared_preload_libraries_in_progress = false;
 
     init_set_user_params_htab();
 

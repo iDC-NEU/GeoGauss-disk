@@ -28,6 +28,9 @@
 #include "postgres.h"
 
 #include "distributelayer/streamMain.h"
+
+//HCJ ADDBY
+#include "epoch/e_init.h"
 #include "distributelayer/streamProducer.h"
 #include "executor/executor.h"
 #include "gs_thread.h"
@@ -135,6 +138,10 @@ void ThreadPoolStream::InitStream()
 
     /* Init GUC option for this session. */
     InitializeGUCOptions();
+    //HCJ ADDBY
+    u_sess->misc_cxt.process_shared_preload_libraries_in_progress = true;
+    EpochBootStrap();
+    u_sess->misc_cxt.process_shared_preload_libraries_in_progress = false;
     init_set_user_params_htab();
     /* Read in remaining GUC variables */
     read_nondefault_variables();

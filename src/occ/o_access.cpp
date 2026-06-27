@@ -6,6 +6,7 @@
 #include "occ/o_heapam.h"
 #include "occ/o_executor.h"
 #include "occ/o_delta_table.h"
+#include "occ/o_staging.h"
 #include "occ/occ_internal.h"
 
 #include "utils/rel.h"
@@ -31,7 +32,7 @@ static Relation O_OpenAccessRelation(O_Access *access, bool *needClose)
 
 static void O_MirrorToDelta(O_Access *access, HeapTuple tuple, uint64_t csn, bool deleted)
 {
-    if (!g_enable_occ_delta || access == nullptr) {
+    if (!g_enable_occ_delta || g_enable_occ_staging || access == nullptr) {
         return;
     }
 
@@ -45,6 +46,36 @@ static void O_MirrorToDelta(O_Access *access, HeapTuple tuple, uint64_t csn, boo
         tuple->t_data->m_rowCSN = csn;
         tuple->t_data->is_latest = true;
         delta.Upsert(access->m_origSentinel.relation, &access->m_origSentinel.tuple_id, tuple, csn);
+    }
+}
+
+static bool O_StageAccessCommit(O_Access *access, Relation rel, ItemPointer tid, uint64_t csn)
+{
+    OccStagingEnsureInit();
+
+    switch (access->m_type) {
+    case WR:
+    case INV: {
+        HeapTuple newVersion = access->m_localRow;
+        if (newVersion == nullptr || newVersion->t_data == nullptr) {
+            return false;
+        }
+        newVersion->t_data->m_rowCSN = csn;
+        newVersion->t_data->is_latest = true;
+        return OccStageAccessCommit(rel, tid, newVersion, csn, access->m_type);
+    }
+    case DEL:
+        return OccStageAccessCommit(rel, tid, nullptr, csn, access->m_type);
+    case INS: {
+        HeapTuple insTuple = access->m_localInsertRow ? access->m_localInsertRow : access->m_localRow;
+        if (insTuple != nullptr && insTuple->t_data != nullptr) {
+            insTuple->t_data->m_rowCSN = csn;
+            insTuple->t_data->is_latest = true;
+        }
+        return OccStageAccessCommit(rel, tid, insTuple, csn, access->m_type);
+    }
+    default:
+        return false;
     }
 }
 
@@ -75,10 +106,14 @@ void O_Access::WriteGlobalChanges(uint64_t csn, const occ_sentinel &key)
     }
     m_origSentinel.tuple_id = tid;
 
-    /*
-     * 始终以 heap 为权威存储落盘；delta 仅作读路径覆盖缓存。
-     * INSERT 的索引在 Executor/OpFusion 插入阶段已维护，此处只补写 CSN。
-     */
+    if (g_enable_occ_staging) {
+        (void)O_StageAccessCommit(this, rel, &tid, csn);
+        if (relClosed) {
+            heap_close(rel, RowExclusiveLock);
+        }
+        return;
+    }
+
     switch (m_type) {
     case WR:
     case INV: {

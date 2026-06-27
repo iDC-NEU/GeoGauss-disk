@@ -626,6 +626,8 @@ typedef enum {
     BarrierPreParseBackendProcess,
     DmsAuxiliaryProcess,
     ExrtoRecyclerProcess,
+//HCJ ADDBY
+    EpochWorkerProcess,
     NUM_SINGLE_AUX_PROC, /* Sentry for auxiliary type with single thread. */
 
     /*
@@ -660,6 +662,8 @@ typedef enum {
 #define AmWLMArbiterProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == WLMArbiterWorkerProcess)
 #define AmCPMonitorProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == CPMonitorProcess)
 #define AmCBMWriterProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == CBMWriterProcess)
+//HCJ ADDBY
+#define AmEpochWorkerProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == EpochWorkerProcess)
 #define AmRemoteServiceProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == RemoteServiceProcess)
 #define AmPageWriterProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == PageWriterProcess)
 #define AmPageWriterMainProcess() (t_thrd.bootstrap_cxt.MyAuxProcType == PageWriterProcess && \

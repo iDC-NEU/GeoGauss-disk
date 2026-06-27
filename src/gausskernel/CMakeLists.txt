@@ -173,6 +173,8 @@ list(APPEND gaussdb_objects
     $<TARGET_OBJECTS:gausskernel_storage_access_heap>
 #HCJ ADDBY
     $<TARGET_OBJECTS:gausskernel_storage_access_occ>
+    $<TARGET_OBJECTS:gausskernel_storage_access_epoch>
+    $<TARGET_OBJECTS:gausskernel_storage_access_dynamic_net>
     $<TARGET_OBJECTS:gausskernel_storage_access_index>
     $<TARGET_OBJECTS:gausskernel_storage_access_nbtree>
     $<TARGET_OBJECTS:gausskernel_storage_access_psort>
@@ -388,6 +390,13 @@ if("${ENABLE_MOT}" STREQUAL "ON")
     include_directories(${MASSTREE_INCLUDE_PATH})
     list(APPEND gaussdb_LINK_DIRS ${MASSTREE_LIB_PATH})
     list(APPEND gaussdb_LINK_LIBS atomic masstree)
+endif()
+
+#HCJ ADDBY
+set(EPOCH_ZMQ_ROOT "/home/hcj2003/GeoGauss/dest" CACHE PATH "Root path of libzmq install")
+if(EXISTS "${EPOCH_ZMQ_ROOT}/lib/libzmq.so")
+    list(APPEND gaussdb_LINK_DIRS ${EPOCH_ZMQ_ROOT}/lib)
+    list(APPEND gaussdb_LINK_LIBS zmq)
 endif()
 
 if("${SUPPORT_HOTPATCH}" STREQUAL "yes")

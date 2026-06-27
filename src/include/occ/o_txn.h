@@ -51,6 +51,12 @@ public:
 
     void RecordCommit();
 
+    /* ValidateCommit 成功后、等待 epoch gate 前释放行锁，避免挡住其他事务 pack/seal */
+    void ReleaseOccLocks();
+
+    /* RECORD_COMMIT 落盘前二次校验写集版本（early unlock 后防 lost update） */
+    bool RevalidateWriteSet();
+
     RC DeleteLastRow();
 
     RC ValidateCommit();

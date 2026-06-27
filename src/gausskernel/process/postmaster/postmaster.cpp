@@ -157,6 +157,8 @@
 #include "replication/ss_disaster_cluster.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/cbmwriter.h"
+//HCJ ADDBY
+#include "postmaster/epoch_worker.h"
 #include "postmaster/startup.h"
 #include "postmaster/twophasecleaner.h"
 #include "postmaster/licensechecker.h"
@@ -180,6 +182,9 @@
 #include "utils/builtins.h"
 #include "utils/datetime.h"
 #include "utils/guc.h"
+//HCJ ADDBY
+#include "epoch/e_init.h"
+#include "epoch/e_config.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/plog.h"
@@ -488,6 +493,8 @@ static void StartTxnSnapWorker(void);
 static void StartAutovacuumWorker(void);
 static void StartUndoWorker(void);
 static void StartApplyWorker(void);
+//HCJ ADDBY: epoch worker 需 backend 子槽位，与 logical apply worker 一致
+static void StartEpochWorker(void);
 static ThreadId StartCatchupWorker(void);
 static void InitPostmasterDeathWatchHandle(void);
 static void NotifyShutdown(void);
@@ -1903,6 +1910,10 @@ int PostmasterMain(int argc, char* argv[])
      * Options setup
      */
     InitializeGUCOptions();
+    //HCJ ADDBY: 须在 build_guc_variables 之后注册自定义 GUC，否则会被覆盖
+    u_sess->misc_cxt.process_shared_preload_libraries_in_progress = true;
+    EpochBootStrap();
+    u_sess->misc_cxt.process_shared_preload_libraries_in_progress = false;
 
     /*
      *Initialize Callback function type of cb_for_getlc
@@ -4273,6 +4284,10 @@ static int ServerLoop(void)
             if (g_instance.pid_cxt.CBMWriterPID == 0 && !dummyStandbyMode &&
                 u_sess->attr.attr_storage.enable_cbm_tracking)
                 g_instance.pid_cxt.CBMWriterPID = initialize_util_thread(CBMWRITER);
+
+//HCJ ADDBY
+            if (g_instance.pid_cxt.EpochWorkerPID == 0 && !dummyStandbyMode && g_enable_epoch_multimaster)
+                StartEpochWorker();
 
             if (!dummyStandbyMode && ENABLE_INCRE_CKPT && !SS_IN_FAILOVER) {
                 for (int i = 0; i < g_instance.ckpt_cxt_ctl->pgwr_procs.num; i++) {
@@ -7241,6 +7256,11 @@ static void reaper(SIGNAL_ARGS)
                 g_instance.pid_cxt.CBMWriterPID = initialize_util_thread(CBMWRITER);
             }
 
+//HCJ ADDBY
+            if (g_instance.pid_cxt.EpochWorkerPID == 0 && !dummyStandbyMode && g_enable_epoch_multimaster) {
+                StartEpochWorker();
+            }
+
             if (IS_EXRTO_READ && g_instance.pid_cxt.exrto_recycler_pid == 0) {
                 g_instance.pid_cxt.exrto_recycler_pid = initialize_util_thread(EXRTO_RECYCLER);
             }
@@ -8019,6 +8039,16 @@ static void reaper(SIGNAL_ARGS)
             continue;
         }
 
+//HCJ ADDBY
+        if (pid == g_instance.pid_cxt.EpochWorkerPID) {
+            g_instance.pid_cxt.EpochWorkerPID = 0;
+
+            if (!EXIT_STATUS_0(exitstatus)) {
+                LogChildExit(LOG, _("epoch worker process"), pid, exitstatus);
+            }
+            continue;
+        }
+
         /*
         * Check if this child was a undo recycle process.
         */
@@ -8222,6 +8252,9 @@ static const char* GetProcName(ThreadId pid)
         return "aio completer process";
     else if (pid == g_instance.pid_cxt.CBMWriterPID)
         return "CBM writer process";
+//HCJ ADDBY
+    else if (pid == g_instance.pid_cxt.EpochWorkerPID)
+        return "epoch worker process";
     else if (g_instance.pid_cxt.HeartbeatPID == pid)
         return "Heartbeat process";
 #ifdef ENABLE_MULTIPLE_NODES
@@ -11337,6 +11370,48 @@ static void StartUndoWorker(void)
 
 }
 
+//HCJ ADDBY: 启动 epoch worker（完整 backend 进程 + InitApplyWorker，参考 StartApplyWorker）
+static void StartEpochWorker(void)
+{
+    Backend* bn = NULL;
+
+    if (canAcceptConnections(false) != CAC_OK) {
+        return;
+    }
+
+    int slot = AssignPostmasterChildSlot();
+    if (slot < 1) {
+        ereport(LOG, (errmsg("no free slots for epoch worker")));
+        return;
+    }
+
+    bn = AssignFreeBackEnd(slot);
+    if (bn == NULL) {
+        (void)ReleasePostmasterChildSlot(slot);
+        ereport(LOG, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+        return;
+    }
+
+    t_thrd.proc_cxt.MyCancelKey = PostmasterRandom();
+    bn->cancel_key = t_thrd.proc_cxt.MyCancelKey;
+    bn->child_slot = t_thrd.proc_cxt.MyPMChildSlot = slot;
+    bn->role = EPOCHWORKER;
+    bn->pid = initialize_util_thread(EPOCHWORKER, bn);
+    t_thrd.proc_cxt.MyPMChildSlot = 0;
+
+    if (bn->pid > 0) {
+        g_instance.pid_cxt.EpochWorkerPID = bn->pid;
+        bn->is_autovacuum = false;
+        DLInitElem(&bn->elem, bn);
+        DLAddHead(g_instance.backend_list, &bn->elem);
+        return;
+    }
+
+    (void)ReleasePostmasterChildSlot(bn->child_slot);
+    bn->pid = 0;
+    bn->role = (knl_thread_role)0;
+}
+
 /*
  * Reaper -- signal handler to cleanup after a child process dies.
  */
@@ -13698,6 +13773,7 @@ static void SetAuxType()
         case CBMWRITER:
             t_thrd.bootstrap_cxt.MyAuxProcType = CBMWriterProcess;
             break;
+//HCJ ADDBY: epoch worker 使用完整 backend 会话，不走 auxiliary
         case STARTUP:
             t_thrd.bootstrap_cxt.MyAuxProcType = StartupProcess;
             break;
@@ -14150,6 +14226,10 @@ int GaussDbThreadMain(knl_thread_arg* arg)
     }
 
     InitializeGUCOptions();
+    //HCJ ADDBY: 辅助线程也需注册 epoch/OCC GUC，否则 SHOW/会话内不可见
+    u_sess->misc_cxt.process_shared_preload_libraries_in_progress = true;
+    EpochBootStrap();
+    u_sess->misc_cxt.process_shared_preload_libraries_in_progress = false;
 
     init_set_user_params_htab();
     /*
@@ -14362,6 +14442,13 @@ int GaussDbThreadMain(knl_thread_arg* arg)
         case JOB_WORKER: {
             InitProcessAndShareMemory();
             JobExecuteWorkerMain();
+            proc_exit(0);
+        } break;
+
+        //HCJ ADDBY: 磁盘 epoch apply 需库级会话，走 InitProcessAndShareMemory 而非 auxiliary
+        case EPOCHWORKER: {
+            InitProcessAndShareMemory();
+            EpochWorkerMain();
             proc_exit(0);
         } break;
 
@@ -14831,6 +14918,8 @@ static ThreadMetaData GaussdbThreadGate[] = {
     { GaussDbThreadMain<DATARECIVER>, DATARECIVER, "datareceiver", "data receiver" },
     { GaussDbThreadMain<DATARECWRITER>, DATARECWRITER, "datarecwriter", "data receive writer" },
     { GaussDbThreadMain<CBMWRITER>, CBMWRITER, "CBMwriter", "CBM writer" },
+//HCJ ADDBY
+    { GaussDbThreadMain<EPOCHWORKER>, EPOCHWORKER, "epochworker", "epoch worker" },
     { GaussDbThreadMain<PAGEWRITER_THREAD>, PAGEWRITER_THREAD, "pagewriter", "page writer" },
     { GaussDbThreadMain<PAGEREPAIR_THREAD>, PAGEREPAIR_THREAD, "pagerepair", "page repair" },
     { GaussDbThreadMain<HEARTBEAT>, HEARTBEAT, "heartbeat", "heart beat" },
