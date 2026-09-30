@@ -11,8 +11,8 @@ struct E_WireTxn;
  * DBR：epoch_dyn_net_catchup。上行持续堵住时，还没进发送队列的本地写集改到后面的 epoch，
  * 当前 epoch 不再计入它们，并照常发 EOF。
  * PA：epoch_dyn_net_proxy。三个及以上副本时，慢节点选定一个健康 proxy。
- * 其他健康节点不再把写集直接发到慢节点；proxy 把这些原始写集转到慢节点。
- * 慢节点下行上只剩 proxy 这一路。两个副本时没有第二路可合并，PA 不改发送。
+ * 其他健康节点不再把写集直接发到慢节点。proxy 用先写胜出规则归并健康写集，
+ * 只把仍然获胜的行发给慢节点，并按实际笔数改写 EOF。两个副本时不改发送。
  */
 
 bool EpochPacerDbrEnabled(void);
