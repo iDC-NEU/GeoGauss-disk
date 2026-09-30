@@ -10,7 +10,9 @@ struct E_WireTxn;
  * Pacer 同步层。两张开关默认关，关着时这些函数都是空操作（Wait）。
  * DBR：epoch_dyn_net_catchup。上行持续堵住时，还没进发送队列的本地写集改到后面的 epoch，
  * 当前 epoch 不再计入它们，并照常发 EOF。
- * PA：epoch_dyn_net_proxy。慢节点选定 proxy 后，健康节点把发给慢节点的那一路改到 proxy。
+ * PA：epoch_dyn_net_proxy。三个及以上副本时，慢节点选定一个健康 proxy。
+ * 其他健康节点不再把写集直接发到慢节点；proxy 把这些原始写集转到慢节点。
+ * 慢节点下行上只剩 proxy 这一路。两个副本时没有第二路可合并，PA 不改发送。
  */
 
 bool EpochPacerDbrEnabled(void);

@@ -23,7 +23,9 @@ static constexpr int64_t EPOCH_PACER_PERSIST_US = 5000;
 static constexpr int64_t EPOCH_PACER_IDLE_RELEASE_US = 5000000;
 static constexpr int EPOCH_PACER_MAX_MOVES = 4;
 static constexpr uint64_t EPOCH_PACER_MAX_DELTA = 64;
-static constexpr uint64_t EPOCH_PACER_PA_WINDOW = 8;
+/* 协助窗口要盖住接下来这一段 epoch，并在用完之前续上，避免退回对慢节点的广播。 */
+static constexpr uint64_t EPOCH_PACER_PA_WINDOW = 64;
+static constexpr uint64_t EPOCH_PACER_PA_REFRESH_LEAD = 16;
 static constexpr size_t EPOCH_PACER_MAX_MOVE_PER_TICK = 4096;
 
 struct EpochPacerPending {
@@ -122,6 +124,7 @@ static std::mutex g_pacer_session_mu;
 static EpochPacerSession g_pacer_session;
 static uint32_t g_pacer_next_session = 1;
 static bool g_pacer_logged = false;
+static bool g_pacer_pa_short_logged = false;
 
 bool EpochPacerDbrEnabled(void)
 {
@@ -408,87 +411,9 @@ void EpochPacerBeforeSeal(uint64_t epoch)
     EpochPacerAdmitList(release);
 }
 
-void EpochPacerPackTick(void)
+static void EpochPacerPublishPaActivate(uint32_t self, uint32_t proxy, uint32_t session_id, uint64_t e_f,
+                                        uint64_t e_t)
 {
-    if (!g_pacer_logged && (EpochPacerDbrEnabled() || EpochPacerPaEnabled())) {
-        g_pacer_logged = true;
-        ereport(LOG,
-            (errmsg("epoch pacer: DBR=%d PA=%d queue_tolerance=%d k=%d rtt_ms=%d",
-                EpochPacerDbrEnabled() ? 1 : 0,
-                EpochPacerPaEnabled() ? 1 : 0,
-                g_epoch_dyn_net_queue_tolerance,
-                g_epoch_dyn_net_catchup_k,
-                g_epoch_dyn_net_rtt_ms)));
-    }
-
-    if (EpochPacerDbrEnabled()) {
-        /* 积压只在关窗时按预算放回。这里整表放行会把一个 epoch 撑到上千笔。 */
-        (void)EpochPacerCongestionLatched();
-    }
-
-    if (!EpochPacerPaEnabled()) {
-        return;
-    }
-    uint32_t self = EpochGetNodeId();
-    if (!EpochPacerIdInSlowList(self)) {
-        std::lock_guard<std::mutex> lock(g_pacer_session_mu);
-        if (g_pacer_session.active && E_NodeManager::GetLogicalEpoch() > g_pacer_session.epoch_to) {
-            g_pacer_session.active = false;
-        }
-        return;
-    }
-
-    bool need_open = false;
-    {
-        std::lock_guard<std::mutex> lock(g_pacer_session_mu);
-        if (g_pacer_session.active && E_NodeManager::GetLogicalEpoch() > g_pacer_session.epoch_to) {
-            g_pacer_session.active = false;
-        }
-        need_open = !g_pacer_session.active;
-    }
-    if (!need_open) {
-        return;
-    }
-
-    uint32_t total = EpochGetTotalNodes();
-    uint32_t proxy = total;
-    uint64_t best_epoch = 0;
-    bool have = false;
-    for (uint32_t peer = 0; peer < total; ++peer) {
-        if (peer == self || EpochPacerIdInSlowList(peer)) {
-            continue;
-        }
-        uint64_t sealed = EpochGetPeerMaxSealedEpoch(peer);
-        if (!have || sealed > best_epoch || (sealed == best_epoch && peer < proxy)) {
-            proxy = peer;
-            best_epoch = sealed;
-            have = true;
-        }
-    }
-    if (!have || proxy >= total) {
-        return;
-    }
-
-    uint64_t e_f = E_NodeManager::GetLogicalEpoch();
-    if (e_f == 0) {
-        e_f = E_NodeManager::GetPhysicalEpoch();
-    }
-    if (e_f == 0) {
-        return;
-    }
-    uint64_t e_t = e_f + EPOCH_PACER_PA_WINDOW - 1;
-    uint32_t session_id = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_pacer_session_mu);
-        session_id = g_pacer_next_session++;
-        g_pacer_session.active = true;
-        g_pacer_session.slow_id = self;
-        g_pacer_session.proxy_id = proxy;
-        g_pacer_session.session_id = session_id;
-        g_pacer_session.epoch_from = e_f;
-        g_pacer_session.epoch_to = e_t;
-    }
-
     E_WireTxn msg;
     msg.csn = EPOCH_WIRE_PA_ACTIVATE_CSN;
     msg.epoch = e_f;
@@ -513,9 +438,109 @@ void EpochPacerPackTick(void)
             e_t)));
 }
 
+void EpochPacerPackTick(void)
+{
+    if (!g_pacer_logged && (EpochPacerDbrEnabled() || EpochPacerPaEnabled())) {
+        g_pacer_logged = true;
+        ereport(LOG,
+            (errmsg("epoch pacer: DBR=%d PA=%d queue_tolerance=%d k=%d rtt_ms=%d",
+                EpochPacerDbrEnabled() ? 1 : 0,
+                EpochPacerPaEnabled() ? 1 : 0,
+                g_epoch_dyn_net_queue_tolerance,
+                g_epoch_dyn_net_catchup_k,
+                g_epoch_dyn_net_rtt_ms)));
+    }
+
+    if (EpochPacerDbrEnabled()) {
+        /* 积压只在关窗时按预算放回。这里整表放行会把一个 epoch 撑到上千笔。 */
+        (void)EpochPacerCongestionLatched();
+    }
+
+    if (!EpochPacerPaEnabled()) {
+        return;
+    }
+    uint32_t self = EpochGetNodeId();
+    if (!EpochPacerIdInSlowList(self)) {
+        return;
+    }
+
+    /*
+     * 下行受限时，慢节点收到的是所有健康副本的写集之和。
+     * 至少要有两个健康副本，proxy 才能把多路收成一路。两个节点时这一路本来就只有一个发送方。
+     */
+    uint32_t total = EpochGetTotalNodes();
+    uint32_t healthy = 0;
+    uint32_t proxy = total;
+    uint64_t best_epoch = 0;
+    bool have = false;
+    for (uint32_t peer = 0; peer < total; ++peer) {
+        if (peer == self || EpochPacerIdInSlowList(peer)) {
+            continue;
+        }
+        healthy++;
+        uint64_t sealed = EpochGetPeerMaxSealedEpoch(peer);
+        if (!have || sealed > best_epoch || (sealed == best_epoch && peer < proxy)) {
+            proxy = peer;
+            best_epoch = sealed;
+            have = true;
+        }
+    }
+    if (healthy < 2 || !have || proxy >= total) {
+        if (!g_pacer_pa_short_logged) {
+            g_pacer_pa_short_logged = true;
+            ereport(LOG,
+                (errmsg("epoch pacer PA: need 3 replicas so two healthy senders can share one proxy. "
+                        "total=%u healthy=%u, keep direct send",
+                    total,
+                    healthy)));
+        }
+        return;
+    }
+
+    uint64_t e_f = E_NodeManager::GetLogicalEpoch();
+    if (e_f == 0) {
+        e_f = E_NodeManager::GetPhysicalEpoch();
+    }
+    if (e_f == 0) {
+        return;
+    }
+    uint64_t want_to = e_f + EPOCH_PACER_PA_WINDOW - 1;
+
+    uint32_t session_id = 0;
+    uint32_t use_proxy = proxy;
+    uint64_t use_from = e_f;
+    uint64_t use_to = want_to;
+    {
+        std::lock_guard<std::mutex> lock(g_pacer_session_mu);
+        if (g_pacer_session.active && g_pacer_session.slow_id == self &&
+            g_pacer_session.epoch_to >= e_f + EPOCH_PACER_PA_REFRESH_LEAD) {
+            return;
+        }
+        if (g_pacer_session.active && g_pacer_session.slow_id == self) {
+            session_id = g_pacer_session.session_id;
+            use_proxy = g_pacer_session.proxy_id;
+            use_from = g_pacer_session.epoch_from;
+            g_pacer_session.epoch_to = want_to;
+            use_to = want_to;
+        } else {
+            session_id = g_pacer_next_session++;
+            g_pacer_session.active = true;
+            g_pacer_session.slow_id = self;
+            g_pacer_session.proxy_id = proxy;
+            g_pacer_session.session_id = session_id;
+            g_pacer_session.epoch_from = e_f;
+            g_pacer_session.epoch_to = want_to;
+            use_proxy = proxy;
+            use_from = e_f;
+            use_to = want_to;
+        }
+    }
+    EpochPacerPublishPaActivate(self, use_proxy, session_id, use_from, use_to);
+}
+
 bool EpochPacerRouteSend(const std::string& wire, const E_WireTxn& txn)
 {
-    if (!EpochPacerPaEnabled() || wire.empty() || txn.epoch == 0) {
+    if (!EpochPacerPaEnabled() || wire.empty() || txn.epoch == 0 || EpochGetTotalNodes() < 3) {
         return false;
     }
     EpochPacerSession session;
@@ -565,12 +590,14 @@ bool EpochPacerOnIncoming(const E_WireTxn& txn, const std::string& wire)
             session_id = txn.rows[0].relid;
         }
         std::lock_guard<std::mutex> lock(g_pacer_session_mu);
-        if (!g_pacer_session.active || session_id >= g_pacer_session.session_id) {
+        if (!g_pacer_session.active || session_id > g_pacer_session.session_id) {
             g_pacer_session.active = true;
             g_pacer_session.slow_id = txn.server_id;
             g_pacer_session.proxy_id = txn.route_wid;
             g_pacer_session.session_id = session_id;
             g_pacer_session.epoch_from = txn.epoch;
+            g_pacer_session.epoch_to = e_t;
+        } else if (session_id == g_pacer_session.session_id && e_t > g_pacer_session.epoch_to) {
             g_pacer_session.epoch_to = e_t;
         }
         return true;
