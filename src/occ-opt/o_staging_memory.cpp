@@ -42,6 +42,10 @@ HeapTuple O_StagingCopyToPersistent(HeapTuple tuple)
         return nullptr;
     }
 
+    /*
+     * Staging MemoryContext is shared across apply/backend threads in-process.
+     * All AllocSet ops on it must hold g_staging_mcxt_mutex.
+     */
     std::lock_guard<std::mutex> lock(g_staging_mcxt_mutex);
     MemoryContext old = MemoryContextSwitchTo(O_StagingGetMemoryContext());
     HeapTuple copy = heap_copytuple(tuple);
@@ -58,4 +62,13 @@ void O_StagingFreePersistent(HeapTuple tuple)
     MemoryContext old = MemoryContextSwitchTo(O_StagingGetMemoryContext());
     heap_freetuple(tuple);
     MemoryContextSwitchTo(old);
+}
+
+HeapTuple O_StagingCopyToCaller(HeapTuple tuple)
+{
+    if (!O_StagingTupleLengthValid(tuple)) {
+        return nullptr;
+    }
+    /* CurrentMemoryContext: callers may heap_freetuple without staging mcxt lock. */
+    return heap_copytuple(tuple);
 }

@@ -3,6 +3,7 @@
 #include "epoch/e_exec_track.h"
 #include "epoch/e_config.h"
 #include "epoch/e_node_manager.h"
+#include "epoch/e_statistician.h"
 
 #include "gs_thread.h"
 #include "knl/knl_variable.h"
@@ -18,7 +19,9 @@ static bool EpochShouldTrackExecuting(void)
     if (IsAutoVacuumWorkerProcess() || AmEpochWorkerProcess()) {
         return false;
     }
-    if (t_thrd.role == EPOCHWORKER) {
+    if (t_thrd.role == EPOCHWORKER || t_thrd.role == EPOCHAPPLYWORKER || t_thrd.role == EPOCHMERGEWORKER ||
+        t_thrd.role == EPOCHPACKWORKER || t_thrd.role == EPOCHSENDWORKER ||
+        t_thrd.role == EPOCHTIPFLUSHER) {
         return false;
     }
     if (t_thrd.role != WORKER && t_thrd.role != THREADPOOL_WORKER) {
@@ -41,22 +44,42 @@ static bool EpochShouldTrackExecuting(void)
 
 void EpochMaybeMarkTxnExecuting(void)
 {
-    if (!EpochShouldTrackExecuting()) {
-        return;
-    }
-    uint64_t epoch = u_sess->epoch_cxt.commit_epoch;
-    uint32_t node_id = EpochGetNodeId();
-    E_NodeManager::IncExecutingTxnCounters(epoch, node_id);
-    u_sess->epoch_cxt.epoch_exec_counted = true;
+    EpochEnsureTxnEpochOnAccess(true);
 }
 
-void EpochReleaseTxnExecuting(void)
+void EpochTrackExecutingInc(uint64_t epoch, const char* reason)
+{
+    if (u_sess->epoch_cxt.epoch_exec_counted) {
+        return;
+    }
+    uint32_t node_id = EpochGetNodeId();
+    uint64_t after = E_NodeManager::IncExecutingTxnCounters(epoch, node_id);
+    if (after == 0) {
+        return;
+    }
+    u_sess->epoch_cxt.epoch_exec_counted = true;
+    EpochRecvDiagLogExecChange(+1, reason, epoch);
+}
+
+void EpochReleaseTxnExecuting(const char* reason)
 {
     if (!u_sess->epoch_cxt.epoch_exec_counted) {
         return;
     }
-    uint64_t epoch = u_sess->epoch_cxt.commit_epoch;
+    uint64_t epoch = u_sess->epoch_cxt.txn_epoch;
     uint32_t node_id = EpochGetNodeId();
-    E_NodeManager::DecExecutingTxnCounters(epoch, node_id);
+    const char* log_reason = reason;
+    if (!E_NodeManager::DecExecutingTxnCounters(epoch, node_id)) {
+        log_reason = "exec_dec_miss";
+    }
     u_sess->epoch_cxt.epoch_exec_counted = false;
+    EpochRecvDiagLogExecChange(-1, log_reason, epoch);
+}
+
+void EpochMaybeLogTxnProgress(const char* tag, const char* detail)
+{
+    if (!u_sess->epoch_cxt.epoch_exec_counted || u_sess->epoch_cxt.deferred_commit) {
+        return;
+    }
+    EpochRecvDiagLogTxnProgress(tag, detail);
 }

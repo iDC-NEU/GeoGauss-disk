@@ -18,7 +18,10 @@ if ! epoch_is_local_node "${NODE_ID}"; then
     REMOTE="$(epoch_ssh_target "${NODE_ID}")"
     RB="$(epoch_bench_root_for_node "${NODE_ID}")"
     ssh -o BatchMode=yes -o ConnectTimeout=10 "${REMOTE}" \
-        "export EPOCH_LOCAL_NODE_ID=${NODE_ID}; export EPOCH_BENCH_ROOT=${RB}; bash ${RB}/openGauss-server/scripts/epoch_benchmark/start_node.sh ${NODE_ID}"
+        "export EPOCH_LOCAL_NODE_ID=${NODE_ID}; export EPOCH_BENCH_ROOT=${RB}; \
+        export EPOCH_SKIP_NODE=${EPOCH_SKIP_NODE}; \
+        export EPOCH_SKIP_NODE2=$( [ \"${EPOCH_SKIP_NODE}\" = 2 ] && echo 1 || echo 0 ); \
+        bash ${RB}/openGauss-server/scripts/epoch_benchmark/start_node.sh ${NODE_ID}"
     exit $?
 fi
 
@@ -75,8 +78,9 @@ fi
 
 epoch_check_gaussdb
 
+# gs_ctl 默认 -t 60；300w 等大库 redo 可能超时，这里提到 2×（120s）
 echo "starting node ${NODE_ID} at ${DATA_DIR} ..."
-if ! gs_ctl start -D "${DATA_DIR}" -l "${LOG_FILE}" -Z single_node; then
+if ! gs_ctl start -D "${DATA_DIR}" -l "${LOG_FILE}" -Z single_node -t 120; then
     echo "gs_ctl start failed, check ${LOG_FILE}" >&2
     tail -20 "${LOG_FILE}" 2>/dev/null || true
     exit 1

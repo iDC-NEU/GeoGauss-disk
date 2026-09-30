@@ -121,6 +121,7 @@
 #include "occ/o_config.h"
 #include "epoch/e_xact.h"
 #include "epoch/e_config.h"
+#include "epoch/e_statistician.h"
 
 static void HcjOccEpochXactDispatch(XactEvent event)
 {
@@ -1473,6 +1474,32 @@ static TransactionId RecordTransactionCommit(void)
     wrote_xlog = (t_thrd.xlog_cxt.XactLastRecEnd != 0) || (isExecCN && u_sess->xact_cxt.savePrepareGID);
 
     /*
+     * sync 多主客户端 backend：不写 COMMIT/ABORT WAL、不刷盘；持久化由 apply worker 负责。
+     * XID 仍正常分配（FOR UPDATE / heap_lock_tuple 等需要）。
+     * 仍须推进内存 CLOG/CSN（无 WAL），否则 heap xmax 在 apply/可见性判断中处于「非 commit 非 abort」态。
+     */
+    if (EpochShouldSkipBackendWal()) {
+        HcjOccEpochXactDispatch(XACT_EVENT_RECORD_COMMIT);
+        t_thrd.xlog_cxt.XactLastRecEnd = 0;
+        if (markXidCommitted) {
+            if (TransactionIdDidAbort(xid))
+                ereport(PANIC, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+                                errmsg("cannot commit transaction %lu, it was already aborted", xid)));
+            latestXid = TransactionIdLatest(xid, nchildren, children);
+            t_thrd.pgxact->needToSyncXid |= SNAPSHOT_UPDATE_NEED_SYNC;
+            /*
+             * OCC/TPCC 路径会在 PRE_COMMIT 预置 commitCSN；gsql DDL（CREATE FUNCTION 等）不会。
+             * GetCommitCsn()==0 时 TransactionIdCommitTree → Assert(csn >= FROZEN) 拖垮进程。
+             */
+            if (GetCommitCsn() < COMMITSEQNO_FROZEN) {
+                setCommitCsn(getLocalNextCSN());
+            }
+            TransactionIdCommitTree(xid, nchildren, children, GetCommitCsn());
+        }
+        goto cleanup;
+    }
+
+    /*
      * If we haven't been assigned an XID yet, we neither can, nor do we want
      * to write a COMMIT record.
      */
@@ -2058,6 +2085,25 @@ static TransactionId RecordTransactionAbort(bool isSubXact)
         if (!isSubXact)
             t_thrd.xlog_cxt.XactLastRecEnd = 0;
         return InvalidTransactionId;
+    }
+
+    /*
+     * sync 客户端 backend：跳过 ABORT WAL，但仍须：
+     * 1) 内存 CLOG/CSN 标记 abort（FOR UPDATE 留下的 heap xmax 依赖此判断）；
+     * 2) 把已分配 XID 交回 ProcArrayEndTransaction。
+     */
+    if (EpochShouldSkipBackendWal()) {
+        nchildren = xactGetCommittedChildren(&children);
+        latestXid = TransactionIdLatest(xid, nchildren, children);
+        if (TransactionIdDidCommit(xid))
+            ereport(PANIC, (errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+                            errmsg("cannot abort transaction %lu, it was already committed", xid)));
+        TransactionIdAbortTree(xid, nchildren, children);
+        if (children != NULL)
+            pfree(children);
+        if (!isSubXact)
+            t_thrd.xlog_cxt.XactLastRecEnd = 0;
+        return latestXid;
     }
 
     /*
@@ -2799,6 +2845,9 @@ static void CommitTransaction(bool STP_commit)
     }
 
     CallXactCallbacks(XACT_EVENT_PRE_COMMIT);
+
+//    HCJ ADDBY
+    HcjOccEpochXactDispatch(XACT_EVENT_PRE_COMMIT);
     /*
      * The remaining actions cannot call any user-defined code, so it's safe
      * to start shutting down within-transaction services.	But note that most
@@ -3034,7 +3083,9 @@ static void CommitTransaction(bool STP_commit)
      * must be done _before_ releasing locks we hold and _after_
      * RecordTransactionCommit.
      */
-    ProcArrayEndTransaction(t_thrd.proc, latestXid);
+    if (!(g_enable_epoch_multimaster && u_sess->epoch_cxt.epoch_procarray_ended)) {
+        ProcArrayEndTransaction(t_thrd.proc, latestXid);
+    }
 
 #ifdef ENABLE_MOT
     /* Release MOT locks */

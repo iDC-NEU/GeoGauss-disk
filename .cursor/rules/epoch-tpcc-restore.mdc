@@ -1,0 +1,28 @@
+---
+description: Epoch TPCC 压测前从 *_bak 整目录恢复 live（含 pg_xlog）
+globs: scripts/epoch_benchmark/**
+alwaysApply: false
+---
+
+# Epoch TPCC 数据恢复
+
+**默认**：从 `*_bak` **整目录** rsync 到 live（含 `pg_xlog`、`global/pg_control`）。  
+原因：仅恢复 `base/<oid>`+tablespace 时，crash 后脏 WAL 残留会导致启动 `heap_*_redo` PANIC。
+
+```bash
+bash scripts/epoch_benchmark/prep_tpcc_cluster.sh
+# 或单独：
+bash scripts/epoch_benchmark/restore_tpcc_datadir.sh
+# 等价显式：
+bash scripts/epoch_benchmark/restore_tpcc_datadir.sh --full-datadir
+```
+
+旧三路径（**crash 后勿用**）：
+
+```bash
+bash scripts/epoch_benchmark/restore_tpcc_datadir.sh --db-files-only --db test
+```
+
+**tpcc300**：不再与 `test` 共住同一 data dir 维护；需要 300w 时另 `gs_initdb` 新目录再 load。
+
+压测结束后用 `verify_epoch_end_consistency.sh` 验收（默认 idle 30s）。

@@ -361,19 +361,23 @@ unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_i
         return 0;
     }
 
-    (void)tableam_tuple_insert(bucket_rel == NULL ? destRel : bucket_rel, tuple, mycid, 0, NULL);
-    if (!RELATION_IS_PARTITIONED(rel)) {
-        /* try to insert tuple into mlog-table. */
-        if (rel != NULL && rel->rd_mlogoid != InvalidOid) {
-            /* judge whether need to insert into mlog-table */
-            HeapTuple htuple = NULL;
-            if (rel->rd_tam_ops == TableAmUstore) {
-                htuple = UHeapToHeap(rel->rd_att, (UHeapTuple)tuple);
-                insert_into_mlog_table(rel, rel->rd_mlogoid, htuple, &htuple->t_self,
-                    GetCurrentTransactionId(), 'I');
-            } else {
-                insert_into_mlog_table(rel, rel->rd_mlogoid, (HeapTuple)tuple, &((HeapTuple)tuple)->t_self,
-                    GetCurrentTransactionId(), 'I');
+    bool defer_heap_insert = OccSyncDeferInsertHeapWrite();
+    Relation insert_rel = bucket_rel == NULL ? destRel : bucket_rel;
+    if (!defer_heap_insert) {
+        (void)tableam_tuple_insert(insert_rel, tuple, mycid, 0, NULL);
+        if (!RELATION_IS_PARTITIONED(rel)) {
+            /* try to insert tuple into mlog-table. */
+            if (rel != NULL && rel->rd_mlogoid != InvalidOid) {
+                /* judge whether need to insert into mlog-table */
+                HeapTuple htuple = NULL;
+                if (rel->rd_tam_ops == TableAmUstore) {
+                    htuple = UHeapToHeap(rel->rd_att, (UHeapTuple)tuple);
+                    insert_into_mlog_table(rel, rel->rd_mlogoid, htuple, &htuple->t_self,
+                        GetCurrentTransactionId(), 'I');
+                } else {
+                    insert_into_mlog_table(rel, rel->rd_mlogoid, (HeapTuple)tuple, &((HeapTuple)tuple)->t_self,
+                        GetCurrentTransactionId(), 'I');
+                }
             }
         }
     }
@@ -384,10 +388,14 @@ unsigned long InsertFusion::ExecInsert(Relation rel, ResultRelInfo* result_rel_i
 //HCJ ADDBY
     bool enable_occ = OccDiskAccessHooksEnabled();
     if (enable_occ) {
-        O_InsertRow(&(((HeapTuple)tuple)->t_self),m_c_local.m_estate,(HeapTuple)tuple);
+        if (defer_heap_insert) {
+            O_RegisterDeferredInsert(m_c_local.m_estate, insert_rel, (HeapTuple)tuple);
+        } else {
+            O_InsertRow(&(((HeapTuple)tuple)->t_self), m_c_local.m_estate, (HeapTuple)tuple);
+        }
     }
 
-    if (result_rel_info->ri_NumIndices > 0) {
+    if (!defer_heap_insert && result_rel_info->ri_NumIndices > 0) {
         recheck_indexes = ExecInsertIndexTuples(m_local.m_reslot,
                                                 &(((HeapTuple)tuple)->t_self),
                                                 m_c_local.m_estate,
@@ -851,10 +859,21 @@ TupleTableSlot* insert_real(ModifyTableState* state, TupleTableSlot* slot, EStat
                         RelationGetRelationName(target_rel))));
         return NULL;
     }
-    new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
+    bool defer_heap_insert = OccSyncDeferInsertHeapWrite();
+    if (!defer_heap_insert) {
+        new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
+    }
+    if (OccDiskAccessHooksEnabled()) {
+        if (defer_heap_insert) {
+            O_RegisterDeferredInsert(estate, target_rel, (HeapTuple)tuple);
+        } else {
+            pTSelf = tableam_tops_get_t_self(target_rel, tuple);
+            O_InsertRow(pTSelf, estate, (HeapTuple)tuple);
+        }
+    }
 
     /* insert index entries for tuple */
-    if (result_rel_info->ri_NumIndices > 0) {
+    if (!defer_heap_insert && result_rel_info->ri_NumIndices > 0) {
         pTSelf = tableam_tops_get_t_self(target_rel, tuple);
         recheck_indexes = ExecInsertIndexTuplesOpfusion(slot, pTSelf, estate, NULL, NULL,
                                                         InvalidBktId, NULL, NULL);

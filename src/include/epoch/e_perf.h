@@ -11,10 +11,7 @@ struct E_WireTxn;
 enum EpochPerfGateKind : uint8_t {
     EPOCH_PERF_GATE_START = 0,
     EPOCH_PERF_GATE_LOGICAL_COMMIT = 1,
-    EPOCH_PERF_GATE_REMOTE_EXEC = 2,
-    EPOCH_PERF_GATE_REMOTE_RECORD = 3,
-    EPOCH_PERF_GATE_ASYNC_ADMIT = 4,
-    EPOCH_PERF_GATE_ASYNC_PACK = 5,
+    EPOCH_PERF_GATE_PACK_ADMIT = 2,
 };
 
 bool EpochPerfIsEnabled(void);
@@ -35,5 +32,8 @@ void EpochPerfNoteEpochEndSend(uint64_t wire_bytes);
 void EpochPerfNoteWireRecv(const E_WireTxn& txn, uint64_t wire_bytes);
 void EpochPerfNoteHelloSend(void);
 void EpochPerfNoteTxnRequestSend(void);
+void EpochPerfNoteApplyCommitTxn(void);
+void EpochPerfNoteApplyAbortTxn(void);
+void EpochPerfNoteMergeHeapAbort(void);
 
 #endif /* OPENGAUSS_E_PERF_H */

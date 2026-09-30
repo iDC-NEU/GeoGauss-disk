@@ -11,7 +11,7 @@
 #include <string>
 
 static constexpr uint64_t DN_WIRE_ENVELOPE_MAGIC = UINT64_C(0xE0C0D00D);
-static constexpr uint32_t DN_WIRE_ENVELOPE_VERSION = 1;
+static constexpr uint32_t DN_WIRE_ENVELOPE_VERSION = 2;
 
 enum DnWireEnvelopeKind : uint32_t {
     DN_WIRE_ENV_TXN_METADATA = 1,

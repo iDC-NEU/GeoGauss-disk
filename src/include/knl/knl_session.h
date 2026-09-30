@@ -2794,11 +2794,16 @@ typedef struct knl_u_occ_context {
 
 //HCJ ADDBY
 typedef struct knl_u_epoch_context {
-    uint64_t start_epoch;
-    uint64_t commit_epoch;
+    uint64_t txn_epoch;
     bool epoch_assigned;
     bool deferred_commit;
     bool epoch_exec_counted;
+    /* sync：pack 后在 COMMIT gate 前已 WriteChanges 并提前 ProcArrayEnd */
+    bool epoch_sync_heap_recorded;
+    bool epoch_procarray_ended;
+    /* nogate：BEGIN 时钉扎的读可见 logical 上界 */
+    uint64_t read_frontier;
+    bool read_frontier_pinned;
 } knl_u_epoch_context;
 
 #ifdef USE_SPQ

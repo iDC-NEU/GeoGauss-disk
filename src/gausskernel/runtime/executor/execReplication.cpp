@@ -40,8 +40,19 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
+#include "epoch/e_heap_version.h"
+#include "epoch/e_apply_profile.h"
+#include "occ/occ_internal.h"
+
+#include "portability/instr_time.h"
+#include "utils/rel.h"
+
 static bool RelationFindReplTupleByIndex(EState *estate, Relation rel, Relation idxrel, LockTupleMode lockmode,
     TupleTableSlot *searchslot, TupleTableSlot *outslot, FakeRelationPartition *fakeRelPart);
+static bool RelationFindReplTupleByIndexEpoch(EState *estate, Relation rel, Relation idxrel, TupleTableSlot *searchslot,
+    TupleTableSlot *outslot, FakeRelationPartition *fakeRelPart);
+static bool PartitionFindReplTupleByIndexEpoch(EState *estate, Relation rel, Relation idxrel,
+    TupleTableSlot *searchslot, TupleTableSlot *outslot, FakeRelationPartition *fakeRelInfo);
 static bool RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode, TupleTableSlot *searchslot,
     TupleTableSlot *outslot, FakeRelationPartition *fakeRelPart);
 
@@ -421,6 +432,163 @@ static bool RelationFindReplTupleByIndex(EState *estate, Relation rel, Relation 
 
     scan_handler_idx_endscan(scan);
     return found;
+}
+
+static bool RelationFindReplTupleByIndexEpoch(EState *estate, Relation rel, Relation idxrel,
+    TupleTableSlot *searchslot, TupleTableSlot *outslot, FakeRelationPartition *fakeRelPart)
+{
+    ScanKeyData skey[INDEX_MAX_KEYS];
+    IndexScanDesc scan;
+    Relation targetRel = NULL;
+    bool found = false;
+    bool isGpi = RelationIsGlobalIndex(idxrel);
+    instr_time index_start;
+    instr_time index_end;
+    uint64_t index_scan_us = 0;
+    uint64_t chain_walk_us = 0;
+    int chain_depth = 0;
+
+    if (isGpi || RelationIsNonpartitioned(rel)) {
+        targetRel = rel;
+    } else {
+        targetRel = fakeRelPart->partRel;
+    }
+    if (targetRel == NULL) {
+        return false;
+    }
+
+    INSTR_TIME_SET_CURRENT(index_start);
+    Snapshot snap = GetLatestSnapshot();
+    scan = scan_handler_idx_beginscan(targetRel, idxrel, snap,
+        IndexRelationGetNumberOfKeyAttributes(idxrel), 0);
+    scan->isUpsert = false;
+
+    build_replindex_scan_key(skey, targetRel, idxrel, searchslot, estate);
+    scan_handler_idx_rescan(scan, skey, IndexRelationGetNumberOfKeyAttributes(idxrel), NULL, 0);
+
+    if (RelationIsUstoreFormat(targetRel)) {
+        found = IndexGetnextSlot(scan, ForwardScanDirection, outslot);
+    } else {
+        HeapTuple scantuple = scan_handler_idx_getnext(scan, ForwardScanDirection);
+        if (scantuple != NULL) {
+            found = true;
+            ExecStoreTuple(scantuple, outslot, InvalidBuffer, false);
+        }
+    }
+    INSTR_TIME_SET_CURRENT(index_end);
+    INSTR_TIME_SUBTRACT(index_end, index_start);
+    index_scan_us = INSTR_TIME_GET_MICROSEC(index_end);
+
+    if (found) {
+        if (RelationIsUstoreFormat(targetRel)) {
+            outslot->tts_tuple = UHeapMaterialize(outslot);
+        } else {
+            outslot->tts_tuple = ExecMaterializeSlot(outslot);
+            if (EpochHeapVersionChainEnabled(targetRel)) {
+                HeapTuple htup = (HeapTuple)outslot->tts_tuple;
+                ItemPointerData root_tid = htup->t_self;
+                HeapTuple latest = nullptr;
+                instr_time chain_start;
+                INSTR_TIME_SET_CURRENT(chain_start);
+                if (EpochHeapFetchLatestCopy(targetRel, &root_tid, &latest, &chain_depth) && latest != nullptr) {
+                    heap_freetuple(htup);
+                    outslot->tts_tuple = latest;
+                }
+                instr_time chain_end;
+                INSTR_TIME_SET_CURRENT(chain_end);
+                INSTR_TIME_SUBTRACT(chain_end, chain_start);
+                chain_walk_us = INSTR_TIME_GET_MICROSEC(chain_end);
+            }
+        }
+        if (isGpi) {
+            GetFakeRelAndPart(estate, rel, outslot, fakeRelPart);
+        }
+    }
+
+    scan_handler_idx_endscan(scan);
+    EpochApplyProfileRecordFind(RelationGetRelid(targetRel), index_scan_us, chain_walk_us, chain_depth);
+    return found;
+}
+
+static bool PartitionFindReplTupleByIndexEpoch(EState *estate, Relation rel, Relation idxrel,
+    TupleTableSlot *searchslot, TupleTableSlot *outslot, FakeRelationPartition *fakeRelInfo)
+{
+    Assert(!RelationIsGlobalIndex(idxrel));
+
+    fakeRelInfo->partList = GetPartitionList(rel, AccessShareLock);
+    ListCell *cell = NULL;
+    foreach (cell, fakeRelInfo->partList) {
+        Partition heapPart = (Partition)lfirst(cell);
+        Relation partionRel = RelationIsSubPartitioned(rel) ? SubPartitionGetRelation(rel, heapPart, NoLock) :
+                                                              partitionGetRelation(rel, heapPart);
+        Oid idxPartOid = getPartitionIndexOid(RelationGetRelid(idxrel), heapPart->pd_id);
+        Partition idxPart = partitionOpen(idxrel, idxPartOid, AccessShareLock);
+        Relation idxPartRel = RelationIsSubPartitioned(idxrel) ? SubPartitionGetRelation(idxrel, idxPart, NoLock) :
+                                                              partitionGetRelation(idxrel, idxPart);
+
+        fakeRelInfo->partRel = partionRel;
+        fakeRelInfo->part = heapPart;
+        fakeRelInfo->partOid = heapPart->pd_id;
+
+        if (RelationFindReplTupleByIndexEpoch(estate, rel, idxPartRel, searchslot, outslot, fakeRelInfo)) {
+            partitionClose(idxrel, idxPart, NoLock);
+            releaseDummyRelation(&idxPartRel);
+            fakeRelInfo->needRleaseDummyRel = true;
+            return true;
+        }
+
+        releaseDummyRelation(&fakeRelInfo->partRel);
+        partitionClose(idxrel, idxPart, NoLock);
+        releaseDummyRelation(&idxPartRel);
+    }
+
+    releasePartitionList(rel, &fakeRelInfo->partList, NoLock);
+    return false;
+}
+
+bool RelationFindReplTupleEpoch(EState *estate, Relation rel, Oid idxoid, TupleTableSlot *searchslot,
+    TupleTableSlot *outslot, FakeRelationPartition *fakeRelInfo)
+{
+    int rc;
+    bool found = false;
+    Relation idxrel = NULL;
+
+    rc = memset_s(fakeRelInfo, sizeof(FakeRelationPartition), 0, sizeof(FakeRelationPartition));
+    securec_check(rc, "", "");
+
+    if (!OidIsValid(idxoid)) {
+        return false;
+    }
+
+    idxrel = index_open(idxoid, AccessShareLock);
+
+    if (RelationIsNonpartitioned(rel) || RelationIsGlobalIndex(idxrel)) {
+        found = RelationFindReplTupleByIndexEpoch(estate, rel, idxrel, searchslot, outslot, fakeRelInfo);
+        index_close(idxrel, NoLock);
+        return found;
+    }
+
+    found = PartitionFindReplTupleByIndexEpoch(estate, rel, idxrel, searchslot, outslot, fakeRelInfo);
+    index_close(idxrel, NoLock);
+    return found;
+}
+
+bool RelationFindReplTupleEpochCached(EState *estate, Relation rel, Relation idxrel, TupleTableSlot *searchslot,
+    TupleTableSlot *outslot, FakeRelationPartition *fakeRelInfo)
+{
+    int rc;
+    if (idxrel == nullptr || fakeRelInfo == nullptr) {
+        return false;
+    }
+
+    rc = memset_s(fakeRelInfo, sizeof(FakeRelationPartition), 0, sizeof(FakeRelationPartition));
+    securec_check(rc, "", "");
+
+    if (RelationIsNonpartitioned(rel) || RelationIsGlobalIndex(idxrel)) {
+        return RelationFindReplTupleByIndexEpoch(estate, rel, idxrel, searchslot, outslot, fakeRelInfo);
+    }
+
+    return PartitionFindReplTupleByIndexEpoch(estate, rel, idxrel, searchslot, outslot, fakeRelInfo);
 }
 
 /*

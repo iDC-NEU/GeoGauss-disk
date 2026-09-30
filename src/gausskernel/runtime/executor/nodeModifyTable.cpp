@@ -1023,16 +1023,27 @@ static Oid ExecUpsert(ModifyTableState* state, TupleTableSlot* slot, TupleTableS
     }
 
     /* insert the tuple */
-    newid = tableam_tuple_insert(targetrel, tuple, estate->es_output_cid, 0, NULL);
+    bool defer_heap_insert = OccSyncDeferInsertHeapWrite();
+    if (!defer_heap_insert) {
+        newid = tableam_tuple_insert(targetrel, tuple, estate->es_output_cid, 0, NULL);
+    }
 
     if (slot->tts_tuple != tuple) {
         UpdateSlotTupleInfo(slot, tuple);
     }
 
+    if (OccDiskAccessHooksEnabled()) {
+        if (defer_heap_insert) {
+            O_RegisterDeferredInsert(estate, targetrel, (HeapTuple)tuple);
+        }
+    }
+
     /* insert index entries for tuple */
     ItemPointerData item = TUPLE_IS_UHEAP_TUPLE(tuple) ? ((UHeapTuple)tuple)->ctid : ((HeapTuple)tuple)->t_self;
-    recheckIndexes = ExecInsertIndexTuples(slot, &item, estate, heaprel,
-        partition, bucketid, &specConflict, NULL);
+    if (!defer_heap_insert) {
+        recheckIndexes = ExecInsertIndexTuples(slot, &item, estate, heaprel,
+            partition, bucketid, &specConflict, NULL);
+    }
 
     /* other transaction commit index insertion before us,
      * then abort the tuple and try to find the conflict tuple again
@@ -1367,6 +1378,7 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                 ConflictInfoData conflictInfo;
                 Oid conflictPartOid = InvalidOid;
                 int2 conflictBucketid = InvalidBktId;
+                bool defer_heap_insert = OccSyncDeferInsertHeapWrite();
 
                 switch (result_relation_desc->rd_rel->parttype) {
                     case PARTTYPE_NON_PARTITIONED_RELATION:
@@ -1390,9 +1402,11 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                                                 RelationGetRelationName(target_rel))));
                                 return NULL;
                             }
-                            new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
+                            if (!defer_heap_insert) {
+                                new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
+                            }
 
-                            if (rel_isblockchain) {
+                            if (!defer_heap_insert && rel_isblockchain) {
                                 MemoryContext old_context = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
                                 is_record = hist_table_record_insert(result_relation_desc, (HeapTuple)tuple, &res_hash);
                                 (void)MemoryContextSwitchTo(old_context);
@@ -1452,8 +1466,10 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                                     searchHBucketFakeRelation(
                                         estate->esfRelations, estate->es_query_cxt, heap_rel, bucket_id, target_rel);
                                 }
-                            new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
-                            if (rel_isblockchain) {
+                            if (!defer_heap_insert) {
+                                new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
+                            }
+                            if (!defer_heap_insert && rel_isblockchain) {
                                 MemoryContext old_context = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
                                 is_record = hist_table_record_insert(target_rel, (HeapTuple)tuple, &res_hash);
                                 (void)MemoryContextSwitchTo(old_context);
@@ -1543,8 +1559,10 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                             searchHBucketFakeRelation(estate->esfRelations, estate->es_query_cxt, heap_rel, bucket_id,
                                                       target_rel);
                         }
-                        new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
-                        if (rel_isblockchain) {
+                        if (!defer_heap_insert) {
+                            new_id = tableam_tuple_insert(target_rel, tuple, estate->es_output_cid, 0, NULL);
+                        }
+                        if (!defer_heap_insert && rel_isblockchain) {
                             MemoryContext old_context = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
                             is_record = hist_table_record_insert(target_rel, (HeapTuple)tuple, &res_hash);
                             (void)MemoryContextSwitchTo(old_context);
@@ -1567,10 +1585,14 @@ TupleTableSlot* ExecInsertT(ModifyTableState* state, TupleTableSlot* slot, Tuple
                 //                        HCJ ADDBY
                 bool enable_occ = OccDiskAccessHooksEnabled();
                 if (enable_occ) {
-                    O_InsertRow(pTSelf,estate,(HeapTuple)tuple);
+                    if (defer_heap_insert) {
+                        O_RegisterDeferredInsert(estate, target_rel, (HeapTuple)tuple);
+                    } else {
+                        O_InsertRow(pTSelf, estate, (HeapTuple)tuple);
+                    }
                 }
 
-                if (result_rel_info->ri_NumIndices > 0 && !RelationIsColStore(result_relation_desc)) {
+                if (!defer_heap_insert && result_rel_info->ri_NumIndices > 0 && !RelationIsColStore(result_relation_desc)) {
                     if (state->isReplace) {
                         bool specConflict = false;
                         recheck_indexes = ExecInsertIndexTuples(slot,
@@ -3105,10 +3127,19 @@ ldelete:
                                 (void)MemoryContextSwitchTo(old_context);
                             }
 
-                            (void)tableam_tuple_insert(fake_insert_relation, 
-                                tuple, estate->es_output_cid, 0, NULL);
+                            if (!OccSyncDeferInsertHeapWrite()) {
+                                (void)tableam_tuple_insert(fake_insert_relation,
+                                    tuple, estate->es_output_cid, 0, NULL);
+                            }
+                            if (OccDiskAccessHooksEnabled()) {
+                                if (OccSyncDeferInsertHeapWrite()) {
+                                    O_RegisterDeferredInsert(estate, fake_insert_relation, (HeapTuple)tuple);
+                                } else {
+                                    O_InsertRow(&(((HeapTuple)tuple)->t_self), estate, (HeapTuple)tuple);
+                                }
+                            }
 
-                            if (result_rel_info->ri_NumIndices > 0) {
+                            if (!OccSyncDeferInsertHeapWrite() && result_rel_info->ri_NumIndices > 0) {
                                 recheck_indexes = ExecInsertIndexTuples(slot, &(((HeapTuple)tuple)->t_self), estate,
                                     fake_part_rel, insert_partition, bucketid, NULL, NULL);
                             }

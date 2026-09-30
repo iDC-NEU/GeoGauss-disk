@@ -1,0 +1,21 @@
+---
+description: Epoch 压测 apply 排队的根因是单个 epoch 执行太慢，不是 merge 慢或 apply 线程空闲
+alwaysApply: true
+---
+
+# Epoch：apply 排队 = 单 epoch 执行慢
+
+`queue_wait` 很高、`gap` 顶在 `epoch_phys_logical_gap_limit` 时，根因是 **apply 线程执行一个 epoch 太慢**。merge 已经结束，新 epoch 仍按物理周期进来，apply 还在做最老的那个，事务就堆在队列里。
+
+## 不要误判
+
+- **不是 merge 慢。** `seal→merge` 短、merge/apply/pack 线程数两边一致，都不能解释这段等待。
+- **不是 apply 线程空着。** `apply_starve_ticks=0` 表示当前 epoch 有任务。线程只领取 `apply_epoch`（`EpochApplyQueueTryClaim` 跳过其它 epoch；`merge_complete` 未置位会把槽退回）。
+- **`merge→apply` 墙钟会偏大。** 入队从 merge 选出赢家就算起，含「等前面几个 epoch 的 apply」；不要拿它当单笔 apply 耗时。
+
+## 怎么确认
+
+1. `gap` 是否整段顶在上限（落后约 `gap ×` 物理周期）。
+2. 单 epoch 的 apply 执行时间（lifecycle 里各笔 `apply_us` 之和，或 `apply_cpu_us`）是否已经接近物理周期，导致追不上已排队的 epoch。
+3. 执行时间里主要是 `find_index_scan` 还是别的阶段。队列等待是落后的结果，优化要缩短 **一个 epoch 的 apply**，而不是再加 merge 线程。
+---

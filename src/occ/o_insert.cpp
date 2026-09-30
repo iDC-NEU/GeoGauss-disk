@@ -5,8 +5,37 @@
 #include "occ/o_executor.h"
 #include "occ/o_txn.h"
 #include "occ/occ_internal.h"
+#include "epoch/e_statistician.h"
+#include "epoch/e_config.h"
 
 #include "catalog/index.h"
+
+bool OccSyncDeferHeapWrite(void)
+{
+    return OccDiskAccessHooksEnabled() && EpochIsSyncBackgroundWorkerCommit();
+}
+
+bool OccSyncDeferInsertHeapWrite(void)
+{
+    return OccSyncDeferHeapWrite();
+}
+
+void O_RegisterDeferredInsert(EState* estate, Relation rel, HeapTuple heap_tuple)
+{
+    if (estate == nullptr || rel == nullptr || heap_tuple == nullptr) {
+        return;
+    }
+    O_TxnManager* txn = GetTxnManager();
+    if (txn == nullptr) {
+        return;
+    }
+    uint32_t seq = txn->AllocateDeferredInsertSlot();
+    BlockNumber blk = 9000000U + (seq >> 16);
+    OffsetNumber off = static_cast<OffsetNumber>((seq & 0xFFFFU) + 1U);
+    ItemPointerSet(&heap_tuple->t_self, blk, off);
+    heap_tuple->t_tableOid = RelationGetRelid(rel);
+    O_InsertRow(&heap_tuple->t_self, estate, heap_tuple);
+}
 
 //接口
 void O_InsertRow(ItemPointer tupleid, EState* estate,

@@ -69,6 +69,8 @@
 #include "commands/matview.h"
 #include "commands/vacuum.h"
 #include "executor/node/nodeModifyTable.h"
+#include "epoch/e_heap_version.h"
+#include "epoch/e_apply_buflock.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "tde_key_management/tde_key_storage.h"
@@ -406,7 +408,13 @@ void heapgetpage(TableScanDesc sscan, BlockNumber page, bool* has_cur_xact_write
             bool valid = false;
 
             if (likely(all_visible && (!IsSerializableXact()))) {
-                scan->rs_base.rs_vistuples[ntup++] = line_off;
+                loctup.t_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
+                loctup.t_bucketId = RelationGetBktid(scan->rs_base.rs_rd);
+                loctup.t_data = (HeapTupleHeader)PageGetItem((Page)dp, lpp);
+                ItemPointerSet(&(loctup.t_self), page, line_off);
+                if (!EpochHeapIsSupersededVersion(scan->rs_base.rs_rd, loctup.t_data, &loctup.t_self)) {
+                    scan->rs_base.rs_vistuples[ntup++] = line_off;
+                }
                 continue;
             }
 
@@ -423,6 +431,10 @@ void heapgetpage(TableScanDesc sscan, BlockNumber page, bool* has_cur_xact_write
                 valid = HeapTupleSatisfiesVisibility(&loctup, snapshot, buffer, has_cur_xact_write);
 
             CheckForSerializableConflictOut(valid, scan->rs_base.rs_rd, (void*)&loctup, buffer, snapshot);
+
+            if (valid && EpochHeapIsSupersededVersion(scan->rs_base.rs_rd, loctup.t_data, &loctup.t_self)) {
+                valid = false;
+            }
 
             if (valid) {
                 scan->rs_base.rs_vistuples[ntup++] = line_off;
@@ -733,6 +745,14 @@ static bool VerifyHeapGetTup(HeapScanDesc scan, ScanDirection dir)
                 }
 
                 if (valid) {
+                    ItemPointerData chain_root = tuple->t_self;
+                    if (!EpochHeapMaterializeLatestRead(scan->rs_base.rs_rd, &chain_root, tuple,
+                            &scan->rs_ctbuf_hdr)) {
+                        valid = false;
+                    }
+                }
+
+                if (valid) {
                     LockBuffer(scan->rs_base.rs_cbuf, BUFFER_LOCK_UNLOCK);
                     return is_valid_relation_page;
                 }
@@ -920,6 +940,12 @@ static void heapgettup(HeapScanDesc scan, ScanDirection dir, int nkeys, ScanKey 
             DECOMPRESS_HEAP_TUPLE(
                 true, tuple, &(scan->rs_ctbuf_hdr), (scan->rs_tupdesc), dp);
         }
+        {
+            ItemPointerData chain_root = tuple->t_self;
+            if (!EpochHeapMaterializeLatestRead(scan->rs_base.rs_rd, &chain_root, tuple, &scan->rs_ctbuf_hdr)) {
+                tuple->t_data = NULL;
+            }
+        }
         return;
     }
 
@@ -945,6 +971,9 @@ static void heapgettup(HeapScanDesc scan, ScanDirection dir, int nkeys, ScanKey 
 
                 CheckForSerializableConflictOut(valid, scan->rs_base.rs_rd, (void *)tuple, scan->rs_base.rs_cbuf,
                     snapshot);
+                if (valid && EpochHeapIsSupersededVersion(scan->rs_base.rs_rd, tuple->t_data, &tuple->t_self)) {
+                    valid = false;
+                }
                 if (valid) {
                     /* make sure this tuple is visible and then uncompress it */
                     if (scan->rs_base.rs_rd->is_compressed && HEAP_TUPLE_IS_COMPRESSED(tuple->t_data)) {
@@ -954,6 +983,13 @@ static void heapgettup(HeapScanDesc scan, ScanDirection dir, int nkeys, ScanKey 
 
                     if (key != NULL) {
                         HeapKeyTest(tuple, (scan->rs_tupdesc), nkeys, key, valid);
+                    }
+                }
+                if (valid) {
+                    ItemPointerData chain_root = tuple->t_self;
+                    if (!EpochHeapMaterializeLatestRead(scan->rs_base.rs_rd, &chain_root, tuple,
+                            &scan->rs_ctbuf_hdr)) {
+                        valid = false;
                     }
                 }
 
@@ -1168,6 +1204,12 @@ static void heapgettup_pagemode(HeapScanDesc scan, ScanDirection dir, int nkeys,
             DECOMPRESS_HEAP_TUPLE(
                 true, tuple, &(scan->rs_ctbuf_hdr), (scan->rs_tupdesc), dp);
         }
+        {
+            ItemPointerData chain_root = tuple->t_self;
+            if (!EpochHeapMaterializeLatestRead(scan->rs_base.rs_rd, &chain_root, tuple, &scan->rs_ctbuf_hdr)) {
+                tuple->t_data = NULL;
+            }
+        }
         return;
     }
 
@@ -1204,12 +1246,24 @@ static void heapgettup_pagemode(HeapScanDesc scan, ScanDirection dir, int nkeys,
                 HeapKeyTest(tuple, (scan->rs_tupdesc), nkeys, key, valid);
 
                 if (valid) {
+                    ItemPointerData chain_root = tuple->t_self;
+                    if (!EpochHeapMaterializeLatestRead(scan->rs_base.rs_rd, &chain_root, tuple,
+                            &scan->rs_ctbuf_hdr)) {
+                        valid = false;
+                    }
+                }
+                if (valid) {
                     scan->rs_base.rs_cindex = line_index;
                     return;
                 }
             } else {
-                scan->rs_base.rs_cindex = line_index;
-                return;
+                ItemPointerData chain_root = tuple->t_self;
+                if (EpochHeapMaterializeLatestRead(scan->rs_base.rs_rd, &chain_root, tuple,
+                        &scan->rs_ctbuf_hdr)) {
+                    scan->rs_base.rs_cindex = line_index;
+                    return;
+                }
+                /* tip tombstone or materialize miss-as-invisible: skip */
             }
 
             /*
@@ -2287,6 +2341,7 @@ bool heap_fetch(
     bool* has_cur_xact_write)
 {
     ItemPointer tid = &(tuple->t_self);
+    ItemPointerData chain_root = *tid;
     ItemId lp;
     Buffer buffer;
     Page page;
@@ -2368,25 +2423,45 @@ bool heap_fetch(
     if (valid) {
         PredicateLockTuple(relation, private_tuple, snapshot);
 
-        DECOMPRESS_HEAP_TUPLE(HEAP_TUPLE_IS_COMPRESSED(private_tuple->t_data),
-            private_tuple,
-            tuple->t_data,
-            relation->rd_att,
-            (const char*)page);
+        if (tuple->t_data != NULL) {
+            DECOMPRESS_HEAP_TUPLE(HEAP_TUPLE_IS_COMPRESSED(private_tuple->t_data),
+                private_tuple,
+                tuple->t_data,
+                relation->rd_att,
+                (const char*)page);
+            if (!HEAP_TUPLE_IS_COMPRESSED(private_tuple->t_data)) {
+                errno_t rc = memcpy_s((char*)tuple->t_data, private_tuple->t_len, (char*)private_tuple->t_data,
+                    private_tuple->t_len);
+                securec_check(rc, "\0", "\0");
+            }
+            tuple->t_self = private_tuple->t_self;
+            tuple->t_len = private_tuple->t_len;
+            tuple->t_tableOid = private_tuple->t_tableOid;
+            tuple->t_bucketId = private_tuple->t_bucketId;
+            HeapTupleCopyBase(tuple, private_tuple);
+#ifdef PGXC
+            tuple->t_xc_node_id = private_tuple->t_xc_node_id;
+#endif
+            if (!EpochHeapMaterializeLatestRead(relation, &chain_root, tuple, tuple->t_data)) {
+                valid = false;
+            }
+        }
     }
     CheckForSerializableConflictOut(valid, relation, (void*)private_tuple, buffer, snapshot);
 
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
-    /* copy heap tuple info into output <tuple>  */
-    tuple->t_data = private_tuple->t_data;
-    tuple->t_len = private_tuple->t_len;
-    tuple->t_tableOid = private_tuple->t_tableOid;
-    tuple->t_bucketId = private_tuple->t_bucketId;
-    HeapTupleCopyBase(tuple, private_tuple);
+    if (!valid || tuple->t_data == NULL) {
+        /* copy heap tuple info into output <tuple> (may reference page until buffer released) */
+        tuple->t_data = private_tuple->t_data;
+        tuple->t_len = private_tuple->t_len;
+        tuple->t_tableOid = private_tuple->t_tableOid;
+        tuple->t_bucketId = private_tuple->t_bucketId;
+        HeapTupleCopyBase(tuple, private_tuple);
 #ifdef PGXC
-    tuple->t_xc_node_id = private_tuple->t_xc_node_id;
+        tuple->t_xc_node_id = private_tuple->t_xc_node_id;
 #endif
+    }
 
     if (valid) {
         /*
@@ -2466,6 +2541,7 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
     offnum = ItemPointerGetOffsetNumber(tid);
     at_chain_start = first_call;
     skip = !first_call;
+    ItemPointerData chain_root = *tid;
 
     Assert(TransactionIdIsValid(u_sess->utils_cxt.RecentGlobalXmin));
     Assert(BufferGetBlockNumber(buffer) == blkno);
@@ -2568,8 +2644,8 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
                     *all_dead = false;
                 }
                 /*
-                 * If uncompress_tup is NULL, the caller will not need tuple data
-                 * Only check some status
+                 * Decompress first, then overlay tip staging. Doing Materialize
+                 * before DECOMPRESS let the page body overwrite the tip.
                  */
                 if (uncompress_tup != NULL) {
                     DECOMPRESS_HEAP_TUPLE(HEAP_TUPLE_IS_COMPRESSED(heap_tuple->t_data),
@@ -2577,6 +2653,10 @@ bool heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer, S
                                           uncompress_tup,
                                           relation->rd_att,
                                           (const char*)BufferGetPage(buffer));
+                    if (!EpochHeapMaterializeLatestRead(relation, &chain_root, heap_tuple, uncompress_tup)) {
+                        return false;
+                    }
+                    ItemPointerCopy(&heap_tuple->t_self, tid);
                 }
                 return true;
             }
@@ -2800,8 +2880,22 @@ void heap_get_latest_tid(Relation relation, Snapshot snapshot, ItemPointer tid)
         /*
          * If there's a valid t_ctid link, follow it, else we're done.
          */
-        if ((tp.t_data->t_infomask & HEAP_XMAX_INVALID) || HeapTupleIsOnlyLocked(&tp) ||
-            ItemPointerEquals(&tp.t_self, &tp.t_data->t_ctid)) {
+        if (HeapTupleIsOnlyLocked(&tp) || ItemPointerEquals(&tp.t_self, &tp.t_data->t_ctid)) {
+            UnlockReleaseBuffer(buffer);
+            break;
+        }
+        /*
+         * epoch CSN HOT apply：旧版本 HEAP_XMAX_INVALID + is_latest=false，新版本经 t_ctid 正向链接。
+         * 标准 PG 在此停止；须沿链追到 is_latest 才能读到 apply 写入的数据。
+         */
+        if ((tp.t_data->t_infomask & HEAP_XMAX_INVALID) && EpochHeapVersionChainEnabled(relation) &&
+            !tp.t_data->is_latest && !ItemPointerEquals(&tp.t_self, &tp.t_data->t_ctid)) {
+            ctid = tp.t_data->t_ctid;
+            priorXmax = InvalidTransactionId;
+            UnlockReleaseBuffer(buffer);
+            continue;
+        }
+        if (tp.t_data->t_infomask & HEAP_XMAX_INVALID) {
             UnlockReleaseBuffer(buffer);
             break;
         }
@@ -3035,7 +3129,9 @@ Oid heap_insert(Relation relation, HeapTuple tup, CommandId cid, int options, Bu
     /* NO EREPORT(ERROR) from here till changes are logged */
     START_CRIT_SECTION();
 
-    //HCJ ADDBY
+    //HCJ ADDBY: 统一清零；epoch apply 在 insert 后经 O_heap_commit_insert_csn 写回 row CSN。
+    // 不可按 role 跳过清零：EPOCHWORKER/APPLY 的其它 heap_insert 可能带着未初始化的 m_rowCSN，
+    // 写进页面后会在 Commit 路径触发 Assert(csn >= COMMITSEQNO_FROZEN) 拖垮进程。
     heaptup->t_data->m_rowCSN = 0;
     heaptup->t_data->is_latest = true;
 
@@ -10339,6 +10435,7 @@ static bool BufferExclusiveLockHeldByMe(Buffer cbuf)
 HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead, bool* has_cur_xact_write)
 {
     ItemPointer tid = &scan->xs_ctup.t_self;
+    ItemPointerData chain_root = *tid;
     bool got_heap_tuple = false;
 
     /* We can skip the buffer-switching logic if we're in mid-HOT chain. */
@@ -10369,8 +10466,9 @@ HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead, bool* has
                         errhint("retry this operation after other DDL operation finished.")));
     }
 
-    /* Obtain share-lock on the buffer so we can examine visibility */
-    LockBuffer(scan->xs_cbuf, BUFFER_LOCK_SHARE);
+    /* Obtain share-lock on the buffer so we can examine visibility.
+     * apply worker 且开启 buflock 采集时统计 SHARE 等待（被 EXCLUSIVE 堵住）。 */
+    EpochApplyBufLockShare(scan->xs_cbuf);
     got_heap_tuple = heap_hot_search_buffer(tid, scan->heapRelation,
         scan->xs_cbuf, scan->xs_snapshot, &scan->xs_ctup,
         &scan->xs_ctbuf_hdr, all_dead, !scan->xs_continue_hot, has_cur_xact_write);
@@ -10378,6 +10476,16 @@ HeapTuple heapam_index_fetch_tuple(IndexScanDesc scan, bool *all_dead, bool* has
     LockBuffer(scan->xs_cbuf, BUFFER_LOCK_UNLOCK);
 
     if (got_heap_tuple) {
+        if (scan->xs_ctup.t_data != NULL) {
+            if (EpochHeapVersionChainEnabled(scan->heapRelation) &&
+                !EpochHeapMaterializeLatestRead(scan->heapRelation, &chain_root, &scan->xs_ctup,
+                    &scan->xs_ctbuf_hdr)) {
+                /* 仅在版本链启用且物化失败时视为未命中；系统表链关闭时不走此分支 */
+                scan->xs_continue_hot = false;
+                return NULL;
+            }
+            *tid = scan->xs_ctup.t_self;
+        }
         if (SHOW_DEBUG_MESSAGE()) {
             Page page = BufferGetPage(scan->xs_cbuf);
             ereport(DEBUG1,

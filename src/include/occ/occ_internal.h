@@ -3,8 +3,10 @@
 
 #include "occ/o_txn.h"
 #include "occ/o_access.h"
+#include "occ/o_config.h"
 #include "knl/knl_session.h"
 #include "occ/occ_mem.h"
+#include "miscadmin.h"
 #include "storage/item/itemptr.h"
 #include "utils/rel.h"
 
@@ -171,6 +173,21 @@ static inline ItemPointerData OccResolveAccessTid(O_Access *access, const occ_se
     return tid;
 }
 
+/*
+ * OCC arena 内 HeapTuple 的 t_data 固定位于 row + HEAPTUPLESIZE。
+ * 若 draft 被原地超长 memcpy 写穿，此处可拦截野指针，避免 pack 路径 SIGSEGV。
+ */
+static inline bool OccDraftTupleLayoutOk(HeapTuple row)
+{
+    if (!HeapTupleIsValid(row) || row->t_data == nullptr) {
+        return false;
+    }
+    if (row->t_len <= 0) {
+        return false;
+    }
+    return row->t_data == (HeapTupleHeader)((char *)row + HEAPTUPLESIZE);
+}
+
 /* 写回/校验前统一解析 relid + TID 并写回 access */
 static inline bool OccPrepareAccessTarget(O_Access *access, const occ_sentinel *key,
                                           Oid *relid, ItemPointerData *tid)
@@ -196,6 +213,16 @@ inline bool O_TxnHasActiveWriteSet()
         return false;
     }
     return txn->m_accessMgr->m_Size() > 0;
+}
+
+/*
+ * epoch 多主 / apply worker：heap 版本链以 m_rowCSN 为准，不在旧元组上留活跃 xmax xid，
+ * 避免 ProcArray/clog 与 vacuum 的 MV2PL 语义冲突。
+ * m_status 记录版本 commit logical epoch（read_frontier 可见性过滤）。
+ */
+inline bool O_HeapUseCsnEpochSemantics(void)
+{
+    return OccEpochMultiMasterEnabled() || AmEpochWorkerProcess();
 }
 
 #endif // OPENGAUSS_OCC_INTERNAL_H

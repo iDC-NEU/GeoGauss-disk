@@ -1,0 +1,97 @@
+---
+description: TPCC 内部对照基线 RTT=70ms（stats gate-on）；非最终验收门槛
+alwaysApply: true
+---
+
+# TPCC 对照基线：RTT=70ms（stats profile，gate on）
+
+**用途**：`EPOCH_PROFILE=stats`（`epoch_sync_start_gate=on`）下的历史数据，仅作 **epoch 内部研发对照**（量化 nogate 相对 gate-on 的收益）。
+
+**最终验收**：**不再**以本基线为通过条件。对外验收对标 **openGauss 一主一备 ×3**（见 `epoch-acceptance.mdc`、`epoch-ha-baseline-70ms-rtt.mdc`）。
+
+**对照配置**：`EPOCH_PROFILE=stats`，BenchmarkSQL 不变（33 terminals，runMins=1），`epoch_physical_interval_ms=70`，`epoch_sync_start_gate=on`。
+
+**日志来源（2026-07-03 本轮）**：
+- node1 TPCC：`epoch_benchmark_results/tpcc_node0_20260703_094603.log`
+- node3 TPCC：`epoch_benchmark_results/tpcc_node2_20260703_094604.log`
+- node1 epoch：`data/epoch-node0/epoch_perf_20260703_094407.log`，`epoch_lifecycle_20260703_094407.log`，`epoch_apply_profile_20260703_094407.log`
+- node3 epoch：`data/epoch-node1/epoch_perf_20260703_094415.log`，`epoch_lifecycle_20260703_094415.log`，`epoch_apply_profile_20260703_094415.log`
+
+**分析窗口**：必须以 BenchmarkSQL 的 **Session Start → Session End** 为准（各 60s），勿用 epoch_perf 全进程时间（含重启前后 idle）。
+
+## TPCC 结果
+
+| 节点 | Session Start | Session End | tpmC | tpmTOTAL | txns |
+|------|---------------|-------------|------|----------|------|
+| node1 | 09:46:19 | 09:47:19 | **2390.96** | 4659.6 | 4684 |
+| node3 | 09:46:10 | 09:47:10 | **2366.41** | 4756.71 | 4781 |
+
+## Logical epoch（60s 窗口 perf 增量）
+
+| 节点 | logical +Δ | 速率 | 平均周期 |
+|------|-----------|------|---------|
+| node1 | +600 | 10.0/s | 100.0ms |
+| node3 | +597 | 9.95/s | 100.5ms |
+
+## Worker pipeline（lifecycle，60s 内）
+
+| 阶段 | node1 | node3 | 双节点合计 |
+|------|-------|-------|-----------|
+| ① start→seal | 19.9% / 19.7ms | 13.9% / 14.1ms | **17.0% / 17.0ms** |
+| ② seal→merge | 56.6% / 55.9ms | 64.8% / 65.6ms | **60.6% / 60.6ms** |
+| ③ merge→apply | 18.3% / 18.1ms | 16.4% / 16.6ms | **17.4% / 17.4ms** |
+
+② 细分 seal→merge：node1 peer_only **83.9ms** / local_only 36.5ms；node3 peer_only **121.9ms** / local_only 40.6ms。
+
+## Backend START gate（60s 窗口 perf 增量）
+
+| 节点 | gate 累计(33 backend) | 事件数 | 单次均 | 每 terminal / 60s |
+|------|----------------------|--------|--------|-------------------|
+| node1 | 1899.5s | 4635 | ~410ms | **~96%** |
+| node3 | 1936.9s | 4823 | ~402ms | **~98%** |
+
+## Worker stall（60s 窗口）
+
+- merge_incomplete：node1 7218/8884 (81%)，node3 7388/8888 (83%)
+- apply_incomplete：node1 1066/8884 (**12.0%**)，node3 903/8888 (**10.2%**)
+
+## Apply 完成时间（60s 窗口，三层指标）
+
+### A. epoch 粒度 — lifecycle `merge_to_apply_us`（merge 完成 → apply 完成，wall clock）
+
+| 节点 | epoch 数 | avg | median | p90 | p95 | 合计 |
+|------|---------|-----|--------|-----|-----|------|
+| node1 | 575 | 18.08ms | 16.03ms | 36.16ms | 47.34ms | 10.40s |
+| node3 | 543 | 16.59ms | 15.40ms | 31.51ms | 41.26ms | 9.01s |
+| **合计** | 1118 | **17.36ms** | — | — | — | **19.40s** |
+
+- `apply_cpu_us` 合计：node1 15.74s / node3 10.74s（5 apply worker 并行，CPU 可 > wall）
+- `apply_batches`：node1 4345 / node3 4276；`apply_rows`：99084 / 97974
+
+### B. txn 粒度 — apply_profile `APPLY_PROFILE_TXN total_us`（单笔 wire txn apply）
+
+| 节点 | apply txn 数 | avg/txn | median | p90 | 合计 |
+|------|-------------|---------|--------|-----|------|
+| node1 | 4342 | 3.69ms | 2.97ms | 6.18ms | 16.02s |
+| node3 | 4278 | 2.57ms | 2.37ms | 4.12ms | 10.99s |
+| **合计** | 8620 | **3.13ms** | — | — | **27.01s** |
+
+### C. txn 粒度 phase 细分 — `APPLY_PROFILE_AGG` 60s 增量
+
+| phase | node1 (4250 txns) | node3 (4250 txns) |
+|-------|-------------------|-------------------|
+| find_tuple | 1.27ms/txn (34.5%) | 0.95ms/txn (36.9%) |
+| txn_commit | 1.13ms/txn (30.7%) | 0.84ms/txn (32.8%) |
+| heap_insert | 0.42ms/txn (11.5%) | 0.31ms/txn (12.2%) |
+| heap_update | 0.41ms/txn (11.1%) | 0.14ms/txn (5.6%) |
+| sort | 0.22ms/txn (6.1%) | 0.17ms/txn (6.6%) |
+| 其他 | ~0.25ms/txn | ~0.20ms/txn |
+
+**解读**：lifecycle ③ `merge→apply` (~17ms/epoch) 是 epoch 关窗后等 apply 完成的 wall time；apply_profile 是 epoch 内各 wire txn 的 CPU 执行（~3ms/txn × ~4300 txns ≈ 13–16s 并行完成）。apply 不是主瓶颈（pipeline 仅 ~17%），但 worker 仍有 ~11% 轮询卡在 `apply_incomplete`。
+
+## 对比下一轮（内部对照）时
+
+1. 读新 TPCC 日志的 Session Start/End，取窗口
+2. 对同期 `epoch_perf` / `epoch_lifecycle` / `epoch_apply_profile` 做同样增量/切片
+3. **对外验收**：对标一主一备 ×3（`epoch-ha-baseline-70ms-rtt.mdc`），勿再用本表作通过线
+4. **相对本表（gate-on）**：可量化 nogate 收益；并看 logical 周期、② seal→merge、START gate %（nogate 应为 0）、peer_only seal→merge、**apply merge_to_apply_us / apply_profile total_us / apply_incomplete stall**

@@ -1,0 +1,36 @@
+---
+description: node3 磁盘布局：/ 与 /home 分离，禁止向 /tmp 写大文件
+alwaysApply: true
+---
+
+# node3 磁盘与 /tmp 约定
+
+## 分区布局（node3，219.216.64.216）
+
+| 挂载点 | 典型路径 | 说明 |
+|--------|----------|------|
+| `/home` | `~/2025-9/`、`~/2025-9/data/` | **7T 盘**，openGauss 数据、备份、core 放这里 |
+| `/` | `/tmp`、`/var` | **1.8T 根分区**，常接近满；与 `/home` 独立 |
+
+openGauss 数据目录在 `/home` 下空间充足；**启动 lock / Unix socket 默认在 `/tmp`**（属 `/`），根分区满会导致 `gs_ctl start` FATAL。
+
+## Agent 必须遵守
+
+- **不要**在 `/tmp` 创建、解压、复制大型文件（core dump、perf.data、备份 tar、gdb 解压产物等）。
+- 大文件统一放到 **`/home/hcj2003/`** 下，例如：
+  - 数据/备份：`~/2025-9/data/`、`~/2025-9/epoch_benchmark_results/`
+  - core / gdb：`~/2025-9/data/epoch-node1/` 或 `~/2025-9/tmp/`（需时先 `mkdir -p`）
+- 脚本、命令、SSH 远程操作同理：输出路径用 `$HOME/2025-9/...`，不用 `/tmp/...`。
+- BenchmarkSQL / JDBC 走 TCP（`127.0.0.1:32000`），不依赖 `/tmp`；但 **启动数据库** 仍会在 `/tmp` 写 socket lock（暂不改配置）。
+
+## 示例
+
+```bash
+# ❌  BAD — 占根分区
+lz4 -d core.lz4 /tmp/gauss_core.core
+cp huge.file /tmp/
+
+# ✅ GOOD — 占 /home
+mkdir -p ~/2025-9/tmp
+lz4 -d core.lz4 ~/2025-9/tmp/gauss_core.core
+```

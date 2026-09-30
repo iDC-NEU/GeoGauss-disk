@@ -6,6 +6,8 @@ void OCCXactCallback(XactEvent event);
 
 RC O_ValidateCommit();
 
+void O_PrepareWriteSetForPack(void);
+
 bool O_RevalidateWriteSet(void);
 
 void O_RecordCommit(uint64_t csn);

@@ -11,11 +11,145 @@
 
 #include "miscadmin.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <sys/time.h>
 
 static uint64_t g_last_perf_report_physical = 0;
+
+/* logical stall 细因：进程内累计（epoch worker 同进程多线程可见），不改 shmem */
+enum EpochStallDetailIdx : int {
+    STALL_D_PHYS = 0,
+    STALL_D_LOCAL_CMT,
+    STALL_D_SEND,
+    STALL_D_MERGE_PEER_END,
+    STALL_D_MERGE_PEER_TXN,
+    STALL_D_MERGE_SELF_SEND,
+    STALL_D_MERGE_ASYNC,
+    STALL_D_MERGE_COUNT,
+    STALL_D_MERGE_OTHER,
+    STALL_D_APPLY_ASYNC_MERGE,
+    STALL_D_APPLY_ASYNC_APPLY,
+    STALL_D_APPLY_POOL,
+    STALL_D_APPLY_UNAPPLIED,
+    STALL_D_APPLY_REMOTE_PENDING,
+    STALL_D_APPLY_COMMIT_SHORT,
+    STALL_D_APPLY_FLAG,
+    STALL_D_APPLY_OTHER,
+    STALL_D_UNKNOWN,
+    STALL_D_N
+};
+
+static const char* g_stall_detail_names[STALL_D_N] = {
+    "phys",
+    "local_cmt",
+    "send",
+    "m_peer_end",
+    "m_peer_txn",
+    "m_self_send",
+    "m_async",
+    "m_count",
+    "m_other",
+    "a_async_merge",
+    "a_async_apply",
+    "a_pool",
+    "a_unapplied",
+    "a_remote",
+    "a_commit_short",
+    "a_flag",
+    "a_other",
+    "unknown",
+};
+
+static std::atomic<uint64_t> g_stall_detail_count[STALL_D_N];
+static std::atomic<uint64_t> g_stall_detail_us[STALL_D_N];
+static std::atomic<int> g_stall_last_idx{-1};
+static std::atomic<uint64_t> g_stall_last_us{0};
+
+static uint64_t EpochPerfWallUsNow(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return static_cast<uint64_t>(tv.tv_sec) * 1000000ULL + static_cast<uint64_t>(tv.tv_usec);
+}
+
+static int EpochPerfStallDetailIndex(const char* reason)
+{
+    if (reason == nullptr) {
+        return STALL_D_UNKNOWN;
+    }
+    if (strcmp(reason, "physical_not_ready") == 0) {
+        return STALL_D_PHYS;
+    }
+    if (strcmp(reason, "local_commit_pending") == 0) {
+        return STALL_D_LOCAL_CMT;
+    }
+    if (strcmp(reason, "send_incomplete") == 0) {
+        return STALL_D_SEND;
+    }
+    if (strcmp(reason, "merge_peer_end") == 0) {
+        return STALL_D_MERGE_PEER_END;
+    }
+    if (strcmp(reason, "merge_peer_txn") == 0) {
+        return STALL_D_MERGE_PEER_TXN;
+    }
+    if (strcmp(reason, "merge_self_send") == 0) {
+        return STALL_D_MERGE_SELF_SEND;
+    }
+    if (strcmp(reason, "merge_async") == 0) {
+        return STALL_D_MERGE_ASYNC;
+    }
+    if (strcmp(reason, "merge_count") == 0) {
+        return STALL_D_MERGE_COUNT;
+    }
+    if (strcmp(reason, "merge_incomplete") == 0) {
+        return STALL_D_MERGE_OTHER;
+    }
+    if (strcmp(reason, "apply_async_merge") == 0) {
+        return STALL_D_APPLY_ASYNC_MERGE;
+    }
+    if (strcmp(reason, "apply_async_apply") == 0) {
+        return STALL_D_APPLY_ASYNC_APPLY;
+    }
+    if (strcmp(reason, "apply_pool") == 0) {
+        return STALL_D_APPLY_POOL;
+    }
+    if (strcmp(reason, "apply_unapplied") == 0) {
+        return STALL_D_APPLY_UNAPPLIED;
+    }
+    if (strcmp(reason, "apply_remote_pending") == 0) {
+        return STALL_D_APPLY_REMOTE_PENDING;
+    }
+    if (strcmp(reason, "apply_commit_short") == 0) {
+        return STALL_D_APPLY_COMMIT_SHORT;
+    }
+    if (strcmp(reason, "apply_flag") == 0) {
+        return STALL_D_APPLY_FLAG;
+    }
+    if (strcmp(reason, "apply_incomplete") == 0) {
+        return STALL_D_APPLY_OTHER;
+    }
+    return STALL_D_UNKNOWN;
+}
+
+static void EpochPerfNoteStallDetail(const char* reason)
+{
+    const int idx = EpochPerfStallDetailIndex(reason);
+    g_stall_detail_count[idx].fetch_add(1, std::memory_order_relaxed);
+
+    const uint64_t now = EpochPerfWallUsNow();
+    const int prev = g_stall_last_idx.exchange(idx, std::memory_order_acq_rel);
+    const uint64_t last = g_stall_last_us.exchange(now, std::memory_order_acq_rel);
+    if (prev >= 0 && prev < STALL_D_N && last > 0 && now >= last) {
+        const uint64_t delta = now - last;
+        /* 单次间隔过大视为 idle，不计入，避免 skew */
+        if (delta > 0 && delta < 500000ULL) {
+            g_stall_detail_us[prev].fetch_add(delta, std::memory_order_relaxed);
+        }
+    }
+}
 
 static EpochSharedState::EpochPerfCounters* EpochPerfCounters(void)
 {
@@ -52,22 +186,22 @@ static void EpochPerfZeroCounters(EpochSharedState::EpochPerfCounters* perf)
     perf->stall_peer_not_connected.store(0, std::memory_order_relaxed);
     perf->stall_peer_lag.store(0, std::memory_order_relaxed);
     perf->stall_physical_not_ready.store(0, std::memory_order_relaxed);
-    perf->stall_recv_incomplete.store(0, std::memory_order_relaxed);
-    perf->stall_merge_incomplete.store(0, std::memory_order_relaxed);
     perf->stall_local_commit_pending.store(0, std::memory_order_relaxed);
+    perf->stall_seal_pending.store(0, std::memory_order_relaxed);
     perf->stall_send_incomplete.store(0, std::memory_order_relaxed);
-    perf->stall_reseal_pending.store(0, std::memory_order_relaxed);
-    perf->stall_commit_path_incomplete.store(0, std::memory_order_relaxed);
-    perf->stall_record_incomplete.store(0, std::memory_order_relaxed);
+    perf->stall_merge_incomplete.store(0, std::memory_order_relaxed);
+    perf->stall_apply_incomplete.store(0, std::memory_order_relaxed);
     perf->seal_block_physical_delay.store(0, std::memory_order_relaxed);
     perf->seal_block_peer_lag.store(0, std::memory_order_relaxed);
     perf->seal_block_exec_pending.store(0, std::memory_order_relaxed);
     perf->seal_block_change_set_pending.store(0, std::memory_order_relaxed);
-    perf->seal_block_epoch_active.store(0, std::memory_order_relaxed);
     perf->seal_block_peer_txn_pending.store(0, std::memory_order_relaxed);
     perf->seal_ok_count.store(0, std::memory_order_relaxed);
     perf->worker_poll_count.store(0, std::memory_order_relaxed);
     perf->physical_advance_count.store(0, std::memory_order_relaxed);
+    perf->apply_commit_txn.store(0, std::memory_order_relaxed);
+    perf->apply_abort_txn.store(0, std::memory_order_relaxed);
+    perf->merge_heap_abort.store(0, std::memory_order_relaxed);
 }
 
 bool EpochPerfIsEnabled(void)
@@ -129,6 +263,8 @@ void EpochPerfNoteLogicalStall(const char* reason)
     if (!EpochPerfIsEnabled() || reason == nullptr) {
         return;
     }
+    EpochPerfNoteStallDetail(reason);
+
     EpochSharedState::EpochPerfCounters* perf = EpochPerfCounters();
     if (perf == nullptr) {
         return;
@@ -139,20 +275,16 @@ void EpochPerfNoteLogicalStall(const char* reason)
         EpochPerfBump(&perf->stall_peer_lag);
     } else if (strcmp(reason, "physical_not_ready") == 0) {
         EpochPerfBump(&perf->stall_physical_not_ready);
-    } else if (strcmp(reason, "recv_incomplete") == 0) {
-        EpochPerfBump(&perf->stall_recv_incomplete);
-    } else if (strcmp(reason, "merge_incomplete") == 0) {
-        EpochPerfBump(&perf->stall_merge_incomplete);
     } else if (strcmp(reason, "local_commit_pending") == 0) {
         EpochPerfBump(&perf->stall_local_commit_pending);
+    } else if (strcmp(reason, "seal_pending") == 0) {
+        EpochPerfBump(&perf->stall_seal_pending);
     } else if (strcmp(reason, "send_incomplete") == 0) {
         EpochPerfBump(&perf->stall_send_incomplete);
-    } else if (strcmp(reason, "reseal_pending") == 0) {
-        EpochPerfBump(&perf->stall_reseal_pending);
-    } else if (strcmp(reason, "commit_path_incomplete") == 0) {
-        EpochPerfBump(&perf->stall_commit_path_incomplete);
-    } else if (strcmp(reason, "record_incomplete") == 0) {
-        EpochPerfBump(&perf->stall_record_incomplete);
+    } else if (strncmp(reason, "merge_", 6) == 0 || strcmp(reason, "merge_incomplete") == 0) {
+        EpochPerfBump(&perf->stall_merge_incomplete);
+    } else if (strncmp(reason, "apply_", 6) == 0 || strcmp(reason, "apply_incomplete") == 0) {
+        EpochPerfBump(&perf->stall_apply_incomplete);
     }
 }
 
@@ -173,8 +305,6 @@ void EpochPerfNoteSealBlock(const char* reason)
         EpochPerfBump(&perf->seal_block_exec_pending);
     } else if (strcmp(reason, "change_set_pending") == 0) {
         EpochPerfBump(&perf->seal_block_change_set_pending);
-    } else if (strcmp(reason, "epoch_active") == 0) {
-        EpochPerfBump(&perf->seal_block_epoch_active);
     } else if (strcmp(reason, "peer_txn_pending") == 0) {
         EpochPerfBump(&perf->seal_block_peer_txn_pending);
     }
@@ -254,7 +384,7 @@ void EpochPerfNoteWireRecv(const E_WireTxn& txn, uint64_t wire_bytes)
         return;
     }
     perf->zmq_wire_recv_bytes.fetch_add(wire_bytes, std::memory_order_relaxed);
-    if (txn.start_epoch == 0 && txn.rows.empty() && txn.csn != EPOCH_WIRE_TXN_REQUEST_CSN) {
+    if (E_WireTxnIsEpochEnd(txn)) {
         perf->zmq_epoch_end_recv_count.fetch_add(1, std::memory_order_relaxed);
     } else {
         perf->zmq_wire_recv_count.fetch_add(1, std::memory_order_relaxed);
@@ -279,6 +409,33 @@ void EpochPerfNoteTxnRequestSend(void)
     EpochPerfBump(perf != nullptr ? &perf->zmq_txn_req_send_count : nullptr);
 }
 
+void EpochPerfNoteApplyCommitTxn(void)
+{
+    if (!g_enable_epoch_multimaster) {
+        return;
+    }
+    EpochSharedState::EpochPerfCounters* perf = EpochPerfCounters();
+    EpochPerfBump(perf != nullptr ? &perf->apply_commit_txn : nullptr);
+}
+
+void EpochPerfNoteApplyAbortTxn(void)
+{
+    if (!g_enable_epoch_multimaster) {
+        return;
+    }
+    EpochSharedState::EpochPerfCounters* perf = EpochPerfCounters();
+    EpochPerfBump(perf != nullptr ? &perf->apply_abort_txn : nullptr);
+}
+
+void EpochPerfNoteMergeHeapAbort(void)
+{
+    if (!g_enable_epoch_multimaster) {
+        return;
+    }
+    EpochSharedState::EpochPerfCounters* perf = EpochPerfCounters();
+    EpochPerfBump(perf != nullptr ? &perf->merge_heap_abort : nullptr);
+}
+
 static const char* EpochPerfGateName(EpochPerfGateKind kind)
 {
     switch (kind) {
@@ -286,14 +443,8 @@ static const char* EpochPerfGateName(EpochPerfGateKind kind)
             return "start_gate";
         case EPOCH_PERF_GATE_LOGICAL_COMMIT:
             return "logical_commit_wait";
-        case EPOCH_PERF_GATE_REMOTE_EXEC:
-            return "remote_exec_wait";
-        case EPOCH_PERF_GATE_REMOTE_RECORD:
-            return "remote_record_wait";
-        case EPOCH_PERF_GATE_ASYNC_ADMIT:
-            return "async_admit_wait";
-        case EPOCH_PERF_GATE_ASYNC_PACK:
-            return "async_pack_wait";
+        case EPOCH_PERF_GATE_PACK_ADMIT:
+            return "pack_admit_wait";
         default:
             return "unknown_gate";
     }
@@ -353,14 +504,13 @@ void EpochPerfMaybeReport(void)
     int rc = snprintf_s(buf,
         sizeof(buf),
         sizeof(buf) - 1,
-        "[%s] node=%u profile_gate_total_us=%lu physical=%lu logical=%lu gap=%lu commit_sync=%s",
+        "[%s] node=%u profile_gate_total_us=%lu physical=%lu logical=%lu gap=%lu",
         ts,
         self,
         total_gate_us,
         physical,
         logical,
-        gap_pl,
-        g_epoch_commit_sync ? "on" : "off");
+        gap_pl);
     securec_check_ss(rc, "\0", "\0");
     EpochPerfAppendLine(fp, buf);
 
@@ -434,30 +584,66 @@ void EpochPerfMaybeReport(void)
     rc = snprintf_s(buf,
         sizeof(buf),
         sizeof(buf) - 1,
-        "  STALL peer_nc=%lu peer_lag=%lu phys=%lu recv=%lu merge=%lu local_cmt=%lu send=%lu reseal=%lu cmt_path=%lu record=%lu",
+        "  STALL peer_nc=%lu peer_lag=%lu phys=%lu local_cmt=%lu seal=%lu send=%lu merge=%lu apply=%lu",
         perf->stall_peer_not_connected.load(std::memory_order_relaxed),
         perf->stall_peer_lag.load(std::memory_order_relaxed),
         perf->stall_physical_not_ready.load(std::memory_order_relaxed),
-        perf->stall_recv_incomplete.load(std::memory_order_relaxed),
-        perf->stall_merge_incomplete.load(std::memory_order_relaxed),
         perf->stall_local_commit_pending.load(std::memory_order_relaxed),
+        perf->stall_seal_pending.load(std::memory_order_relaxed),
         perf->stall_send_incomplete.load(std::memory_order_relaxed),
-        perf->stall_reseal_pending.load(std::memory_order_relaxed),
-        perf->stall_commit_path_incomplete.load(std::memory_order_relaxed),
-        perf->stall_record_incomplete.load(std::memory_order_relaxed));
+        perf->stall_merge_incomplete.load(std::memory_order_relaxed),
+        perf->stall_apply_incomplete.load(std::memory_order_relaxed));
+    securec_check_ss(rc, "\0", "\0");
+    EpochPerfAppendLine(fp, buf);
+
+    {
+        char detail[768];
+        int off = 0;
+        int n = snprintf_s(detail, sizeof(detail), sizeof(detail) - 1, "  STALL_US");
+        if (n > 0) {
+            off = n;
+        }
+        for (int i = 0; i < STALL_D_N && off < static_cast<int>(sizeof(detail)) - 48; ++i) {
+            const uint64_t us = g_stall_detail_us[i].load(std::memory_order_relaxed);
+            const uint64_t cnt = g_stall_detail_count[i].load(std::memory_order_relaxed);
+            if (us == 0 && cnt == 0) {
+                continue;
+            }
+            n = snprintf_s(detail + off,
+                sizeof(detail) - static_cast<size_t>(off),
+                sizeof(detail) - static_cast<size_t>(off) - 1,
+                " %s=%luus/%lu",
+                g_stall_detail_names[i],
+                us,
+                cnt);
+            if (n > 0) {
+                off += n;
+            }
+        }
+        EpochPerfAppendLine(fp, detail);
+    }
+
+    rc = snprintf_s(buf,
+        sizeof(buf),
+        sizeof(buf) - 1,
+        "  SEAL_BLOCK phys_delay=%lu peer_lag=%lu exec=%lu chg_set=%lu peer_txn=%lu",
+        perf->seal_block_physical_delay.load(std::memory_order_relaxed),
+        perf->seal_block_peer_lag.load(std::memory_order_relaxed),
+        perf->seal_block_exec_pending.load(std::memory_order_relaxed),
+        perf->seal_block_change_set_pending.load(std::memory_order_relaxed),
+        perf->seal_block_peer_txn_pending.load(std::memory_order_relaxed));
     securec_check_ss(rc, "\0", "\0");
     EpochPerfAppendLine(fp, buf);
 
     rc = snprintf_s(buf,
         sizeof(buf),
         sizeof(buf) - 1,
-        "  SEAL_BLOCK phys_delay=%lu peer_lag=%lu exec=%lu chg_set=%lu epoch_active=%lu peer_txn=%lu",
-        perf->seal_block_physical_delay.load(std::memory_order_relaxed),
-        perf->seal_block_peer_lag.load(std::memory_order_relaxed),
-        perf->seal_block_exec_pending.load(std::memory_order_relaxed),
-        perf->seal_block_change_set_pending.load(std::memory_order_relaxed),
-        perf->seal_block_epoch_active.load(std::memory_order_relaxed),
-        perf->seal_block_peer_txn_pending.load(std::memory_order_relaxed));
+        "  APPLY_TXN commit=%lu abort=%lu merge_heap_abort=%lu total=%lu",
+        perf->apply_commit_txn.load(std::memory_order_relaxed),
+        perf->apply_abort_txn.load(std::memory_order_relaxed),
+        perf->merge_heap_abort.load(std::memory_order_relaxed),
+        perf->apply_commit_txn.load(std::memory_order_relaxed) +
+            perf->apply_abort_txn.load(std::memory_order_relaxed));
     securec_check_ss(rc, "\0", "\0");
     EpochPerfAppendLine(fp, buf);
 

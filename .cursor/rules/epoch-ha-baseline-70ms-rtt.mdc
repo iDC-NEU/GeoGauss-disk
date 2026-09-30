@@ -1,0 +1,64 @@
+---
+description: openGauss 一主一备 TPCC 基线 RTT=70ms（epoch P0 持平 / P2×3 对标）
+alwaysApply: true
+---
+
+# openGauss 一主一备基线：RTT=70ms
+
+**用途**：epoch 多主验收的**外部对比系统**（见 `epoch-acceptance.mdc`）。  
+主线对标 **async**；**P0 = 持平（1×）**，**P2 = 对标 ×3**（原文档曾称 P1）。  
+当前冲刺 **P1** 为 terminals/库规模扩展（33→50→tpcc300），不在本表用主备绝对 tpmC 定义。
+
+**机器**：与当前 epoch 压测节点相同配置。  
+**窗口**：BenchmarkSQL **Session Start → Session End** 的 Measured tpmC。
+
+## 基线结果与门槛
+
+| 档位 | 配置要点 | 基线 tpmC | tpmTOTAL | **P0（1×，持平）** | **P2（3×）** |
+|------|----------|-----------|----------|--------------------|--------------|
+| **async（主验收）** | `synchronous_commit=off`，`sync_state=async` | **46217.44** | 92659.74 | **≥ 46218** | **≥ 138653** |
+| **sync（附带）** | `synchronous_commit=on`，`sync_state=sync` | **2909.37** | 5776.86 | 建议 ≥ 2909 | 理想 ≥ 8728 |
+
+日志摘录：
+
+```text
+# async
+Measured tpmC (NewOrders) = 46217.44
+Measured tpmTOTAL = 92659.74
+
+# sync
+Measured tpmC (NewOrders) = 2909.37
+Measured tpmTOTAL = 5776.86
+```
+
+（时间戳参考：async ~14:42:57；sync ~15:02:59。）
+
+## 与 epoch 的对比方式
+
+| 项目 | 一主一备 | epoch（stats-nogate） |
+|------|----------|------------------------|
+| 写路径 | 单 primary | 双节点同时写 |
+| TPCC | 一条打主 | node0 + node2 各一条 |
+| 指标 | 主上 tpmC | **两节点 tpmC 之和** |
+| 默认档 | async | `synchronous_commit=off` |
+
+主线（默认）：
+
+```text
+sum = tpmC_node0 + tpmC_node2
+P0:  sum ≥ 46217.44   ≈ 46218
+P2:  sum ≥ 3 × 46217.44 = 138652.32  ≈ 138653
+```
+
+附带（`synchronous_commit=on` 时，不替代 P0/P1/P2）：
+
+```text
+建议持平: sum ≥ 2909.37
+理想 ×3:  sum ≥ 8728.11
+```
+
+## 备注
+
+- 旧 epoch gate-on 基线（`epoch-tpcc-baseline-70ms-rtt.mdc`）仅内部对照。  
+- 换机器或改 warehouses/terminals 后须重测本表并更新 P0/P2。  
+- **P1（50 terminals / tpcc300 扩展）** 的通过条件见 `epoch-acceptance.mdc`，不以本表 ×3 线作为 P1 门槛。

@@ -36,6 +36,7 @@
 #include "c.h"
 #include "datatype/timestamp.h"
 #include "gs_thread.h"
+#include "epoch/e_types.h"
 #include "knl/knl_guc.h"
 #include "lib/circularqueue.h"
 #include "nodes/pg_list.h"
@@ -196,6 +197,11 @@ typedef struct knl_g_pid_context {
     ThreadId CBMWriterPID;
 //HCJ ADDBY
     ThreadId EpochWorkerPID;
+    ThreadId EpochApplyWorkerPIDs[EPOCH_MAX_APPLY_WORKERS];
+    ThreadId EpochMergeWorkerPIDs[EPOCH_MAX_MERGE_WORKERS];
+    ThreadId EpochPackWorkerPIDs[EPOCH_MAX_PACK_WORKERS];
+    ThreadId EpochSendWorkerPID;
+    ThreadId EpochTipFlushWorkerPIDs[EPOCH_MAX_TIP_FLUSH_WORKERS];
     ThreadId AioCompleterStarted;
     ThreadId HeartbeatPID;
     ThreadId CsnminSyncPID;

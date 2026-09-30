@@ -2,11 +2,13 @@
 #define OPENGAUSS_E_EXEC_TRACK_H
 
 /*
- * 统计某 epoch 内「正在执行 SQL、尚未完成读写集采集」的事务数。
- * +1：首次 OCC 访问（非 START gate，避免空闲连接误计）
- * -1：写集已 pack/change_set 入账，或只读 commit，或 abort
+ * XACT START：Assign 后立即 assign_on_start（executing +1），再 START gate。
+ * 事务 END（no_occ / 写 / 只读）E_ResetTxnEpochContext，下一条 START 重新 Assign。
  */
+void EpochEnsureTxnEpochOnAccess(bool is_write);
 void EpochMaybeMarkTxnExecuting(void);
-void EpochReleaseTxnExecuting(void);
+void EpochTrackExecutingInc(uint64_t epoch, const char* reason);
+void EpochReleaseTxnExecuting(const char* reason);
+void EpochMaybeLogTxnProgress(const char* tag, const char* detail);
 
 #endif /* OPENGAUSS_E_EXEC_TRACK_H */

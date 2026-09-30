@@ -49,9 +49,17 @@
 #include "postmaster/postmaster.h"
 //HCJ ADDBY
 #include "epoch/e_config.h"
+#include "epoch/e_epoch_capacity.h"
 #include "epoch/e_types.h"
 #include "epoch/e_shmem.h"
 #include "epoch/e_txn_queue.h"
+#include "epoch/e_apply_shmem.h"
+#include "epoch/e_abort_csn.h"
+#include "epoch/e_crdt_shmem.h"
+#include "epoch/e_merge_retract_shmem.h"
+#include "epoch/e_merge_shmem.h"
+#include "epoch/e_tip_staging_shmem.h"
+#include "epoch/e_pk_staging_shmem.h"
 #include "postmaster/snapcapturer.h"
 #include "postmaster/cfs_shrinker.h"
 #include "postmaster/rbcleaner.h"
@@ -218,7 +226,14 @@ Size ComputeTotalSizeOfShmem()
 //HCJ ADDBY
         if (g_enable_epoch_multimaster) {
             size = add_size(size, EpochShmemSize());
-            size = add_size(size, EpochTxnQueueShmemSize(EPOCH_TXN_QUEUE_CAPACITY));
+            size = add_size(size, EpochTxnQueueShmemSize(EpochGetTxnQueueCapacity()));
+            size = add_size(size, EpochApplyQueueShmemSize());
+            size = add_size(size, EpochCrdtShmemSize());
+            size = add_size(size, EpochMergeQueueShmemSize());
+            size = add_size(size, EpochMergeRetractShmemSize());
+            size = add_size(size, EpochAbortCsnShmemSize());
+            size = add_size(size, EpochTipStagingShmemSize());
+            size = add_size(size, EpochPkStagingShmemSize());
         }
         return size;
 }
@@ -429,7 +444,14 @@ void CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 //HCJ ADDBY
         if (g_enable_epoch_multimaster) {
             EpochShmemInit();
-            EpochTxnQueueShmemInit(EPOCH_TXN_QUEUE_CAPACITY);
+            EpochTxnQueueShmemInit(EpochGetTxnQueueCapacity());
+            EpochApplyQueueShmemInit();
+            EpochCrdtShmemInit();
+            EpochMergeQueueShmemInit();
+            EpochMergeRetractShmemInit();
+            EpochAbortCsnShmemInit();
+            EpochTipStagingShmemInit();
+            EpochPkStagingShmemInit();
         }
 
 #ifdef PGXC

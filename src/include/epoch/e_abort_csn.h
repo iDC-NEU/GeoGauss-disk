@@ -1,31 +1,21 @@
 #ifndef OPENGAUSS_E_ABORT_CSN_H
 #define OPENGAUSS_E_ABORT_CSN_H
 
-#include <atomic>
 #include <cstdint>
 
-#include "epoch/e_types.h"
-
-/* GeoGauss MOTAdaptor::abort_transcation_csn_set，按 epoch 槽位存放 merge 输家 CSN */
-static constexpr uint32_t EPOCH_ABORT_CSNS_PER_SLOT = 1024;
+#include "epoch/e_crdt.h"
+#include "epoch/e_txn_wire.h"
 
 struct EpochAbortCsnEntry {
-    std::atomic<uint64_t> csn;
-    std::atomic<uint32_t> server_id;
+    uint64_t csn;
+    uint32_t server_id;
 };
 
-struct EpochAbortCsnSlot {
-    std::atomic<uint32_t> count;
-    EpochAbortCsnEntry entries[EPOCH_ABORT_CSNS_PER_SLOT];
-};
-
-struct EpochAbortCsnBank {
-    EpochAbortCsnSlot slots[EPOCH_DEFAULT_CACHE_SLOTS];
-};
-
-void EpochAbortCsnBankInit(EpochAbortCsnBank* bank);
-void EpochAbortCsnClear(uint64_t epochId);
-void EpochAbortCsnInsert(uint64_t epochId, uint64_t csn, uint32_t serverId);
-bool EpochAbortCsnContains(uint64_t epochId, uint64_t csn, uint32_t serverId);
+extern Size EpochAbortCsnShmemSize(void);
+extern void EpochAbortCsnShmemInit(void);
+extern void EpochAbortCsnClear(uint64_t epochId);
+extern void EpochAbortCsnInsert(uint64_t epochId, uint64_t csn, uint32_t serverId);
+extern bool EpochAbortCsnContains(uint64_t epochId, uint64_t csn, uint32_t serverId);
+extern void EpochAbortCsnRecordMergeOutcome(uint64_t epochId, const E_WireTxn& txn, const E_CrdtMergeOutcome& outcome);
 
 #endif /* OPENGAUSS_E_ABORT_CSN_H */

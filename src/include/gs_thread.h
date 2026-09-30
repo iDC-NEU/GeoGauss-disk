@@ -102,6 +102,15 @@ typedef enum knl_thread_role {
     CBMWRITER,
 //HCJ ADDBY
     EPOCHWORKER,
+    EPOCHAPPLYWORKER,
+    EPOCHMERGEWORKER,
+    /*
+     * Pack/Send/TipFlush 必须紧挨 Merge：GaussdbThreadGate[role] 以枚举数值为下标。
+     * 切勿把新 role 只加在 THREAD_ENTRY_BOUND 前而表项插在中间，否则全表错位、Assert 崩。
+     */
+    EPOCHPACKWORKER,
+    EPOCHSENDWORKER,
+    EPOCHTIPFLUSHER,
     PAGEWRITER_THREAD,
     PAGEREPAIR_THREAD,
     HEARTBEAT,

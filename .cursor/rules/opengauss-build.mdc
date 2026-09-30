@@ -1,0 +1,19 @@
+---
+description: openGauss 全量编译由用户执行；Agent 仅做增量编译或改代码
+alwaysApply: true
+---
+
+# openGauss 编译约定
+
+- **全量链接/编译 gaussdb 由用户自行执行**，Agent 不要主动运行长时间全量 build。
+- 典型命令（用户执行）：
+  ```bash
+  cd /home/hcj2003/2025-9/openGauss-server/src/gausskernel && make -sj4 gaussdb
+  ```
+- Agent 可以做的：
+  - 修改源码
+  - 在 `src/epoch` 等子目录做**增量**编译（如 `make e_apply_pool.o SUBSYS.o`）
+  - 告知用户需要全量编译后再验证
+- Agent 不要做的：
+  - 主动跑 `build.sh`、顶层 `make -sj$(nproc)`、或 `src/gausskernel && make gaussdb` 等全量链接
+  - 因全量编译超时而反复重试

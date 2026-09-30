@@ -5,6 +5,8 @@
 #include <string>
 
 bool EpochNetInit(void);
+/* Pack/Send：勿重复 Init；等 epochcoord BootstrapOwner 完成绑定 */
+bool EpochNetIsReady(void);
 void EpochNetShutdown(void);
 bool EpochNetPublish(const std::string& payload);
 bool EpochNetPublishDirect(const std::string& payload);

@@ -32,6 +32,7 @@
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "epoch/e_apply_buflock.h"
 #include "miscadmin.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
@@ -603,7 +604,7 @@ Buffer _bt_getbuf(Relation rel, BlockNumber blkno, int access)
         /* Read an existing block of the relation */
         buf = ReadBuffer(rel, blkno);
         _bt_checkbuffer_valid(rel, buf);
-        LockBuffer(buf, access);
+        EpochApplyBufLockBtLockBuffer(buf, access);
         _bt_checkpage(rel, buf);
     } else {
         Assert(!RelationIsUstoreIndex(rel));
@@ -696,7 +697,7 @@ loop:
         buf = ReadBuffer(rel, P_NEW);
 
         /* Acquire buffer lock on new page */
-        LockBuffer(buf, BT_WRITE);
+        EpochApplyBufLockBtLockBuffer(buf, BT_WRITE);
 
         /*
          * Release the file-extension lock; it's now OK for someone else to
@@ -740,7 +741,7 @@ Buffer _bt_relandgetbuf(Relation rel, Buffer obuf, BlockNumber blkno, int access
         LockBuffer(obuf, BUFFER_LOCK_UNLOCK);
     buf = ReleaseAndReadBuffer(obuf, rel, blkno);
     _bt_checkbuffer_valid(rel, buf);
-    LockBuffer(buf, access);
+    EpochApplyBufLockBtLockBuffer(buf, access);
     _bt_checkpage(rel, buf, par_blkno);
     return buf;
 }

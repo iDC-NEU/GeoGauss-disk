@@ -84,7 +84,8 @@ static bool ReadEnvelopeHeader(const char *data, size_t len, DnWireEnvelopeKind 
     if (!ReadU64(p, end, &magic) || magic != DN_WIRE_ENVELOPE_MAGIC) {
         return false;
     }
-    if (!ReadU32(p, end, &version) || version != DN_WIRE_ENVELOPE_VERSION) {
+    if (!ReadU32(p, end, &version) ||
+        (version != DN_WIRE_ENVELOPE_VERSION && version != 1)) {
         return false;
     }
     if (!ReadU32(p, end, &k)) {
@@ -258,7 +259,6 @@ bool DnWireSerializeMetadataEnvelope(int32_t from_node, int32_t epoch, uint64_t 
     AppendU32(out, static_cast<uint32_t>(DN_WIRE_ENV_TXN_METADATA));
     AppendU64(out, 0);
     AppendU64(out, static_cast<uint64_t>(epoch));
-    AppendU64(out, static_cast<uint64_t>(epoch));
     AppendU32(out, static_cast<uint32_t>(from_node));
     AppendU64(out, payload_hash);
     AppendI32(out, payload_size);
@@ -286,20 +286,40 @@ bool DnWireTryDecodePayload(const char *data, size_t len, int from_node_id, DnNe
     if (kind == DN_WIRE_ENV_TXN_METADATA) {
         const char *p = data + sizeof(uint64_t) + sizeof(uint32_t) * 2;
         const char *end = data + len;
+        const char *ver_p = data + sizeof(uint64_t);
+        uint32_t version = 0;
+        if (!ReadU32(ver_p, end, &version) ||
+            (version != DN_WIRE_ENVELOPE_VERSION && version != 1)) {
+            return false;
+        }
         uint64_t csn = 0;
-        uint64_t start_epoch = 0;
-        uint64_t commit_epoch = 0;
+        uint64_t epoch_val = 0;
         uint32_t server_id = 0;
         uint64_t payload_hash = 0;
         int32_t payload_size = 0;
-        if (!ReadU64(p, end, &csn) || !ReadU64(p, end, &start_epoch) ||
-            !ReadU64(p, end, &commit_epoch) || !ReadU32(p, end, &server_id) ||
-            !ReadU64(p, end, &payload_hash) || !ReadI32(p, end, &payload_size)) {
+        if (!ReadU64(p, end, &csn)) {
+            return false;
+        }
+        if (version >= 2) {
+            if (!ReadU64(p, end, &epoch_val)) {
+                return false;
+            }
+        } else {
+            uint64_t start_epoch = 0;
+            uint64_t commit_epoch = 0;
+            if (!ReadU64(p, end, &start_epoch) || !ReadU64(p, end, &commit_epoch)) {
+                return false;
+            }
+            epoch_val = commit_epoch;
+            (void)start_epoch;
+        }
+        if (!ReadU32(p, end, &server_id) || !ReadU64(p, end, &payload_hash) ||
+            !ReadI32(p, end, &payload_size)) {
             return false;
         }
         (void)csn;
         out->kind = DnMsgKind::APPEND_ENTRIES;
-        out->append_req.epoch = static_cast<int32_t>(commit_epoch);
+        out->append_req.epoch = static_cast<int32_t>(epoch_val);
         out->append_req.channel_id = static_cast<int32_t>(server_id);
         out->append_req.payload_hash = payload_hash;
         out->append_req.payload_size = payload_size;

@@ -55,8 +55,19 @@ Tuple O_index_getnext(IndexScanDesc scan, ScanDirection direction, bool* has_cur
         occ_sentinel sentinel(scan->heapRelation, scan->xs_ctup.t_self, scan->xs_snapshot);
         currRow = txn->RowLookup(AccessType::RD, sentinel, rc, scan);
 
-        if (currRow != NULL)
-            return (Tuple)currRow;
+        if (currRow != NULL) {
+            if (!ItemPointerIsValid(&currRow->t_self)) {
+                if (ItemPointerIsValid(&scan->xs_ctup.t_self)) {
+                    currRow->t_self = scan->xs_ctup.t_self;
+                } else if (OccTidIsPlausible(&sentinel.tuple_id)) {
+                    currRow->t_self = sentinel.tuple_id;
+                }
+            }
+            if (ItemPointerIsValid(&currRow->t_self)) {
+                return (Tuple)currRow;
+            }
+            continue;
+        }
 
     }
     return NULL;

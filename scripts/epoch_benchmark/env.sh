@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # HCJ ADDBY: epoch 多节点 BenchmarkSQL 测试环境变量
 
-# 从 scripts/epoch_benchmark 向上三级推断 bench 根目录（node0/node1/node2 各自本机路径）
+# 从 scripts/epoch_benchmark 向上三级推断 bench 根目录（node1/node2/node3 各自本机路径）
 _epoch_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export EPOCH_BENCH_ROOT="${EPOCH_BENCH_ROOT:-$(cd "${_epoch_env_dir}/../../.." && pwd)}"
-# 勿沿用 ~/.bashrc 里的 GAUSSHOME，epoch 必须用 2025-9 下与 node0 同步的二进制
+# 勿沿用 ~/.bashrc 里的 GAUSSHOME，epoch 必须用 2025-9 下与 node1 同步的二进制
 export GAUSSHOME="${EPOCH_BENCH_ROOT}/openGauss-server/mppdb_temp_install"
 export EPOCH_RUNTIME_LIBS="${EPOCH_BENCH_ROOT}/epoch_deploy/runtime_libs"
 export BINARYLIBS="${BINARYLIBS:-/home/hcj2003/openGauss-third_party_binarylibs}"
@@ -55,47 +55,141 @@ export PATH
 export EPOCH_DATA_ROOT="${EPOCH_DATA_ROOT:-${EPOCH_BENCH_ROOT}/data}"
 export EPOCH_BENCHMARKSQL="${EPOCH_BENCH_ROOT}/benchmarksql-5.0-epoch/run"
 
-# 三节点拓扑
-export EPOCH_NODE0_IP="${EPOCH_NODE0_IP:-202.199.13.149}"
-export EPOCH_NODE1_IP="${EPOCH_NODE1_IP:-219.216.64.113}"
+# 三节点拓扑（脚本 NODE_ID = 1..3，与 node1/node2/node3 一致）
+#   id=1  node1  202.199.13.149   本机 hcj2003
+#   id=2  node2  202.199.13.61    远程 zwx
+#   id=3  node3  219.216.64.216   远程 hcj2003（当前默认不测）
+export EPOCH_NODE1_IP="${EPOCH_NODE1_IP:-202.199.13.149}"
 export EPOCH_NODE2_IP="${EPOCH_NODE2_IP:-202.199.13.61}"
+export EPOCH_NODE3_IP="${EPOCH_NODE3_IP:-219.216.64.216}"
 export EPOCH_TOTAL_NODES=3
-export EPOCH_PEER_HOSTS="${EPOCH_NODE0_IP},${EPOCH_NODE1_IP},${EPOCH_NODE2_IP}"
+export EPOCH_PEER_HOSTS="${EPOCH_NODE1_IP},${EPOCH_NODE2_IP},${EPOCH_NODE3_IP}"
+
+# 跳过的脚本节点 id。0 = 三节点都参与。
+# 当前默认：node1 + node2，跳过 node3。
+# 旧组合 node1 + node3：export EPOCH_SKIP_NODE=2
+# 三节点都测：export EPOCH_SKIP_NODE=0
+export EPOCH_SKIP_NODE="${EPOCH_SKIP_NODE:-3}"
+
+epoch_node_is_skipped() {
+    local node_id="$1"
+    [ "${EPOCH_SKIP_NODE:-0}" != "0" ] && [ "${node_id}" = "${EPOCH_SKIP_NODE}" ]
+}
+
+epoch_effective_total_nodes() {
+    if [ "${EPOCH_SKIP_NODE:-0}" != "0" ]; then
+        echo $((EPOCH_TOTAL_NODES - 1))
+    else
+        echo "${EPOCH_TOTAL_NODES}"
+    fi
+}
+
+epoch_active_node_ids() {
+    local n
+    for n in 1 2 3; do
+        epoch_node_is_skipped "${n}" && continue
+        printf '%s ' "${n}"
+    done
+    printf '\n'
+}
+
+epoch_effective_peer_hosts() {
+    local n ip hosts=""
+    for n in $(epoch_active_node_ids); do
+        ip="$(epoch_node_ip "${n}")"
+        if [ -z "${hosts}" ]; then
+            hosts="${ip}"
+        else
+            hosts="${hosts},${ip}"
+        fi
+    done
+    echo "${hosts}"
+}
+
+# 按 EPOCH_PROFILE 决定 prep/压测流程实际操作哪些节点（single-node-baseline 仅 node1）
+epoch_profile_node_ids() {
+    case "${EPOCH_PROFILE:-benchmark}" in
+        single-node-baseline)
+            echo "1"
+            ;;
+        *)
+            epoch_active_node_ids
+            ;;
+    esac
+}
+
+epoch_remote_deploy_node_ids() {
+    local n
+    for n in $(epoch_active_node_ids); do
+        [ "${n}" = "1" ] && continue
+        printf '%s ' "${n}"
+    done
+    printf '\n'
+}
+
+# epoch_node_id GUC 为 0-based，与当前 peer_hosts 列表下标对齐
+epoch_guc_node_id() {
+    local node_id="$1"
+    local n idx=0
+    if epoch_node_is_skipped "${node_id}"; then
+        echo "invalid node_id ${node_id} (EPOCH_SKIP_NODE=${EPOCH_SKIP_NODE})" >&2
+        return 1
+    fi
+    for n in $(epoch_active_node_ids); do
+        if [ "${n}" = "${node_id}" ]; then
+            echo "${idx}"
+            return 0
+        fi
+        idx=$((idx + 1))
+    done
+    echo "invalid node_id ${node_id}" >&2
+    return 1
+}
+
 export EPOCH_DB_PORT="${EPOCH_DB_PORT:-32000}"
 export EPOCH_ZMQ_PORT_BASE="${EPOCH_ZMQ_PORT_BASE:-25600}"
 
-# node0 / node1：hcj2003；node2：zwx（gs_initdb 超级用户随 OS 用户）
-# 以下密码仅用于 gs_initdb -w；日常 gsql 走 pg_hba trust，无需 -U/-W
+# node1 / node3：hcj2003；node2：zwx（gs_initdb 超级用户随 OS 用户）
 export EPOCH_SUPER_USER="${EPOCH_SUPER_USER:-hcj2003}"
 export EPOCH_SUPER_PASSWORD="${EPOCH_SUPER_PASSWORD:-Gauss@123.}"
 export EPOCH_NODE2_SUPER_USER="${EPOCH_NODE2_SUPER_USER:-zwx}"
 export EPOCH_NODE2_SUPER_PASSWORD="${EPOCH_NODE2_SUPER_PASSWORD:-Test@123}"
 export EPOCH_TPCC_USER=bot
 export EPOCH_TPCC_PASSWORD="${EPOCH_TPCC_PASSWORD:-Test@123}"
-export EPOCH_TPCC_DB=test
+# 默认整目录 bak→live 恢复（见 restore_tpcc_datadir.sh）。tpcc300 建议另起 data dir。
+export EPOCH_TPCC_DB="${EPOCH_TPCC_DB:-test}"
 
-# TPCC / epoch 性能调优（三节点各跑 33 warehouse，共 100；terminal：node0=33, node1=33, node2=34）
-export EPOCH_LOAD_WAREHOUSES="${EPOCH_LOAD_WAREHOUSES:-100}"
-export EPOCH_RUN_WAREHOUSES_PER_NODE="${EPOCH_RUN_WAREHOUSES_PER_NODE:-33}"
-export EPOCH_TPCC_TERMINALS_NODE0="${EPOCH_TPCC_TERMINALS_NODE0:-33}"
+# 物理 OID（CREATE DATABASE 后固定；DROP 重建会变，需更新）
+export EPOCH_TPCC_TEST_OID_NODE1="${EPOCH_TPCC_TEST_OID_NODE1:-24744}"
+export EPOCH_TPCC_TEST_OID_NODE3="${EPOCH_TPCC_TEST_OID_NODE3:-49388}"
+export EPOCH_TPCC300_OID_NODE1="${EPOCH_TPCC300_OID_NODE1:-24906}"
+export EPOCH_TPCC300_OID_NODE3="${EPOCH_TPCC300_OID_NODE3:-49543}"
+# openGauss tablespace 相对路径中的版本目录名（与 initdb nodename 相关；同节点上 test/tpcc300 共用）
+export EPOCH_TPCC_TBLSPC_VER_NODE1="${EPOCH_TPCC_TBLSPC_VER_NODE1:-${EPOCH_TPCC300_TBLSPC_VER_NODE1:-PG_9.2_201611171_epoch_node0}}"
+export EPOCH_TPCC_TBLSPC_VER_NODE3="${EPOCH_TPCC_TBLSPC_VER_NODE3:-${EPOCH_TPCC300_TBLSPC_VER_NODE3:-PG_9.2_201611171_epoch_node1}}"
+# 兼容旧变量名
+export EPOCH_TPCC300_TBLSPC_VER_NODE1="${EPOCH_TPCC_TBLSPC_VER_NODE1}"
+export EPOCH_TPCC300_TBLSPC_VER_NODE3="${EPOCH_TPCC_TBLSPC_VER_NODE3}"
+
+export EPOCH_LOAD_WAREHOUSES="${EPOCH_LOAD_WAREHOUSES:-300}"
+export EPOCH_RUN_WAREHOUSES_PER_NODE="${EPOCH_RUN_WAREHOUSES_PER_NODE:-150}"
 export EPOCH_TPCC_TERMINALS_NODE1="${EPOCH_TPCC_TERMINALS_NODE1:-33}"
 export EPOCH_TPCC_TERMINALS_NODE2="${EPOCH_TPCC_TERMINALS_NODE2:-34}"
-# Payment hist_id 分片步长（bmsql_history.hist_id 为 int4）
-# node N 从 N*stride+1 发号；默认 stride=2147483647/TOTAL_NODES
-export EPOCH_HIST_ID_NODE_STRIDE="${EPOCH_HIST_ID_NODE_STRIDE:-$((2147483647 / EPOCH_TOTAL_NODES))}"
+export EPOCH_TPCC_TERMINALS_NODE3="${EPOCH_TPCC_TERMINALS_NODE3:-33}"
+# BenchmarkSQL props（相对 EPOCH_BENCHMARKSQL）；空则按 EPOCH_TPCC_DB 选默认
+export EPOCH_TPCC_PROPS_NODE1="${EPOCH_TPCC_PROPS_NODE1:-}"
+export EPOCH_TPCC_PROPS_NODE2="${EPOCH_TPCC_PROPS_NODE2:-}"
+export EPOCH_TPCC_PROPS_NODE3="${EPOCH_TPCC_PROPS_NODE3:-}"
+export EPOCH_HIST_ID_NODE_STRIDE="${EPOCH_HIST_ID_NODE_STRIDE:-$((2147483647 / $(epoch_effective_total_nodes)))}"
 if ! [[ "${EPOCH_HIST_ID_NODE_STRIDE}" =~ ^[0-9]+$ ]] \
-    || [ $((EPOCH_TOTAL_NODES * EPOCH_HIST_ID_NODE_STRIDE)) -gt 2147483647 ]; then
-    export EPOCH_HIST_ID_NODE_STRIDE=$((2147483647 / EPOCH_TOTAL_NODES))
-    echo "WARN: EPOCH_HIST_ID_NODE_STRIDE adjusted to ${EPOCH_HIST_ID_NODE_STRIDE} for ${EPOCH_TOTAL_NODES} nodes" >&2
+    || [ $(($(epoch_effective_total_nodes) * EPOCH_HIST_ID_NODE_STRIDE)) -gt 2147483647 ]; then
+    export EPOCH_HIST_ID_NODE_STRIDE=$((2147483647 / $(epoch_effective_total_nodes)))
+    echo "WARN: EPOCH_HIST_ID_NODE_STRIDE adjusted to ${EPOCH_HIST_ID_NODE_STRIDE} for $(epoch_effective_total_nodes) active nodes" >&2
 fi
 
-# 远程部署：node1
 export EPOCH_REMOTE_USER="${EPOCH_REMOTE_USER:-hcj2003}"
-export EPOCH_REMOTE_HOST="${EPOCH_REMOTE_HOST:-${EPOCH_NODE1_IP}}"
 export EPOCH_REMOTE_HOME="${EPOCH_REMOTE_HOME:-/home/hcj2003}"
-export EPOCH_REMOTE_BENCH_ROOT="${EPOCH_REMOTE_BENCH_ROOT:-${EPOCH_REMOTE_HOME}/2025-9}"
-
-# 远程部署：node2
+export EPOCH_NODE3_BENCH_ROOT="${EPOCH_NODE3_BENCH_ROOT:-${EPOCH_REMOTE_HOME}/2025-9}"
 export EPOCH_NODE2_REMOTE_USER="${EPOCH_NODE2_REMOTE_USER:-zwx}"
 export EPOCH_NODE2_REMOTE_HOME="${EPOCH_NODE2_REMOTE_HOME:-/home/zwx}"
 export EPOCH_NODE2_BENCH_ROOT="${EPOCH_NODE2_BENCH_ROOT:-${EPOCH_NODE2_REMOTE_HOME}/2025-9}"
@@ -103,20 +197,114 @@ export EPOCH_NODE2_BENCH_ROOT="${EPOCH_NODE2_BENCH_ROOT:-${EPOCH_NODE2_REMOTE_HO
 export BUILD_JOBS=40
 export OPENGAUSS_SRC="${EPOCH_BENCH_ROOT}/openGauss-server"
 
-epoch_tpcc_terminals_for_node() {
+# 当前 EPOCH_TPCC_DB 对应的 OID
+epoch_tpcc_db_oid_for_node() {
     local node_id="$1"
-    case "${node_id}" in
-        0) echo "${EPOCH_TPCC_TERMINALS_NODE0}" ;;
-        1) echo "${EPOCH_TPCC_TERMINALS_NODE1}" ;;
-        2) echo "${EPOCH_TPCC_TERMINALS_NODE2}" ;;
+    case "${EPOCH_TPCC_DB}" in
+        test)
+            case "${node_id}" in
+                1) echo "${EPOCH_TPCC_TEST_OID_NODE1}" ;;
+                3) echo "${EPOCH_TPCC_TEST_OID_NODE3}" ;;
+                *)
+                    echo "ERROR: no test OID mapping for node id=${node_id}" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
+        tpcc300)
+            case "${node_id}" in
+                1) echo "${EPOCH_TPCC300_OID_NODE1}" ;;
+                3) echo "${EPOCH_TPCC300_OID_NODE3}" ;;
+                *)
+                    echo "ERROR: no tpcc300 OID mapping for node id=${node_id}" >&2
+                    return 1
+                    ;;
+            esac
+            ;;
         *)
-            echo "invalid node_id ${node_id} (expected 0..$((EPOCH_TOTAL_NODES - 1)))" >&2
+            echo "ERROR: unsupported EPOCH_TPCC_DB='${EPOCH_TPCC_DB}' (use test|tpcc300)" >&2
             return 1
             ;;
     esac
 }
 
-# openGauss 编译环境（build.sh --cmake 依赖 gcc10.3 + cmake；与运行时 GAUSSHOME 分离）
+epoch_tpcc_tblspc_ver_for_node() {
+    local node_id="$1"
+    case "${node_id}" in
+        1) echo "${EPOCH_TPCC_TBLSPC_VER_NODE1}" ;;
+        3) echo "${EPOCH_TPCC_TBLSPC_VER_NODE3}" ;;
+        *)
+            echo "ERROR: no tablespace version for node id=${node_id}" >&2
+            return 1
+            ;;
+    esac
+}
+
+# 兼容旧调用名
+epoch_tpcc300_oid_for_node() {
+    local saved="${EPOCH_TPCC_DB}"
+    export EPOCH_TPCC_DB=tpcc300
+    epoch_tpcc_db_oid_for_node "$@"
+    local ec=$?
+    export EPOCH_TPCC_DB="${saved}"
+    return "${ec}"
+}
+
+epoch_tpcc300_tblspc_ver_for_node() {
+    epoch_tpcc_tblspc_ver_for_node "$@"
+}
+
+epoch_tpcc_terminals_for_node() {
+    local node_id="$1"
+    case "${node_id}" in
+        1) echo "${EPOCH_TPCC_TERMINALS_NODE1}" ;;
+        2) echo "${EPOCH_TPCC_TERMINALS_NODE2}" ;;
+        3) echo "${EPOCH_TPCC_TERMINALS_NODE3}" ;;
+        *)
+            echo "invalid node_id ${node_id} (expected 1..${EPOCH_TOTAL_NODES})" >&2
+            return 1
+            ;;
+    esac
+}
+
+# 返回 props 文件名（相对 benchmarksql-5.0-epoch/run）
+epoch_tpcc_props_for_node() {
+    local node_id="$1"
+    local override=""
+    case "${node_id}" in
+        1) override="${EPOCH_TPCC_PROPS_NODE1}" ;;
+        2) override="${EPOCH_TPCC_PROPS_NODE2}" ;;
+        3) override="${EPOCH_TPCC_PROPS_NODE3}" ;;
+        *)
+            echo "ERROR: no BenchmarkSQL props mapping for node id=${node_id}" >&2
+            return 1
+            ;;
+    esac
+    if [ -n "${override}" ]; then
+        echo "${override}"
+        return 0
+    fi
+    # node2 / node3 都是第二写端，共用 props.epoch.node2-*
+    case "${EPOCH_TPCC_DB}" in
+        tpcc300)
+            case "${node_id}" in
+                1) echo "props.epoch.node0-300w" ;;
+                2|3) echo "props.epoch.node2-300w" ;;
+            esac
+            ;;
+        test)
+            case "${node_id}" in
+                1) echo "props.epoch.node0-33" ;;
+                2|3) echo "props.epoch.node2-33" ;;
+            esac
+            ;;
+        *)
+            echo "ERROR: unsupported EPOCH_TPCC_DB='${EPOCH_TPCC_DB}' for props (use test|tpcc300)" >&2
+            return 1
+            ;;
+    esac
+}
+
 epoch_find_cmake_bin_dir() {
     local d candidate
     if command -v cmake >/dev/null 2>&1; then
@@ -217,16 +405,16 @@ epoch_build() {
 epoch_detect_local_node_id() {
     local ip
     for ip in $(hostname -I 2>/dev/null); do
-        if [ "${ip}" = "${EPOCH_NODE0_IP}" ]; then
-            echo 0
-            return
-        fi
         if [ "${ip}" = "${EPOCH_NODE1_IP}" ]; then
             echo 1
             return
         fi
         if [ "${ip}" = "${EPOCH_NODE2_IP}" ]; then
             echo 2
+            return
+        fi
+        if [ "${ip}" = "${EPOCH_NODE3_IP}" ]; then
+            echo 3
             return
         fi
     done
@@ -240,19 +428,50 @@ if [ -z "${EPOCH_LOCAL_NODE_ID:-}" ]; then
     fi
 fi
 
+# 兼容旧版 0-based 数据目录：node1→epoch-node0, node3→epoch-node1
+# 仅当 canonical 目录已 gs_initdb 时才用 epoch-nodeN；否则固定 legacy 路径。
+# 不可在「调用方机器」上检查 legacy/postgresql.conf——集群脚本常在 node1 上
+# 解析 node3 的 datadir，本机没有 epoch-node1 时会误判为 epoch-node3。
 data_dir_for_node() {
     local node_id="$1"
-    echo "${EPOCH_DATA_ROOT}/epoch-node${node_id}"
+    local canonical legacy=""
+    canonical="${EPOCH_DATA_ROOT}/epoch-node${node_id}"
+    case "${node_id}" in
+        1) legacy="${EPOCH_DATA_ROOT}/epoch-node0" ;;
+        3) legacy="${EPOCH_DATA_ROOT}/epoch-node1" ;;
+    esac
+    if [ -f "${canonical}/postgresql.conf" ]; then
+        echo "${canonical}"
+    elif [ -n "${legacy}" ]; then
+        echo "${legacy}"
+    else
+        echo "${canonical}"
+    fi
+}
+
+# 在目标节点机器上解析 datadir（远程 EPOCH_DATA_ROOT 与本地不一致时更可靠）
+epoch_data_dir_for_node() {
+    local node_id="$1"
+    if epoch_is_local_node "${node_id}"; then
+        data_dir_for_node "${node_id}"
+        return
+    fi
+    local rb script
+    rb="$(epoch_bench_root_for_node "${node_id}")"
+    script="${rb}/openGauss-server/scripts/epoch_benchmark/env.sh"
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$(epoch_ssh_target "${node_id}")" \
+        "export EPOCH_BENCH_ROOT='${rb}'; export EPOCH_LOCAL_NODE_ID=${node_id}; \
+        source '${script}'; data_dir_for_node ${node_id}"
 }
 
 epoch_node_ip() {
     local node_id="$1"
     case "${node_id}" in
-        0) echo "${EPOCH_NODE0_IP}" ;;
         1) echo "${EPOCH_NODE1_IP}" ;;
         2) echo "${EPOCH_NODE2_IP}" ;;
+        3) echo "${EPOCH_NODE3_IP}" ;;
         *)
-            echo "invalid node_id ${node_id} (expected 0..$((EPOCH_TOTAL_NODES - 1)))" >&2
+            echo "invalid node_id ${node_id} (expected 1..${EPOCH_TOTAL_NODES})" >&2
             return 1
             ;;
     esac
@@ -261,7 +480,7 @@ epoch_node_ip() {
 epoch_remote_user() {
     local node_id="$1"
     case "${node_id}" in
-        0|1) echo "${EPOCH_REMOTE_USER}" ;;
+        1|3) echo "${EPOCH_REMOTE_USER}" ;;
         2) echo "${EPOCH_NODE2_REMOTE_USER}" ;;
         *)
             echo "invalid node_id ${node_id}" >&2
@@ -273,9 +492,9 @@ epoch_remote_user() {
 epoch_bench_root_for_node() {
     local node_id="$1"
     case "${node_id}" in
-        0) echo "${EPOCH_BENCH_ROOT}" ;;
-        1) echo "${EPOCH_REMOTE_BENCH_ROOT}" ;;
+        1) echo "${EPOCH_BENCH_ROOT}" ;;
         2) echo "${EPOCH_NODE2_BENCH_ROOT}" ;;
+        3) echo "${EPOCH_NODE3_BENCH_ROOT}" ;;
         *)
             echo "invalid node_id ${node_id}" >&2
             return 1
@@ -288,7 +507,6 @@ epoch_ssh_target() {
     echo "$(epoch_remote_user "${node_id}")@$(epoch_node_ip "${node_id}")"
 }
 
-# 远程 SSH 执行 gs_ctl/gaussdb 时的最小环境（GAUSSHOME/lib + runtime_libs）
 epoch_remote_gauss_env() {
     local node_id="$1"
     local rb gh rt
@@ -298,7 +516,6 @@ epoch_remote_gauss_env() {
     echo "export GAUSSHOME=${gh}; export PATH=\${GAUSSHOME}/bin:/usr/bin:/bin; export LD_LIBRARY_PATH=\${GAUSSHOME}/lib:${rt}"
 }
 
-# 是否在目标节点本机执行（勿仅用 hostname -I 首地址，多网卡/hostname 别名会误判）
 epoch_is_local_node() {
     local node_id="$1"
     if [ -n "${EPOCH_LOCAL_NODE_ID:-}" ] && [ "${EPOCH_LOCAL_NODE_ID}" = "${node_id}" ]; then
@@ -312,6 +529,21 @@ epoch_is_local_node() {
         fi
     done
     return 1
+}
+
+epoch_remote_shell() {
+    local n="$1"
+    shift
+    local rb env_prefix
+    rb="$(epoch_bench_root_for_node "${n}")"
+    env_prefix="$(epoch_remote_gauss_env "${n}")"
+    if epoch_is_local_node "${n}"; then
+        eval "${env_prefix}"
+        bash -c "$*"
+    else
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$(epoch_ssh_target "${n}")" \
+            "${env_prefix}; $*"
+    fi
 }
 
 epoch_super_user_for_node() {
@@ -334,30 +566,36 @@ epoch_super_password_for_node() {
 
 validate_node_id() {
     local node_id="$1"
-    if ! [[ "${node_id}" =~ ^[0-9]+$ ]] || [ "${node_id}" -ge "${EPOCH_TOTAL_NODES}" ]; then
-        echo "invalid NODE_ID=${node_id}, expected 0..$((EPOCH_TOTAL_NODES - 1))" >&2
+    if ! [[ "${node_id}" =~ ^[0-9]+$ ]] || [ "${node_id}" -lt 1 ] || [ "${node_id}" -gt "${EPOCH_TOTAL_NODES}" ]; then
+        echo "invalid NODE_ID=${node_id}, expected 1..${EPOCH_TOTAL_NODES}" >&2
         return 1
     fi
+    if epoch_node_is_skipped "${node_id}"; then
+        echo "NODE_ID=${node_id} (node${node_id}) is skipped (EPOCH_SKIP_NODE=${EPOCH_SKIP_NODE})" >&2
+        return 1
+    fi
+}
+
+epoch_node_display_name() {
+    local node_id="$1"
+    echo "node${node_id}"
 }
 
 epoch_check_gaussdb() {
     local gaussdb="${GAUSSHOME}/bin/gaussdb"
     if [ ! -x "${gaussdb}" ]; then
-        echo "ERROR: missing ${gaussdb}, run deploy_to_remote.sh from node0" >&2
+        echo "ERROR: missing ${gaussdb}, run deploy_to_remote.sh from node1" >&2
         return 1
     fi
     if ! "${gaussdb}" -V >/dev/null 2>&1; then
         echo "ERROR: gaussdb cannot start (shared library missing). ldd output:" >&2
         ldd "${gaussdb}" 2>&1 | grep 'not found' >&2 || ldd "${gaussdb}" >&2
-        echo "hint: on node0 run deploy_to_remote.sh ${EPOCH_LOCAL_NODE_ID:-NODE_ID} to sync epoch_deploy/runtime_libs" >&2
+        echo "hint: on node1 run deploy_to_remote.sh 3 to sync epoch_deploy/runtime_libs" >&2
         echo "hint: or install libncurses5: sudo apt install libncurses5" >&2
         return 1
     fi
 }
 
-# 连库：pg_hba 对本机/三节点 IP 为 trust，无需 -U/-W（以当前 OS 用户身份连入）
-#   管理库：gsql -d postgres -p 32000
-#   TPCC 库：gsql -d test -p 32000
 epoch_gsql() {
     gsql -d "${EPOCH_TPCC_DB}" -p "${EPOCH_DB_PORT}" "$@"
 }

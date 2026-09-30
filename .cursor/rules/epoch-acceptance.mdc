@@ -1,0 +1,120 @@
+---
+description: Epoch 多主验收（stats-nogate；P0 持平主备；P1 终端/库扩展；P2×3 主备；一致性）
+alwaysApply: true
+---
+
+# Epoch 项目验收标准
+
+性能优化、架构改动、回归验证均以 **`EPOCH_PROFILE=stats-nogate`** 为**验收 profile**（默认 **`synchronous_commit=off`**）。
+
+**对比系统**：同机器配置下的 **openGauss 一主一备**，网络 **RTT=70ms**（见 `epoch-ha-baseline-70ms-rtt.mdc`）。
+
+**主验收对标档**：主备 **async**（`synchronous_commit=off` / `sync_state=async`）。  
+指标：epoch **双节点 Measured tpmC 之和** vs 主备单点 tpmC（P0/P2）；扩展档看 terminals / 库规模（P1）。
+
+## 通过条件
+
+### 共同前提（每一级都要满足）
+
+1. **节点数据一致**：`verify_epoch_end_consistency.sh` 通过  
+2. 配置与网络：`stats-nogate`、RTT≈70ms  
+3. **压测机尽量空闲**：共享机上有他人重负载时结果勿作基线（对照 MemAvailable / 高 CPU 进程）
+
+### 性能三级目标
+
+| 级别 | 含义 | 通过条件（摘要） |
+|------|------|------------------|
+| **P0** | 持平主备 async（阶段达标） | 双端 tpmC 合计 **≥ 46218**（对标一主一备 async） |
+| **P1** | **当前主目标：扩展性** | 见下「P1 扩展」 |
+| **P2** | 对标主备 async **×3**（原最终线） | 双端合计 **≥ 138653**（≈ 3 × 46217.44） |
+
+- **日常迭代（现在）**：P0 在 **props `*-33`** 安静机上已达标则视作守住；**优先冲 P1**（50 terminals → tpcc300）。  
+- **对外宣称「相对主备 3×」**：须 **P2 + 一致性**。  
+- 未达 P0 时，勿改去对标 sync 档「刷好看比例」。
+
+#### P0 现状（参考基线，勿与嘈杂轮次混淆）
+
+安静机、`stats-nogate`、warehouses=100、**33 terminals**、Session 窗：
+
+| 轮次 | commit_threads | 双端合计 tpmC | 备注 |
+|------|----------------|---------------|------|
+| 2026-07-16 07:11 | 5 | **~72654** | 已过 P0；作 **33 扩展参照** |
+| 2026-07-16 07:00 | 15 | **~85227** | 相对 5 仅约 +17% |
+| 2026-07-15 23:55 | 5 | ~24466 | **作废**（疑似同机抢核） |
+
+#### P1 扩展（当前冲刺）
+
+定性为主；补测后可再写入硬门槛数字。
+
+1. **`props.epoch.*-50`（50 terminals）**  
+   - 相对同环境 **33 terminals** 基线，双端 tpmC 合计须体现**明显扩展**（随 terminals↑ 吞吐明显上升，而非几乎持平或回落）。  
+   - 一致性仍须通过。  
+   - 压测 props：`benchmarksql-5.0-epoch/run/props.epoch.node0-50`（及对端等价 50 配置）。
+
+2. **最终扩展：`tpcc300`（300 warehouses）**  
+   - DB：`tpcc300`；典型 props：`props.epoch.node0-300w`（`warehouses=300`，双端分片跑仓，如各 150 warehouses / 与 terminals 对齐）。  
+   - 目标：在更大库 + 更高并发下仍有**可接受的性能扩展**（相对 100w/33–50 档的规模效应清楚；具体数字补测后写入本表）。  
+   - 一致性仍须通过。
+
+#### P2（原 P1）
+
+```text
+sum = tpmC_node0 + tpmC_node2
+P2: sum ≥ 3 × 46217.44 = 138652.32 ≈ 138653
+```
+
+在 P1 扩展路径上可顺带观察是否接近 P2，但 **P1 不以 P2 为通过条件**。
+
+### 附带对照（非主验收）
+
+| 档位 | 配置 | 用途 | 参考线（合计 tpmC） |
+|------|------|------|---------------------|
+| sync | epoch `synchronous_commit=on` vs 主备 sync（2909.37） | 同耐久语义附带检查 | 建议先 **≥ 2909（持平）**，理想 **≥ 8728（×3）** |
+
+主线优化与报告默认用 **off/async**；on/sync 单独记录，不替代 P0/P1/P2。
+
+说明：
+
+- 一主一备为**单点写主**一条 TPCC；epoch 为**双节点各一条**。用 **tpmC 之和** 对比。  
+- 旧 epoch 内部 gate-on 基线（`epoch-tpcc-baseline-70ms-rtt.mdc`）仅**研发对照**，不作通过门槛。
+
+## 1. Epoch profile：`stats-nogate`
+
+```bash
+export EPOCH_PROFILE=stats-nogate
+```
+
+对应 `configure_node.sh`：`epoch_sync_start_gate=off`、当前脚本默认 **`epoch_phys_logical_gap_limit=5`**、`physical_interval_ms=max(10, RTT)`（RTT=70 时为 70ms）、`synchronous_commit=off`、`epoch_commit_threads` / `epoch_merge_threads` 以 profile/覆盖为准，并开启诊断日志。
+
+```bash
+export EPOCH_PROFILE=stats-nogate
+export EPOCH_NETWORK_RTT_MS=70
+bash scripts/epoch_benchmark/prep_tpcc_cluster.sh
+```
+
+**正确性依赖**：CSN 版本链、read_frontier、merge/apply 按 logical 推进等（同前）。
+
+## 2. BenchmarkSQL
+
+| 阶段 | props（示例） | 库 |
+|------|---------------|-----|
+| P0 / 33 参照 | `props.epoch.node0-33`（及对端 33） | 通常 `test`，100w |
+| **P1-a** | `props.epoch.node0-50`（及对端 50） | 通常 `test`，100w |
+| **P1-b** | 另起 data dir + load（勿与 test 共目录） | **`tpcc300`**，300w |
+
+压测前按 `epoch-tpcc-restore.mdc` 恢复对应快照。
+
+## 3. 网络 RTT：70ms
+
+- `epoch_physical_interval_ms=70`（`max(10, RTT)`）。
+
+## 验证清单
+
+- [ ] `stats-nogate`：`start_gate=off`，**`synchronous_commit=off`**
+- [ ] RTT≈70ms，`epoch_physical_interval_ms=70`
+- [ ] **P0**：33 档双端合计 **≥ 46218**（已达标则回归时勿无故回退）
+- [ ] **P1-a**：50 terminals 相对 33 **有明显 tpmC 扩展** + 一致性
+- [ ] **P1-b**：`tpcc300` 下扩展表现达到预期（数字补测后固化）+ 一致性
+- [ ] **P2**（后续）：双端合计 **≥ 138653** + 一致性
+- [ ] （可选附带）`synchronous_commit=on` 时合计对照主备 sync
+- [ ] （建议）无「tpmC 虚高但 apply≈0」类退化；报告注明是否同机空闲

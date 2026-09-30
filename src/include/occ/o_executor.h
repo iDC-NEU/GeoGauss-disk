@@ -7,11 +7,20 @@
 
 #include "executor/executor.h"
 
+class O_Access;
+
 //extern List* O_ExecInsertIndexTuples(TupleTableSlot* slot, ItemPointer tupleid, EState* estate,
 //                                     HeapTuple heap_tuple);
 
 extern void O_InsertRow(ItemPointer tupleid, EState* estate,
                  HeapTuple heap_tuple);
+
+/* sync 双主：DML 延迟 heap/index 写入，由 epoch apply worker 落盘 */
+extern bool OccSyncDeferHeapWrite(void);
+extern bool OccSyncDeferInsertHeapWrite(void);
+extern void O_RegisterDeferredInsert(EState* estate, Relation rel, HeapTuple tuple);
+
+extern void O_InsertIndexTuplesForHeap(Relation heapRel, HeapTuple tup, ItemPointer tupleid);
 
 extern bool O_OpFusionExecUpdate(Relation relation, ItemPointer tupleid, HeapTuple newtuple,
     TupleTableSlot* slot, EState* estate, int2 bucketid, bool* needsIndexUpdate, bool* indexUpdateDone);

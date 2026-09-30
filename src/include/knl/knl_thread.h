@@ -854,6 +854,12 @@ typedef struct knl_t_cbm_context {
 typedef struct knl_t_epoch_worker_context {
     volatile sig_atomic_t got_SIGHUP;
     volatile sig_atomic_t shutdown_requested;
+    /* EPOCHAPPLYWORKER：postmaster 槽位下标，用于 apply 亲和分片 claim */
+    int apply_worker_id;
+    /* EPOCHMERGEWORKER：postmaster 槽位下标，用于 merge 亲和分片 claim */
+    int merge_worker_id;
+    /* EPOCHPACKWORKER：postmaster 槽位下标；Pack#0 兼 seal */
+    int pack_worker_id;
 } knl_t_epoch_worker_context;
 
 /* thread local pointer to the shared memory */
