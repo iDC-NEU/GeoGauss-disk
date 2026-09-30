@@ -66,23 +66,23 @@ export EPOCH_TOTAL_NODES=3
 export EPOCH_PEER_HOSTS="${EPOCH_NODE1_IP},${EPOCH_NODE2_IP},${EPOCH_NODE3_IP}"
 
 # 跳过的脚本节点 id。0 = 三节点都参与。
-# 当前默认：node1 + node2，跳过 node3。
+# 当前：node1 + node2，跳过 node3（node3 IP 暂不可用）。
 # 旧组合 node1 + node3：export EPOCH_SKIP_NODE=2
 # 三节点都测：export EPOCH_SKIP_NODE=0
-export EPOCH_SKIP_NODE="${EPOCH_SKIP_NODE:-3}"
+export EPOCH_SKIP_NODE=3
 
 # 下面几行是文件里的生效值。prep / configure 会用这里的值，覆盖终端里已经 export 的同名变量。
 # 对 wait / dbr / pa / het 都生效。RTT 和带宽由 apply_netem.sh 用 tc 写到网卡上。
 # EPOCH_PROFILE：wait | dbr | pa | het
-# EPOCH_DYN_NET_SLOW_NODES：被限速的节点，0 起。默认跳过 node3 时：0 = node1，1 = node2
+# EPOCH_DYN_NET_SLOW_NODES：被限速的节点，0 起。跳过 node3 时：0 = node1，1 = node2
 # EPOCH_NETWORK_RTT_MS：往返延迟（毫秒）。100 表示两端各 50ms，ping 大约 100ms。
 # EPOCH_DYN_NET_BW_MODE：unlimit | uplimit | downlimit | bilimit
-# EPOCH_DYN_NET_BW_MBPS：慢节点带宽（Mbps）。
+# EPOCH_DYN_NET_BW_MBPS：慢节点带宽（Mbps）。unlimit 时不使用。
 # dbr 会打开 epoch_dyn_net_catchup，pa 打开 epoch_dyn_net_proxy，het 两个都开。
 export EPOCH_PROFILE=wait
 export EPOCH_DYN_NET_SLOW_NODES=1
 export EPOCH_NETWORK_RTT_MS=100
-export EPOCH_DYN_NET_BW_MODE=uplimit
+export EPOCH_DYN_NET_BW_MODE=unlimit
 export EPOCH_DYN_NET_BW_MBPS=100
 
 epoch_node_is_skipped() {
