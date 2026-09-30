@@ -4,7 +4,7 @@
 #include "postgres.h"
 
 /*
- * stats-nogate：事务 START 时钉扎 read_frontier = logical，读路径只见 commit_epoch ≤ frontier 的版本。
+ * wait：事务 START 时钉扎 read_frontier = logical，读路径只见 commit_epoch ≤ frontier 的版本。
  * gate=on 时不启用，由 START gate 保证堆可见性。
  */
 extern void EpochPinReadFrontierOnStart(void);

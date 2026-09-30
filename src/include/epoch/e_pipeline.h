@@ -78,6 +78,9 @@ extern void EpochPipelineReadStageFlagsForDiag(uint64_t epoch, bool* physical_re
     bool* self_send_sent, bool* merge_complete, bool* apply_complete);
 
 extern void EpochPipelineInjectRemoteWireTxn(const E_WireTxn& txn);
+/* DBR 放行：本地 merge + 发送队列。wire 里的 epoch 已是最终提交 epoch。 */
+/* 返回 false 表示 merge 环这格已满，调用方保留写集下个 tick 再试。 */
+extern bool EpochPipelineAdmitLocalWire(const E_WireTxn& txn, const std::string& wire);
 /* 兼容旧名：实际由 Send worker 调用 ZMQ */
 extern bool EpochPipelinePublishWire(const std::string& wire, const E_WireTxn& txn);
 extern bool EpochPipelineSendWire(const std::string& wire, const E_WireTxn& txn);

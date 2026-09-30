@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
 export EPOCH_BENCH_ROOT="${EPOCH_BENCH_ROOT:-/home/hcj2003/2025-9}"
-export EPOCH_PROFILE="${EPOCH_PROFILE:-stats-nogate}"
+# EPOCH_PROFILE、慢节点、RTT、带宽在 env.sh 里改
 # stats 类 profile 内置 commit/merge threads；仅显式 export 时才覆盖 configure_node.sh 的 profile 默认值
 export EPOCH_RECV_DIAG_VERBOSE="${EPOCH_RECV_DIAG_VERBOSE:-off}"
 export EPOCH_LIFECYCLE_LOG="${EPOCH_LIFECYCLE_LOG:-on}"
@@ -30,8 +30,15 @@ usage: $(basename "$0") [OPTION]
                 （不跑 TPCC；压测请自行 runBenchmark.sh）
   --deploy-only 仅 rsync 二进制到远程节点
 
+  env.sh 里改（wait/dbr/pa/het 共用）。configure_node.sh 写库参数时会按这些值执行 tc：
+    EPOCH_PROFILE=${EPOCH_PROFILE}          # wait | dbr | pa | het
+    EPOCH_DYN_NET_SLOW_NODES=${EPOCH_DYN_NET_SLOW_NODES:-}  # 慢节点，0=node1 1=node2
+    EPOCH_NETWORK_RTT_MS=${EPOCH_NETWORK_RTT_MS:-}         # ping 应看到的往返延迟
+    EPOCH_DYN_NET_BW_MODE=${EPOCH_DYN_NET_BW_MODE:-}       # uplimit|downlimit|bilimit|unlimit
+    EPOCH_DYN_NET_BW_MBPS=${EPOCH_DYN_NET_BW_MBPS:-}
+  本脚本启动测试（prep）会调用 configure，因此会自动加延迟和限速。
+  单独核对：bash scripts/epoch_benchmark/apply_netem.sh status
   本脚本顶部可改：
-    EPOCH_PROFILE=${EPOCH_PROFILE}
     EPOCH_TPCC_DB=${EPOCH_TPCC_DB}   # tpcc300 | test
 
   prep 后建议的手动压测 props：

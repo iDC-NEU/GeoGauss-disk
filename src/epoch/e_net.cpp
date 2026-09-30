@@ -10,9 +10,23 @@
 #include "epoch/e_perf.h"
 
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <mutex>
 #include <thread>
 #include <vector>
+
+#include <dirent.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <linux/sockios.h>
+
+#ifndef SIOCOUTQNSD
+#define SIOCOUTQNSD 0x894B
+#endif
 
 #include "neu_concurrency_tools/blockingconcurrentqueue.h"
 
@@ -305,6 +319,208 @@ void EpochNetShutdown(void)
     g_zmq_pull.reset();
     g_zmq_pub.reset();
     g_zmq_ctx.reset();
+#endif
+}
+
+#ifdef EPOCH_USE_ZMQ
+static int64_t EpochMonoUs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000 + static_cast<int64_t>(ts.tv_nsec) / 1000;
+}
+
+static constexpr int EPOCH_UPLINK_FD_MAX = 8;
+static constexpr int64_t EPOCH_UPLINK_BUDGET_HOLD_US = 200;
+static int g_uplink_fds[EPOCH_UPLINK_FD_MAX];
+static int g_uplink_fd_count = 0;
+static int64_t g_uplink_fd_scan_us = 0;
+static uint64_t g_uplink_handed = 0;
+static bool g_uplink_budget_hold = false;
+static int64_t g_uplink_budget_hold_us = 0;
+static bool g_uplink_congested_logged = false;
+static std::atomic<bool> g_uplink_defer{false};
+static std::atomic<bool> g_uplink_congested{false};
+
+static bool EpochParseProcPort(const char* token, unsigned* port_out)
+{
+    const char* colon = strrchr(token, ':');
+    if (colon == nullptr || colon[1] == '\0' || port_out == nullptr) {
+        return false;
+    }
+    char* end = nullptr;
+    unsigned long port = strtoul(colon + 1, &end, 16);
+    if (end == colon + 1) {
+        return false;
+    }
+    *port_out = static_cast<unsigned>(port);
+    return true;
+}
+
+static void EpochCollectPubInodes(int port, unsigned long* inodes, int* inode_count)
+{
+    const char* paths[2] = {"/proc/net/tcp", "/proc/net/tcp6"};
+    *inode_count = 0;
+    for (int p = 0; p < 2; ++p) {
+        FILE* fp = fopen(paths[p], "r");
+        if (fp == nullptr) {
+            continue;
+        }
+        char line[512];
+        if (fgets(line, sizeof(line), fp) == nullptr) {
+            fclose(fp);
+            continue;
+        }
+        while (fgets(line, sizeof(line), fp) != nullptr && *inode_count < 32) {
+            char local[80];
+            char remote[80];
+            unsigned state = 0;
+            unsigned long inode = 0;
+            int sl = 0;
+            int n = sscanf(line,
+                "%d: %79s %79s %x %*s %*s %*s %*u %*u %lu",
+                &sl,
+                local,
+                remote,
+                &state,
+                &inode);
+            unsigned lport = 0;
+            if (n != 5 || state != 0x01 || !EpochParseProcPort(local, &lport)) {
+                continue;
+            }
+            if (static_cast<int>(lport) != port) {
+                continue;
+            }
+            inodes[*inode_count] = inode;
+            (*inode_count)++;
+        }
+        fclose(fp);
+    }
+}
+
+static void EpochNetRescanPubFds(void)
+{
+    g_uplink_fd_count = 0;
+    unsigned long inodes[32];
+    int inode_count = 0;
+    EpochCollectPubInodes(EpochNodePort(EpochGetNodeId()), inodes, &inode_count);
+    if (inode_count == 0) {
+        return;
+    }
+    DIR* dir = opendir("/proc/self/fd");
+    if (dir == nullptr) {
+        return;
+    }
+    struct dirent* de;
+    while ((de = readdir(dir)) != nullptr && g_uplink_fd_count < EPOCH_UPLINK_FD_MAX) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') {
+            continue;
+        }
+        int fd = atoi(de->d_name);
+        char path[64];
+        int rc = snprintf_s(path, sizeof(path), sizeof(path) - 1, "/proc/self/fd/%d", fd);
+        securec_check_ss(rc, "\0", "\0");
+        char link[80];
+        ssize_t nread = readlink(path, link, sizeof(link) - 1);
+        if (nread <= 0) {
+            continue;
+        }
+        link[nread] = '\0';
+        unsigned long inode = 0;
+        if (sscanf(link, "socket:[%lu]", &inode) != 1) {
+            continue;
+        }
+        for (int i = 0; i < inode_count; ++i) {
+            if (inodes[i] == inode) {
+                g_uplink_fds[g_uplink_fd_count++] = fd;
+                break;
+            }
+        }
+    }
+    closedir(dir);
+}
+
+static size_t EpochNetReadUnsent(void)
+{
+    size_t max_unsent = 0;
+    bool any = false;
+    for (int i = 0; i < g_uplink_fd_count; ++i) {
+        int val = 0;
+        if (ioctl(g_uplink_fds[i], SIOCOUTQNSD, &val) == 0 && val >= 0) {
+            any = true;
+            if (static_cast<size_t>(val) > max_unsent) {
+                max_unsent = static_cast<size_t>(val);
+            }
+        }
+    }
+    if (!any) {
+        g_uplink_fd_count = 0;
+    }
+    return max_unsent;
+}
+#endif
+
+void EpochNetPollUplink(void)
+{
+#ifdef EPOCH_USE_ZMQ
+    if (!g_enable_epoch_multimaster || !g_epoch_dyn_net_catchup || EpochGetTotalNodes() <= 1) {
+        g_uplink_defer.store(false, std::memory_order_relaxed);
+        g_uplink_congested.store(false, std::memory_order_relaxed);
+        g_uplink_handed = 0;
+        g_uplink_budget_hold = false;
+        return;
+    }
+    int64_t now = EpochMonoUs();
+    bool need_scan = g_uplink_fd_count == 0 ? (now - g_uplink_fd_scan_us >= 100000)
+                                            : (now - g_uplink_fd_scan_us >= 1000000);
+    if (need_scan) {
+        EpochNetRescanPubFds();
+        g_uplink_fd_scan_us = now;
+    }
+    size_t unsent = EpochNetReadUnsent();
+    bool kernel_high = unsent >= EPOCH_UPLINK_HIGH_BYTES;
+    bool kernel_low = unsent <= EPOCH_UPLINK_LOW_BYTES;
+
+    if (kernel_high) {
+        if (!g_uplink_congested.load(std::memory_order_relaxed) && !g_uplink_congested_logged) {
+            g_uplink_congested_logged = true;
+            ereport(LOG,
+                (errmsg("epoch pacer: uplink congested, tcp unsent=%zu", unsent)));
+        }
+        g_uplink_congested.store(true, std::memory_order_relaxed);
+        return;
+    }
+    if (kernel_low) {
+        g_uplink_congested.store(false, std::memory_order_relaxed);
+        g_uplink_handed = 0;
+    }
+#endif
+}
+
+bool EpochNetDeferPayload(void)
+{
+#ifdef EPOCH_USE_ZMQ
+    return g_uplink_defer.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+}
+
+bool EpochNetUplinkCongested(void)
+{
+#ifdef EPOCH_USE_ZMQ
+    return g_uplink_congested.load(std::memory_order_relaxed);
+#else
+    return false;
+#endif
+}
+
+void EpochNetNotePayloadSent(size_t nbytes)
+{
+#ifdef EPOCH_USE_ZMQ
+    g_uplink_handed += nbytes;
+#else
+    (void)nbytes;
 #endif
 }
 

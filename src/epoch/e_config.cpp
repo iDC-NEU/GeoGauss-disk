@@ -435,7 +435,7 @@ void EpochRegisterGucs(void)
                             &g_epoch_apply_queue_capacity,
                             EPOCH_DEFAULT_APPLY_QUEUE_CAPACITY,
                             64,
-                            65536,
+                            262144,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
@@ -580,7 +580,7 @@ void EpochRegisterGucs(void)
                              NULL);
 
     DefineCustomBoolVariable("epoch_dyn_net_catchup",
-                             "Enable CATCHUP epoch jump for configured slow nodes.",
+                             "Enable Pacer DBR: move unsent local write sets forward and close skipped epochs with EOF.",
                              NULL,
                              &g_epoch_dyn_net_catchup,
                              false,
@@ -591,7 +591,7 @@ void EpochRegisterGucs(void)
                              NULL);
 
     DefineCustomBoolVariable("epoch_dyn_net_proxy",
-                             "Enable proxy merge path (PartialSnapshot) for slow nodes.",
+                             "Enable Pacer PA: slow node selects a proxy; healthy nodes route its copy there.",
                              NULL,
                              &g_epoch_dyn_net_proxy,
                              false,

@@ -18,6 +18,7 @@ public:
     static void SetLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
 
     static uint64_t IncChangeSetTxnCounters(uint64_t epochId, uint64_t nodeId);
+    static uint64_t DecChangeSetTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetChangeSetTxnCounters(uint64_t epochId, uint64_t nodeId);
 
     static uint64_t IncExecutingTxnCounters(uint64_t epochId, uint64_t nodeId);
@@ -26,6 +27,7 @@ public:
     static uint64_t GetExecutingTxnCounters(uint64_t epochId, uint64_t nodeId);
 
     static uint64_t IncLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId);
+    static uint64_t DecLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetSealedPackTxnCounters(uint64_t epochId, uint64_t nodeId);
     static void SetSealedPackTxnCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
