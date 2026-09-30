@@ -3,6 +3,7 @@
 #include "epoch/e_pacer.h"
 
 #include "epoch/e_config.h"
+#include "epoch/e_crdt_merge_logic.h"
 #include "epoch/e_merge_pool.h"
 #include "epoch/e_net.h"
 #include "epoch/e_node_manager.h"
@@ -11,10 +12,13 @@
 #include "epoch/e_statistician.h"
 #include "epoch/e_txn_wire.h"
 
+#include <algorithm>
 #include <atomic>
 #include <ctime>
 #include <map>
 #include <mutex>
+#include <set>
+#include <utility>
 #include <vector>
 
 static constexpr int EPOCH_PACER_PERSIST_TICKS = 5;
@@ -538,6 +542,223 @@ void EpochPacerPackTick(void)
     EpochPacerPublishPaActivate(self, use_proxy, session_id, use_from, use_to);
 }
 
+struct EpochPacerPaItem {
+    E_WireTxn txn;
+    std::string wire;
+};
+
+struct EpochPacerPaCollect {
+    std::vector<EpochPacerPaItem> txns;
+    std::set<std::pair<uint32_t, uint64_t>> seen;
+    std::map<uint32_t, uint64_t> eof_count;
+    bool emitted = false;
+    size_t in_bytes = 0;
+};
+
+static std::mutex g_pa_collect_mu;
+static std::map<uint64_t, EpochPacerPaCollect> g_pa_collect;
+
+static bool EpochPacerPaRowKey(const E_WireRow& row, std::string* key)
+{
+    if (key == nullptr || !E_WireRowHasPackedPk(row)) {
+        return false;
+    }
+    key->clear();
+    if (!row.relname.empty()) {
+        key->append(row.relname);
+    } else {
+        key->append(std::to_string(row.relid));
+    }
+    key->push_back('\0');
+    key->append(row.pk.data(), row.pk.size());
+    return true;
+}
+
+/* 健康写集按到达顺序做先写胜出。输家整笔不进入结果；后来获胜的行替换先到的行。 */
+static void EpochPacerPaEmitReduced(uint64_t epoch, uint32_t slow_id, std::vector<EpochPacerPaItem> items,
+    std::map<uint32_t, uint64_t> eof_count, size_t in_bytes)
+{
+    struct Winner {
+        uint64_t csn;
+        uint32_t server_id;
+        size_t txn_i;
+        size_t row_i;
+    };
+    std::map<std::string, Winner> winners;
+    bool unsafe = false;
+    for (size_t ti = 0; ti < items.size() && !unsafe; ++ti) {
+        const E_WireTxn& txn = items[ti].txn;
+        std::vector<size_t> writes;
+        for (size_t ri = 0; ri < txn.rows.size(); ++ri) {
+            if (txn.rows[ri].op_type == EPOCH_OP_READ) {
+                continue;
+            }
+            std::string key;
+            if (!EpochPacerPaRowKey(txn.rows[ri], &key)) {
+                unsafe = true;
+                break;
+            }
+            writes.push_back(ri);
+        }
+        if (unsafe) {
+            break;
+        }
+        bool accept = true;
+        for (size_t ri : writes) {
+            std::string key;
+            if (!EpochPacerPaRowKey(txn.rows[ri], &key)) {
+                unsafe = true;
+                accept = false;
+                break;
+            }
+            auto it = winners.find(key);
+            if (it != winners.end() &&
+                !EpochCrdtTxnWinsOver(txn.csn, txn.server_id, it->second.csn, it->second.server_id)) {
+                accept = false;
+                break;
+            }
+        }
+        if (unsafe || !accept) {
+            continue;
+        }
+        for (size_t ri : writes) {
+            std::string key;
+            if (!EpochPacerPaRowKey(txn.rows[ri], &key)) {
+                continue;
+            }
+            winners[key] = Winner{txn.csn, txn.server_id, ti, ri};
+        }
+    }
+
+    std::map<uint32_t, uint64_t> sent;
+    size_t out_bytes = 0;
+    size_t out_txns = 0;
+    if (unsafe) {
+        for (const auto& item : items) {
+            if (!EpochNetPublishTo(slow_id, item.wire)) {
+                continue;
+            }
+            out_bytes += item.wire.size();
+            out_txns++;
+        }
+        sent = eof_count;
+    } else {
+        std::map<size_t, std::vector<size_t>> live_rows;
+        for (const auto& kv : winners) {
+            live_rows[kv.second.txn_i].push_back(kv.second.row_i);
+        }
+        for (auto& kv : live_rows) {
+            const E_WireTxn& src = items[kv.first].txn;
+            E_WireTxn reduced = src;
+            reduced.rows.clear();
+            std::sort(kv.second.begin(), kv.second.end());
+            for (size_t ri : kv.second) {
+                if (ri < src.rows.size()) {
+                    reduced.rows.push_back(src.rows[ri]);
+                }
+            }
+            if (reduced.rows.empty()) {
+                continue;
+            }
+            std::string payload;
+            if (!E_WireSerializeTxn(reduced, &payload)) {
+                continue;
+            }
+            if (!EpochNetPublishTo(slow_id, payload)) {
+                continue;
+            }
+            sent[reduced.server_id]++;
+            out_bytes += payload.size();
+            out_txns++;
+        }
+    }
+
+    uint32_t total = EpochGetTotalNodes();
+    for (uint32_t peer = 0; peer < total; ++peer) {
+        if (peer == slow_id) {
+            continue;
+        }
+        E_WireTxn end;
+        end.csn = sent[peer];
+        end.epoch = epoch;
+        end.server_id = peer;
+        end.txn_state = EPOCH_TXN_EMPTY;
+        std::string payload;
+        if (!E_WireSerializeTxn(end, &payload)) {
+            continue;
+        }
+        (void)EpochNetPublishTo(slow_id, payload);
+        out_bytes += payload.size();
+    }
+    ereport(LOG,
+        (errmsg("epoch pacer PA: reduced epoch=%lu slow=%u bytes %zu -> %zu txns %zu -> %zu%s",
+            epoch,
+            slow_id,
+            in_bytes,
+            out_bytes,
+            items.size(),
+            out_txns,
+            unsafe ? " (pk missing, forwarded original)" : "")));
+}
+
+static void EpochPacerPaHoldSlowCopy(const E_WireTxn& txn, const std::string& wire, uint32_t slow_id)
+{
+    if (txn.epoch == 0 || wire.empty() || slow_id >= EpochGetTotalNodes()) {
+        return;
+    }
+    std::vector<EpochPacerPaItem> ready;
+    std::map<uint32_t, uint64_t> eof_count;
+    size_t in_bytes = 0;
+    bool emit = false;
+    {
+        std::lock_guard<std::mutex> lock(g_pa_collect_mu);
+        if (g_pa_collect.size() > 32) {
+            for (auto it = g_pa_collect.begin(); it != g_pa_collect.end();) {
+                if (it->second.emitted && it->first + 2 < txn.epoch) {
+                    it = g_pa_collect.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        EpochPacerPaCollect& slot = g_pa_collect[txn.epoch];
+        if (slot.emitted) {
+            return;
+        }
+        if (E_WireTxnIsEpochEnd(txn)) {
+            slot.eof_count[txn.server_id] = txn.csn;
+        } else if (slot.seen.insert(std::make_pair(txn.server_id, txn.csn)).second) {
+            EpochPacerPaItem item;
+            item.txn = txn;
+            item.wire = wire;
+            slot.in_bytes += wire.size();
+            slot.txns.push_back(std::move(item));
+        }
+        uint32_t total = EpochGetTotalNodes();
+        bool all = true;
+        for (uint32_t peer = 0; peer < total; ++peer) {
+            if (peer == slow_id) {
+                continue;
+            }
+            if (slot.eof_count.find(peer) == slot.eof_count.end()) {
+                all = false;
+                break;
+            }
+        }
+        if (!all) {
+            return;
+        }
+        slot.emitted = true;
+        ready.swap(slot.txns);
+        eof_count.swap(slot.eof_count);
+        in_bytes = slot.in_bytes;
+        emit = true;
+    }
+    if (emit) {
+        EpochPacerPaEmitReduced(txn.epoch, slow_id, std::move(ready), std::move(eof_count), in_bytes);
+    }
+}
+
 bool EpochPacerRouteSend(const std::string& wire, const E_WireTxn& txn)
 {
     if (!EpochPacerPaEnabled() || wire.empty() || txn.epoch == 0 || EpochGetTotalNodes() < 3) {
@@ -570,9 +791,7 @@ bool EpochPacerRouteSend(const std::string& wire, const E_WireTxn& txn)
         }
     }
     if (self == session.proxy_id) {
-        if (!EpochNetPublishTo(session.slow_id, wire)) {
-            ok = false;
-        }
+        EpochPacerPaHoldSlowCopy(txn, wire, session.slow_id);
     }
     (void)ok;
     return true;
@@ -624,6 +843,6 @@ bool EpochPacerOnIncoming(const E_WireTxn& txn, const std::string& wire)
     if (txn.server_id == self || txn.server_id == session.slow_id) {
         return false;
     }
-    (void)EpochNetPublishTo(session.slow_id, wire);
+    EpochPacerPaHoldSlowCopy(txn, wire, session.slow_id);
     return false;
 }
