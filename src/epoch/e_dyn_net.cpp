@@ -36,7 +36,7 @@ static void EpochDynNetBuildConfig(DnNetworkConfig* cfg)
     }
     cfg->node_count = static_cast<int>(EpochGetTotalNodes());
     cfg->local_node_id = static_cast<int>(EpochGetNodeId());
-    cfg->epoch_duration_ms = g_epoch_physical_interval_ms > 0 ? g_epoch_physical_interval_ms : 10;
+    cfg->epoch_duration_ms = 10;
     cfg->lag_tolerance = g_epoch_dyn_net_lag_tolerance;
     cfg->queue_size_tolerance = g_epoch_dyn_net_queue_tolerance;
     cfg->catchup_factor_k = g_epoch_dyn_net_catchup_k;
@@ -128,8 +128,7 @@ static void EpochDynNetTryEmitProxySnapshot(int32_t epoch)
 
         E_WireTxn meta_txn;
         meta_txn.csn = 0;
-        meta_txn.start_epoch = static_cast<uint64_t>(epoch);
-        meta_txn.commit_epoch = static_cast<uint64_t>(epoch);
+        meta_txn.epoch = static_cast<uint64_t>(epoch);
         meta_txn.server_id = static_cast<uint32_t>(contrib.origin_node_id);
 
         std::string meta_wire;
@@ -186,9 +185,6 @@ void EpochDynNetInit(void)
         uint64_t origin = static_cast<uint64_t>(origin_node_id);
         uint64_t self = static_cast<uint64_t>(EpochGetNodeId());
         E_NodeManager::UpdateStoreReceivedPackCounters(ep, origin, txn_count);
-        for (size_t i = 0; i < txn_count; ++i) {
-            (void)E_NodeManager::IncMergedTxnCounters(ep, self);
-        }
     });
 
     rt.SetDispatchSideEffectFn([](const DnIncomingPacket& in, const DnDispatchResult& dr) {
@@ -203,8 +199,7 @@ void EpochDynNetInit(void)
             const DnAppendEntriesRequest& req = in.packet.append_req;
             E_WireTxn pseudo;
             pseudo.csn = 0;
-            pseudo.start_epoch = static_cast<uint64_t>(req.epoch);
-            pseudo.commit_epoch = static_cast<uint64_t>(req.epoch);
+            pseudo.epoch = static_cast<uint64_t>(req.epoch);
             pseudo.server_id = static_cast<uint32_t>(req.channel_id);
             EpochPipelineInjectRemoteWireTxn(pseudo);
         }
@@ -313,7 +308,7 @@ void EpochDynNetRecordWireForProxy(const E_WireTxn& txn, int32_t channel_id)
         return;
     }
     DnRaftEntry entry = EpochDynNetWireToRaftEntry(txn);
-    rt.PartialRegistry()->AppendFastNodeEntry(static_cast<int32_t>(txn.commit_epoch), channel_id,
+    rt.PartialRegistry()->AppendFastNodeEntry(static_cast<int32_t>(txn.epoch), channel_id,
                                               entry);
 }
 
@@ -349,7 +344,7 @@ bool EpochDynNetPublishWireTxn(const std::string& wire, const E_WireTxn& txn)
         net->SendMessage(pkt, static_cast<int>(peer), false);
     }
     EpochDynNetFlushOutgoing();
-    EpochDynNetTryEmitProxySnapshot(static_cast<int32_t>(txn.commit_epoch));
+    EpochDynNetTryEmitProxySnapshot(static_cast<int32_t>(txn.epoch));
     return true;
 }
 
@@ -419,12 +414,8 @@ void EpochDynNetObserveWireTxn(const E_WireTxn& txn)
         return;
     }
 
-    uint64_t observed = txn.commit_epoch;
-    if (observed == 0) {
-        observed = txn.start_epoch;
-    }
-    if (observed > 0) {
-        observer->RecordObservedEpochDirect(static_cast<int32_t>(observed));
+    if (txn.epoch > 0) {
+        observer->RecordObservedEpochDirect(static_cast<int32_t>(txn.epoch));
     }
 }
 

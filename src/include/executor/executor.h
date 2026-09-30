@@ -725,6 +725,14 @@ typedef struct FakeRelationPartition {
 extern bool RelationFindReplTuple(EState *estate, Relation rel, Oid idxoid, LockTupleMode lockmode, TupleTableSlot *searchslot,
     TupleTableSlot *outslot, FakeRelationPartition *fakeRelInfo);
 
+/* epoch multimaster apply: PK lookup without XactLockTableWait / LockWaitBlock */
+extern bool RelationFindReplTupleEpoch(EState *estate, Relation rel, Oid idxoid, TupleTableSlot *searchslot,
+    TupleTableSlot *outslot, FakeRelationPartition *fakeRelInfo);
+
+/* epoch apply: idxrel 已由调用方 AccessShareLock 打开，避免每行 index_open/close */
+extern bool RelationFindReplTupleEpochCached(EState *estate, Relation rel, Relation idxrel,
+    TupleTableSlot *searchslot, TupleTableSlot *outslot, FakeRelationPartition *fakeRelInfo);
+
 extern void ExecSimpleRelationInsert(EState *estate, TupleTableSlot *slot, FakeRelationPartition *relAndPart);
 extern void ExecSimpleRelationUpdate(EState *estate, EPQState *epqstate, TupleTableSlot *searchslot,
     TupleTableSlot *slot, FakeRelationPartition *relAndPart);

@@ -8,7 +8,7 @@
 #include "epoch/e_txn_wire.h"
 
 static constexpr uint64_t EPOCH_WIRE_ENVELOPE_MAGIC = UINT64_C(0xE0C0D00D);
-static constexpr uint32_t EPOCH_WIRE_ENVELOPE_VERSION = 1;
+static constexpr uint32_t EPOCH_WIRE_ENVELOPE_VERSION = 2;
 
 enum EpochWireEnvelopeKind : uint32_t {
     EPOCH_WIRE_ENV_TXN_METADATA = 1,
@@ -17,8 +17,7 @@ enum EpochWireEnvelopeKind : uint32_t {
 
 struct EpochWireMetadata {
     uint64_t csn{0};
-    uint64_t start_epoch{0};
-    uint64_t commit_epoch{0};
+    uint64_t epoch{0};
     uint32_t server_id{0};
     uint64_t payload_hash{0};
     int32_t payload_size{0};

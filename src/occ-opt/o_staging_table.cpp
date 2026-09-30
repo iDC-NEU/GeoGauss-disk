@@ -199,7 +199,8 @@ HeapTuple O_StagingTable::LookupCopyTuple(Relation relation, ItemPointer tid) co
         return nullptr;
     }
 
-    return O_StagingCopyToPersistent(it->second.tuple);
+    /* Caller-owned copy (CurrentMemoryContext); never share staging-mcxt tuples. */
+    return O_StagingCopyToCaller(it->second.tuple);
 }
 
 bool O_StagingTable::LookupForRead(Relation relation, ItemPointer tid,
@@ -231,7 +232,8 @@ bool O_StagingTable::LookupForRead(Relation relation, ItemPointer tid,
             result.found = false;
             return false;
         }
-        result.tuple_copy = O_StagingCopyToPersistent(it->second.tuple);
+        /* Caller-owned: heap_freetuple OK; avoids concurrent free on staging mcxt. */
+        result.tuple_copy = O_StagingCopyToCaller(it->second.tuple);
         if (result.tuple_copy == nullptr) {
             result.found = false;
             return false;

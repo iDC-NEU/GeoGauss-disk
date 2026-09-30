@@ -35,6 +35,12 @@ public:
         m_csn = commitSequenceNumber;
     }
 
+    /* sync 双主延迟 insert：为写集分配唯一 synthetic TID，避免 InvalidTid 碰撞 */
+    uint32_t AllocateDeferredInsertSlot()
+    {
+        return m_deferredInsertSeq++;
+    }
+
     HeapTuple RowLookup(const AccessType type, occ_sentinel const& originalSentinel,RC& rc, IndexScanDesc scan, HeapTuple heap_tuple = nullptr);
 
     bool CheckUnique(const AccessType type, occ_sentinel const& originalSentinel, RC& rc);
@@ -56,6 +62,9 @@ public:
 
     /* RECORD_COMMIT 落盘前二次校验写集版本（early unlock 后防 lost update） */
     bool RevalidateWriteSet();
+
+    /* epoch 多主 pack 前：剥离写集中纯读条目，不做 OCC ValidateOcc */
+    void PrepareWriteSetForPack();
 
     RC DeleteLastRow();
 
@@ -101,6 +110,8 @@ private:
     uint64_t m_threadId;
 
     uint64_t m_csn;
+
+    uint32_t m_deferredInsertSeq;
 
 public:
     /** @var Transaction cache (OCC optimization). */

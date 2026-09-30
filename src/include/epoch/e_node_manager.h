@@ -16,35 +16,22 @@ public:
     static void SetStoreShouldReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
     static void SetStoreReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
     static void SetLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
-    static void SetLocalProduceTxnCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
 
     static uint64_t IncChangeSetTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetChangeSetTxnCounters(uint64_t epochId, uint64_t nodeId);
 
     static uint64_t IncExecutingTxnCounters(uint64_t epochId, uint64_t nodeId);
-    static uint64_t DecExecutingTxnCounters(uint64_t epochId, uint64_t nodeId);
+    /* 成功 dec 返回 true；slot 非当前或计数已为 0 返回 false（不调用 EnsureEpochSlot）。 */
+    static bool DecExecutingTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetExecutingTxnCounters(uint64_t epochId, uint64_t nodeId);
-
-    static uint64_t IncLocalProduceTxnCounters(uint64_t epochId, uint64_t nodeId);
-    static uint64_t GetLocalProduceTxnCounters(uint64_t epochId, uint64_t nodeId);
-    static uint64_t GetAndResetLocalProduceTxnCounters(uint64_t epochId, uint64_t nodeId);
 
     static uint64_t IncLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetSealedPackTxnCounters(uint64_t epochId, uint64_t nodeId);
     static void SetSealedPackTxnCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
 
-    static uint64_t IncLocalRecordCommitCounters(uint64_t epochId, uint64_t nodeId);
-    static uint64_t GetLocalRecordCommitCounters(uint64_t epochId, uint64_t nodeId);
-
-    static uint64_t IncLocalRecordCommittedCounters(uint64_t epochId, uint64_t nodeId);
-    static uint64_t GetLocalRecordCommittedCounters(uint64_t epochId, uint64_t nodeId);
-
     static uint64_t IncAbortTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetAbortTxnCounters(uint64_t epochId, uint64_t nodeId);
-
-    static uint64_t IncReadCommittedTxnCounters(uint64_t epochId, uint64_t nodeId);
-    static uint64_t GetReadCommittedTxnCounters(uint64_t epochId, uint64_t nodeId);
 
     static uint64_t IncWriteAbortAfterSendTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetWriteAbortAfterSendTxnCounters(uint64_t epochId, uint64_t nodeId);
@@ -61,8 +48,14 @@ public:
     static void SetNodeReceiveCompleted(uint64_t epochId, uint64_t nodeId, bool completed);
     static bool IsNodeReceiveCompleted(uint64_t epochId, uint64_t nodeId);
 
+    static uint64_t IncWireMergeDoneCounters(uint64_t epochId, uint64_t nodeId);
+    static uint64_t GetWireMergeDoneCounters(uint64_t epochId, uint64_t nodeId);
+
     static uint64_t IncMergedTxnCounters(uint64_t epochId, uint64_t nodeId);
+    static uint64_t DecMergedTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetMergedTxnCounters(uint64_t epochId, uint64_t nodeId);
+    /* merge 关窗后一次性写入 CRDT 净赢家数（替代流式 Inc/Dec） */
+    static void SetMergedTxnCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
 
     static uint64_t IncCommittedTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetCommittedTxnCounters(uint64_t epochId, uint64_t nodeId);
@@ -70,13 +63,6 @@ public:
     static void ResetEpochCounters(uint64_t epochId);
     static void ClearEpochSlot(uint64_t epochId);
     static void EnsureEpochSlot(uint64_t epochId);
-
-    static bool IsRecordCommitted(void);
-    static void SetRecordCommitted(bool value);
-    static bool IsRemoteRecordCommitted(void);
-    static void SetRemoteRecordCommitted(bool value);
-    static bool IsRemoteExeced(void);
-    static void SetRemoteExeced(bool value);
 
 private:
     static size_t GetIndex(uint64_t epochId, uint64_t nodeId);

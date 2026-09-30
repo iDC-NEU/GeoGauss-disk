@@ -18,7 +18,10 @@ if ! epoch_is_local_node "${NODE_ID}"; then
     REMOTE="$(epoch_ssh_target "${NODE_ID}")"
     RB="$(epoch_bench_root_for_node "${NODE_ID}")"
     ssh -o BatchMode=yes -o ConnectTimeout=10 "${REMOTE}" \
-        "export EPOCH_LOCAL_NODE_ID=${NODE_ID}; bash ${RB}/openGauss-server/scripts/epoch_benchmark/stop_node.sh ${NODE_ID}"
+        "export EPOCH_LOCAL_NODE_ID=${NODE_ID}; export EPOCH_BENCH_ROOT=${RB}; \
+        export EPOCH_SKIP_NODE=${EPOCH_SKIP_NODE}; \
+        export EPOCH_SKIP_NODE2=$( [ \"${EPOCH_SKIP_NODE}\" = 2 ] && echo 1 || echo 0 ); \
+        bash ${RB}/openGauss-server/scripts/epoch_benchmark/stop_node.sh ${NODE_ID}"
     exit $?
 fi
 

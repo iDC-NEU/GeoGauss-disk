@@ -38,6 +38,8 @@
 #include "access/cstore_am.h"
 #include "access/double_write.h"
 #include "access/multi_redo_api.h"
+#include "epoch/e_apply_buflock.h"
+#include "portability/instr_time.h"
 #include "access/transam.h"
 #include "access/xlogproc.h"
 #include "access/double_write.h"
@@ -2552,6 +2554,33 @@ Buffer MultiBulkReadBufferCommon(SMgrRelation smgr, char relpersistence, ForkNum
  *
  * *hit is set to true if the request was satisfied from shared buffer cache.
  */
+namespace {
+/* apply find 诊断：仅 EpochApplyBufLockCollecting 时累计 ReadBuffer 墙钟 */
+struct EpochApplyReadBufTimer {
+    bool active;
+    bool* hit;
+    instr_time t0;
+
+    explicit EpochApplyReadBufTimer(bool* hit_ptr) : active(EpochApplyBufLockCollecting()), hit(hit_ptr)
+    {
+        if (active) {
+            INSTR_TIME_SET_CURRENT(t0);
+        }
+    }
+
+    ~EpochApplyReadBufTimer()
+    {
+        if (!active) {
+            return;
+        }
+        instr_time t1;
+        INSTR_TIME_SET_CURRENT(t1);
+        INSTR_TIME_SUBTRACT(t1, t0);
+        EpochApplyBufLockNoteReadBuf(static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(t1)), hit != nullptr && *hit);
+    }
+};
+}  // namespace
+
 Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum, BlockNumber blockNum,
                                 ReadBufferMode mode, BufferAccessStrategy strategy, bool *hit, const XLogPhyBlock *pblk)
 {
@@ -2563,6 +2592,7 @@ Buffer ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber fork
     bool need_repair = false;
 
     *hit = false;
+    EpochApplyReadBufTimer rb_timer(hit);
 
     /* Make sure we will have room to remember the buffer pin */
     ResourceOwnerEnlargeBuffers(t_thrd.utils_cxt.CurrentResourceOwner);
@@ -6828,6 +6858,11 @@ void WaitIO(BufferDesc *buf)
      * I/O could release the io_in_progress_lock prematurely. See
      * AbortBufferIO.
      */
+    const bool collect = EpochApplyBufLockCollecting();
+    instr_time wait_t0;
+    if (collect) {
+        INSTR_TIME_SET_CURRENT(wait_t0);
+    }
     for (;;) {
         uint64 buf_state;
 
@@ -6844,6 +6879,12 @@ void WaitIO(BufferDesc *buf)
         }
         (void)LWLockAcquire(buf->io_in_progress_lock, LW_SHARED);
         LWLockRelease(buf->io_in_progress_lock);
+    }
+    if (collect) {
+        instr_time wait_t1;
+        INSTR_TIME_SET_CURRENT(wait_t1);
+        INSTR_TIME_SUBTRACT(wait_t1, wait_t0);
+        EpochApplyBufLockNoteWaitIO(static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(wait_t1)));
     }
 }
 

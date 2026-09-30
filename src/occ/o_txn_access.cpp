@@ -8,6 +8,9 @@
 #include "occ/o_delta_table.h"
 #include "occ/o_staging.h"
 
+#include "epoch/e_config.h"
+#include "epoch/e_heap_version.h"
+
 static FORCE_INLINE
     HeapTuple
     O_heap_copytuple_impl(HeapTuple tuple)
@@ -35,6 +38,22 @@ static FORCE_INLINE
     rc = memcpy_s((char *)newTuple->t_data, tuple->t_len, (char *)tuple->t_data, tuple->t_len);
     securec_check(rc, "\0", "\0");
     return newTuple;
+}
+
+static HeapTuple OccResolveEpochVersionCopy(Relation rel, HeapTuple row)
+{
+    if (row == nullptr || row->t_data == nullptr || !EpochHeapVersionChainEnabled(rel)) {
+        return row;
+    }
+    if (row->t_data->is_latest) {
+        return row;
+    }
+    HeapTuple latest = nullptr;
+    if (!EpochHeapFetchLatestCopy(rel, &row->t_self, &latest, NULL) || latest == nullptr) {
+        return row;
+    }
+    heap_freetuple(row);
+    return latest;
 }
 
 //static FORCE_INLINE
@@ -364,7 +383,7 @@ bool O_TxnAccess::EnsureRowAccessForModify(Relation rel, ItemPointer tid, HeapTu
 
     ac->m_origSentinel = sentinel;
     ac->m_globalRow = row;
-    ac->m_localRow = row;
+    ac->m_localRow = nullptr;
     ac->m_csn = row->t_data->m_rowCSN;
     ac->m_type = RD_FOR_UPDATE;
     ac->m_stmtCount = m_txnManager->GetStmtCount();
@@ -414,6 +433,14 @@ RC O_TxnAccess::LookupFilterRow(O_Access *curr_acc, const AccessType type, HeapT
     }
     else
         r_local_Row = curr_acc->GetTxnRow();
+    if (r_local_Row != nullptr && !ItemPointerIsValid(&r_local_Row->t_self) &&
+        OccTidIsPlausible(&curr_acc->m_origSentinel.tuple_id)) {
+        r_local_Row->t_self = curr_acc->m_origSentinel.tuple_id;
+    }
+    if (r_local_Row != nullptr && !ItemPointerIsValid(&r_local_Row->t_self) &&
+        curr_acc->m_type != INS) {
+        return RC::RC_LOCAL_ROW_NOT_FOUND;
+    }
     SetLastAccess(curr_acc);
     return RC::RC_LOCAL_ROW_FOUND;
 }
@@ -557,6 +584,17 @@ O_Access *O_TxnAccess::GetNewRowAccess(occ_sentinel const &originalSentinel, Acc
     if (row == nullptr)
     {
         return nullptr;
+    }
+
+    {
+        Relation version_rel = originalSentinel.relation;
+        if (version_rel == nullptr && scan != nullptr) {
+            version_rel = scan->heapRelation;
+        }
+        row = OccResolveEpochVersionCopy(version_rel, row);
+        if (row == nullptr) {
+            return nullptr;
+        }
     }
 
     O_Access *ac = GetAccessPtr(m_rowCnt);
@@ -710,7 +748,7 @@ RC O_TxnAccess::GenerateDraft(O_Access *ac, AccessType acType)
 
 RC O_TxnAccess::CreateMVCCDraft(O_Access *ac, AccessType acType)
 {
-    if (ac->m_localRow != nullptr) {
+    if (ac->m_localRow != nullptr && ac->m_localRow != ac->m_globalRow) {
         return RC_OK;
     }
 

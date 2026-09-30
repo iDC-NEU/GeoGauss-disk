@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "epoch/e_config.h"
+#include "epoch/e_epoch_capacity.h"
 #include "epoch/e_types.h"
 
 #include "occ/o_config.h"
@@ -9,25 +10,51 @@
 
 #include <climits>
 
+/*
+ * Benchmark 三节点拓扑（scripts/epoch_benchmark/env.sh）：
+ *   NODE_ID=1  node1  202.199.13.149
+ *   NODE_ID=2  node2  202.199.13.61
+ *   NODE_ID=3  node3  219.216.64.216
+ * epoch_node_id GUC 为 0-based，与 peer_hosts 列表下标一致。
+ * node2 关机时脚本写入 epoch_total_nodes=2，peer_hosts 仅含 node1+node3。
+ */
+#define EPOCH_BENCHMARK_PEER_HOSTS "202.199.13.149,202.199.13.61,219.216.64.216"
+#define EPOCH_BENCHMARK_TOTAL_NODES 3
+
 bool g_enable_epoch_multimaster = false;
-bool g_epoch_commit_sync = true;
+/* 压测：改为 true 可跳过 worker apply（见 e_config.h） */
+bool g_epoch_skip_apply = false;
+/* 分析：只 apply 本地 wire；远端 MarkApplied 跳过（见 e_config.h） */
+bool g_epoch_apply_local_only = false;
+/* Phase 1：本地 tip 进 staging 哈希表（见 e_config.h） */
+bool g_epoch_local_tip_staging = true;
+
+bool g_epoch_sync_start_gate = true;
 bool g_epoch_recv_diag = false;
+bool g_epoch_recv_diag_verbose = false;
+bool g_epoch_lifecycle_log = false;
 bool g_epoch_diag = false;
 bool g_epoch_perf_log = false;
 int g_epoch_node_id = 0;
-int g_epoch_total_nodes = 2;
+int g_epoch_total_nodes = EPOCH_BENCHMARK_TOTAL_NODES;
 int g_epoch_cache_slots = EPOCH_DEFAULT_CACHE_SLOTS;
-int g_epoch_physical_interval_ms = 10;
+int g_epoch_physical_txns_per_epoch = 0;
 int g_epoch_delay_slots = EPOCH_DEFAULT_DELAY;
 int g_epoch_phys_logical_gap_limit = 5;
 int g_epoch_merge_threads = 2;
 int g_epoch_commit_threads = 2;
-int g_epoch_pack_threads = 1;
-int g_epoch_async_stale_pack_limit = 500;
-int g_epoch_async_stagnation_ms = 500;
-int g_epoch_async_assign_max_sleep_ms = 20;
-int g_epoch_async_max_tpmc = 0;
-int g_epoch_async_tpmc_write_ratio_percent = 180;
+int g_epoch_tip_flush_threads = 1;
+int g_epoch_pack_threads = 5;
+int g_epoch_apply_lock_trace_ms = 0;
+int g_epoch_txn_queue_capacity = EPOCH_DEFAULT_TXN_QUEUE_CAPACITY;
+int g_epoch_abort_csn_per_epoch = EPOCH_DEFAULT_ABORT_CSN_PER_EPOCH;
+int g_epoch_crdt_slot_count = EPOCH_DEFAULT_CRDT_SLOT_COUNT;
+int g_epoch_crdt_rows_per_slot = EPOCH_DEFAULT_CRDT_ROWS_PER_SLOT;
+int g_epoch_crdt_inserts_per_slot = EPOCH_DEFAULT_CRDT_INSERTS_PER_SLOT;
+int g_epoch_merge_queue_capacity = EPOCH_DEFAULT_MERGE_QUEUE_CAPACITY;
+int g_epoch_merge_done_capacity = EPOCH_DEFAULT_MERGE_DONE_CAPACITY;
+int g_epoch_apply_queue_capacity = EPOCH_DEFAULT_APPLY_QUEUE_CAPACITY;
+int g_epoch_apply_done_capacity = EPOCH_DEFAULT_APPLY_DONE_CAPACITY;
 char* g_epoch_peer_hosts = NULL;
 int g_epoch_data_port_base = 25600;
 char* g_epoch_apply_database = NULL;
@@ -101,6 +128,9 @@ uint32_t EpochGetNodeId(void)
 
 uint64_t EpochGetPhysLogicalGapLimit(void)
 {
+    if (g_epoch_phys_logical_gap_limit <= 0) {
+        return UINT64_MAX;
+    }
     uint64_t limit = static_cast<uint64_t>(g_epoch_phys_logical_gap_limit);
     if (limit < 2) {
         limit = 2;
@@ -116,47 +146,9 @@ uint64_t EpochGetPhysLogicalGapLimit(void)
     return limit;
 }
 
-uint64_t EpochGetAsyncStalePackLimit(void)
+bool EpochIsPhysLogicalGapDisabled(void)
 {
-    if (g_epoch_async_stale_pack_limit <= 0) {
-        return UINT64_MAX;
-    }
-    return static_cast<uint64_t>(g_epoch_async_stale_pack_limit);
-}
-
-uint32_t EpochGetAsyncStagnationMs(void)
-{
-    if (g_epoch_async_stagnation_ms < 0) {
-        return 0;
-    }
-    return static_cast<uint32_t>(g_epoch_async_stagnation_ms);
-}
-
-uint32_t EpochGetAsyncAssignMaxSleepMs(void)
-{
-    if (g_epoch_async_assign_max_sleep_ms < 0) {
-        return 0;
-    }
-    return static_cast<uint32_t>(g_epoch_async_assign_max_sleep_ms);
-}
-
-uint32_t EpochGetAsyncMaxTpmc(void)
-{
-    if (g_epoch_async_max_tpmc < 0) {
-        return 0;
-    }
-    return static_cast<uint32_t>(g_epoch_async_max_tpmc);
-}
-
-uint32_t EpochGetAsyncTpmcWriteRatioPercent(void)
-{
-    if (g_epoch_async_tpmc_write_ratio_percent < 100) {
-        return 100;
-    }
-    if (g_epoch_async_tpmc_write_ratio_percent > 400) {
-        return 400;
-    }
-    return static_cast<uint32_t>(g_epoch_async_tpmc_write_ratio_percent);
+    return g_epoch_phys_logical_gap_limit <= 0;
 }
 
 void EpochConfigInit(void)
@@ -177,12 +169,12 @@ void EpochRegisterGucs(void)
                              EpochAssignMultimaster,
                              NULL);
 
-    DefineCustomBoolVariable("epoch_commit_sync",
-                             "When on, COMMIT waits for logical epoch close and remote "
-                             "exec/record (sync multi-master; strong cross-node visibility). "
-                             "When off, pack at COMMIT and return immediately (async; higher tpmC).",
+    DefineCustomBoolVariable("epoch_sync_start_gate",
+                             "When on (default), sync multi-master blocks BEGIN on START gate "
+                             "until logical epoch catches up; extended-protocol Parse (prepare) "
+                             "skips assign/gate/executing. When off, skip START gate for all paths.",
                              NULL,
-                             &g_epoch_commit_sync,
+                             &g_epoch_sync_start_gate,
                              true,
                              PGC_POSTMASTER,
                              GUC_NO_RESET_ALL,
@@ -194,7 +186,7 @@ void EpochRegisterGucs(void)
                                "Comma-separated peer host list aligned with node id.",
                                NULL,
                                &g_epoch_peer_hosts,
-                               "",
+                               EPOCH_BENCHMARK_PEER_HOSTS,
                                PGC_POSTMASTER,
                                GUC_NO_RESET_ALL,
                                NULL,
@@ -231,7 +223,7 @@ void EpochRegisterGucs(void)
                             "Total node count in epoch multi-master cluster.",
                             NULL,
                             &g_epoch_total_nodes,
-                            2,
+                            EPOCH_BENCHMARK_TOTAL_NODES,
                             1,
                             static_cast<int>(EPOCH_MAX_NODES),
                             PGC_POSTMASTER,
@@ -253,13 +245,14 @@ void EpochRegisterGucs(void)
                             NULL,
                             NULL);
 
-    DefineCustomIntVariable("epoch_physical_interval_ms",
-                            "Physical epoch advance interval in milliseconds.",
+    DefineCustomIntVariable("epoch_physical_txns_per_epoch",
+                            "When >0, each postmaster allows at most this many backend assigns "
+                            "before advancing its local physical epoch.",
                             NULL,
-                            &g_epoch_physical_interval_ms,
-                            10,
-                            1,
-                            10000,
+                            &g_epoch_physical_txns_per_epoch,
+                            0,
+                            0,
+                            1000000,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
@@ -280,11 +273,12 @@ void EpochRegisterGucs(void)
                             NULL);
 
     DefineCustomIntVariable("epoch_phys_logical_gap_limit",
-                            "Max slots physical epoch may lead logical epoch (backpressure).",
+                            "Max slots physical epoch may lead logical epoch (backpressure). "
+                            "0 disables physical backpressure.",
                             NULL,
                             &g_epoch_phys_logical_gap_limit,
                             5,
-                            2,
+                            0,
                             8192,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
@@ -318,84 +312,143 @@ void EpochRegisterGucs(void)
                             NULL,
                             NULL);
 
+    DefineCustomIntVariable("epoch_tip_flush_threads",
+                            "Epoch tip-staging flush worker count (background reclaim to heap).",
+                            NULL,
+                            &g_epoch_tip_flush_threads,
+                            1,
+                            1,
+                            16,
+                            PGC_POSTMASTER,
+                            GUC_NO_RESET_ALL,
+                            NULL,
+                            NULL,
+                            NULL);
+
     DefineCustomIntVariable("epoch_pack_threads",
-                            "Worker thread count for epoch pack stage.",
+                            "Pack worker count (TxnQueue drain → merge enqueue + send queue; Pack#0 seals).",
                             NULL,
                             &g_epoch_pack_threads,
-                            1,
+                            5,
                             1,
                             64,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
-                            NULL,
-                            NULL);
+                             NULL,
+                             NULL);
 
-    DefineCustomIntVariable("epoch_async_stale_pack_limit",
-                            "Async: when phys-logical gap is full, hard cap on pack count "
-                            "per cap epoch (commit_epoch==logical+gap); cross-backend atomic "
-                            "reservation at COMMIT pack (0=disable).",
+    DefineCustomIntVariable("epoch_txn_queue_capacity",
+                            "Shared-memory txn wire queue slot count.",
                             NULL,
-                            &g_epoch_async_stale_pack_limit,
-                            500,
-                            0,
-                            1000000,
+                            &g_epoch_txn_queue_capacity,
+                            EPOCH_DEFAULT_TXN_QUEUE_CAPACITY,
+                            256,
+                            1048576,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
                             NULL,
                             NULL);
 
-    DefineCustomIntVariable("epoch_async_stagnation_ms",
-                            "Async: after cap-epoch pack quota is saturated for this many ms, "
-                            "allow a small overflow burst to avoid commit stalls.",
+    DefineCustomIntVariable("epoch_abort_csn_per_epoch",
+                            "Max aborted txn CSNs recorded per epoch cache slot.",
                             NULL,
-                            &g_epoch_async_stagnation_ms,
-                            500,
-                            0,
-                            600000,
+                            &g_epoch_abort_csn_per_epoch,
+                            EPOCH_DEFAULT_ABORT_CSN_PER_EPOCH,
+                            1024,
+                            1048576,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
                             NULL,
                             NULL);
 
-    DefineCustomIntVariable("epoch_async_assign_max_sleep_ms",
-                            "Async: max sleep per assign when stale-pack or stagnation throttle "
-                            "fires (does not wait for logical close; 0=no sleep).",
+    DefineCustomIntVariable("epoch_crdt_slot_count",
+                            "CRDT ring buffer slot count (epoch modulo).",
                             NULL,
-                            &g_epoch_async_assign_max_sleep_ms,
-                            20,
-                            0,
-                            1000,
+                            &g_epoch_crdt_slot_count,
+                            EPOCH_DEFAULT_CRDT_SLOT_COUNT,
+                            4,
+                            8192,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
                             NULL,
                             NULL);
 
-    DefineCustomIntVariable("epoch_async_max_tpmc",
-                            "Async: per-node write COMMIT rate cap targeting BenchmarkSQL tpmC "
-                            "(0=disable). Limits local pack commits via shared token bucket.",
+    DefineCustomIntVariable("epoch_crdt_rows_per_slot",
+                            "Max merged row entries per CRDT slot.",
                             NULL,
-                            &g_epoch_async_max_tpmc,
-                            0,
-                            0,
-                            1000000,
+                            &g_epoch_crdt_rows_per_slot,
+                            EPOCH_DEFAULT_CRDT_ROWS_PER_SLOT,
+                            256,
+                            1048576,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
                             NULL,
                             NULL);
 
-    DefineCustomIntVariable("epoch_async_tpmc_write_ratio_percent",
-                            "Async: estimated write-txn / NewOrder ratio in percent for tpmC cap "
-                            "(180 ≈ 56%% NewOrder in 50/50 TPCC with errors).",
+    DefineCustomIntVariable("epoch_crdt_inserts_per_slot",
+                            "Max insert-tracker entries per CRDT slot.",
                             NULL,
-                            &g_epoch_async_tpmc_write_ratio_percent,
-                            180,
-                            100,
-                            400,
+                            &g_epoch_crdt_inserts_per_slot,
+                            EPOCH_DEFAULT_CRDT_INSERTS_PER_SLOT,
+                            64,
+                            1048576,
+                            PGC_POSTMASTER,
+                            GUC_NO_RESET_ALL,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("epoch_merge_queue_capacity",
+                            "Async merge task queue slot count.",
+                            NULL,
+                            &g_epoch_merge_queue_capacity,
+                            EPOCH_DEFAULT_MERGE_QUEUE_CAPACITY,
+                            64,
+                            65536,
+                            PGC_POSTMASTER,
+                            GUC_NO_RESET_ALL,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("epoch_merge_done_capacity",
+                            "Async merge completion ring buffer size.",
+                            NULL,
+                            &g_epoch_merge_done_capacity,
+                            EPOCH_DEFAULT_MERGE_DONE_CAPACITY,
+                            64,
+                            65536,
+                            PGC_POSTMASTER,
+                            GUC_NO_RESET_ALL,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("epoch_apply_queue_capacity",
+                            "Async apply task queue slot count.",
+                            NULL,
+                            &g_epoch_apply_queue_capacity,
+                            EPOCH_DEFAULT_APPLY_QUEUE_CAPACITY,
+                            64,
+                            65536,
+                            PGC_POSTMASTER,
+                            GUC_NO_RESET_ALL,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomIntVariable("epoch_apply_done_capacity",
+                            "Async apply completion ring buffer size.",
+                            NULL,
+                            &g_epoch_apply_done_capacity,
+                            EPOCH_DEFAULT_APPLY_DONE_CAPACITY,
+                            64,
+                            65536,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
@@ -403,10 +456,32 @@ void EpochRegisterGucs(void)
                             NULL);
 
     DefineCustomBoolVariable("epoch_recv_diag",
-                             "When on, write epoch_recv_diag_YYYYMMDD_HHMMSS.log (wire txn / seal / stall tracing). "
-                             "Off by default for benchmark throughput.",
+                             "When on, write epoch_recv_diag_YYYYMMDD_HHMMSS.log for anomalies only. "
+                             "Use epoch_recv_diag_verbose=on for full wire/backend tracing.",
                              NULL,
                              &g_epoch_recv_diag,
+                             false,
+                             PGC_POSTMASTER,
+                             GUC_NO_RESET_ALL,
+                             NULL,
+                             NULL,
+                             NULL);
+
+    DefineCustomBoolVariable("epoch_recv_diag_verbose",
+                             "When on with epoch_recv_diag, log per-txn/per-epoch verbose recv_diag (large files).",
+                             NULL,
+                             &g_epoch_recv_diag_verbose,
+                             false,
+                             PGC_POSTMASTER,
+                             GUC_NO_RESET_ALL,
+                             NULL,
+                             NULL,
+                             NULL);
+
+    DefineCustomBoolVariable("epoch_lifecycle_log",
+                             "When on, append epoch_lifecycle_YYYYMMDD_HHMMSS.log with per-epoch stage timings.",
+                             NULL,
+                             &g_epoch_lifecycle_log,
                              false,
                              PGC_POSTMASTER,
                              GUC_NO_RESET_ALL,
@@ -431,6 +506,41 @@ void EpochRegisterGucs(void)
                              &g_epoch_perf_log,
                              false,
                              PGC_POSTMASTER,
+                             GUC_NO_RESET_ALL,
+                             NULL,
+                             NULL,
+                             NULL);
+
+    DefineCustomIntVariable("epoch_apply_lock_trace_ms",
+                            "Log APPLY_BUFLOCK_DETAIL/TXN when apply row lock/find IO exceeds this many ms; 0 disables.",
+                            "Splits excl_wait/hold, share_wait, ReadBuffer (rb_*), WaitIO, btree LockBuffer (bt_lock_*).",
+                            &g_epoch_apply_lock_trace_ms,
+                            0,
+                            0,
+                            60000,
+                            PGC_SIGHUP,
+                            GUC_UNIT_MS,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomBoolVariable("epoch_apply_profile",
+                             "When on, append epoch_apply_profile_*.log with per-phase apply timings.",
+                             NULL,
+                             &g_epoch_apply_profile,
+                             false,
+                             PGC_SIGHUP,
+                             GUC_NO_RESET_ALL,
+                             NULL,
+                             NULL,
+                             NULL);
+
+    DefineCustomBoolVariable("epoch_merge_profile",
+                             "When on, append epoch_merge_profile_*.log with per-phase merge worker timings.",
+                             NULL,
+                             &g_epoch_merge_profile,
+                             false,
+                             PGC_SIGHUP,
                              GUC_NO_RESET_ALL,
                              NULL,
                              NULL,

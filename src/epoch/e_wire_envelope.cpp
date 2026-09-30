@@ -84,7 +84,8 @@ static bool ReadEnvelopeHeader(const char* data, size_t len, EpochWireEnvelopeKi
     if (!ReadU64(p, end, &magic) || magic != EPOCH_WIRE_ENVELOPE_MAGIC) {
         return false;
     }
-    if (!ReadU32(p, end, &version) || version != EPOCH_WIRE_ENVELOPE_VERSION) {
+    if (!ReadU32(p, end, &version) ||
+        (version != EPOCH_WIRE_ENVELOPE_VERSION && version != 1)) {
         return false;
     }
     if (!ReadU32(p, end, &k)) {
@@ -115,8 +116,7 @@ bool EpochWireSerializeMetadata(const E_WireTxn& txn, uint64_t payload_hash, int
     AppendU32(out, EPOCH_WIRE_ENVELOPE_VERSION);
     AppendU32(out, static_cast<uint32_t>(EPOCH_WIRE_ENV_TXN_METADATA));
     AppendU64(out, txn.csn);
-    AppendU64(out, txn.start_epoch);
-    AppendU64(out, txn.commit_epoch);
+    AppendU64(out, txn.epoch);
     AppendU32(out, txn.server_id);
     AppendU64(out, payload_hash);
     AppendI32(out, payload_size);
@@ -125,18 +125,42 @@ bool EpochWireSerializeMetadata(const E_WireTxn& txn, uint64_t payload_hash, int
 
 bool EpochWireParseMetadata(const char* data, size_t len, EpochWireMetadata* out)
 {
-    if (out == nullptr) {
+    if (out == nullptr || data == nullptr || len < sizeof(uint64_t) + sizeof(uint32_t) * 2) {
         return false;
     }
-    EpochWireEnvelopeKind kind = EPOCH_WIRE_ENV_TXN_METADATA;
-    if (!ReadEnvelopeHeader(data, len, &kind) || kind != EPOCH_WIRE_ENV_TXN_METADATA) {
-        return false;
-    }
-    const char* p = data + sizeof(uint64_t) + sizeof(uint32_t) * 2;
+    const char* p = data;
     const char* end = data + len;
-    if (!ReadU64(p, end, &out->csn) || !ReadU64(p, end, &out->start_epoch) ||
-        !ReadU64(p, end, &out->commit_epoch) || !ReadU32(p, end, &out->server_id) ||
-        !ReadU64(p, end, &out->payload_hash) || !ReadI32(p, end, &out->payload_size)) {
+    uint64_t magic = 0;
+    uint32_t version = 0;
+    uint32_t k = 0;
+    if (!ReadU64(p, end, &magic) || magic != EPOCH_WIRE_ENVELOPE_MAGIC) {
+        return false;
+    }
+    if (!ReadU32(p, end, &version) ||
+        (version != EPOCH_WIRE_ENVELOPE_VERSION && version != 1)) {
+        return false;
+    }
+    if (!ReadU32(p, end, &k) || k != static_cast<uint32_t>(EPOCH_WIRE_ENV_TXN_METADATA)) {
+        return false;
+    }
+    if (!ReadU64(p, end, &out->csn)) {
+        return false;
+    }
+    if (version >= 2) {
+        if (!ReadU64(p, end, &out->epoch)) {
+            return false;
+        }
+    } else {
+        uint64_t start_epoch = 0;
+        uint64_t commit_epoch = 0;
+        if (!ReadU64(p, end, &start_epoch) || !ReadU64(p, end, &commit_epoch)) {
+            return false;
+        }
+        out->epoch = commit_epoch;
+        (void)start_epoch;
+    }
+    if (!ReadU32(p, end, &out->server_id) || !ReadU64(p, end, &out->payload_hash) ||
+        !ReadI32(p, end, &out->payload_size)) {
         return false;
     }
     return true;

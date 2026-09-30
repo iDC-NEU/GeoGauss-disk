@@ -37,6 +37,7 @@ public:
      */
     bool Lookup(Relation relation, ItemPointer tid, O_StagingEntry &outEntry) const;
 
+    /* Caller-owned HeapTuple in CurrentMemoryContext (heap_freetuple). */
     HeapTuple LookupCopyTuple(Relation relation, ItemPointer tid) const;
 
     bool LookupForRead(Relation relation, ItemPointer tid, O_StagingLookupResult &result) const;

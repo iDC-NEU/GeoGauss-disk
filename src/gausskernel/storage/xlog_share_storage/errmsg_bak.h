@@ -43600,12 +43600,12 @@ static const gsqlerr_err_msg_t g_gsqlerr_errors[] =
 	   "invalid"}},
 
 	  {17121, "25000",
-	  {"cannot commit a transaction that deleted files but has no xid",
+	  {"cannot commit transaction %lu, it was already aborted",
 	   "invalid",
 	   "invalid"}},
 
 	  {17122, "25000",
-	  {"cannot commit transaction %lu, it was already aborted",
+	  {"cannot commit a transaction that deleted files but has no xid",
 	   "invalid",
 	   "invalid"}},
 

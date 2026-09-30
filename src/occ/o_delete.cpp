@@ -31,8 +31,9 @@ static uint8 ComputeInfobits(uint16 infomask, uint16 infomask2);
 TupleTableSlot *O_ExecDelete(ItemPointer tupleid, Oid deletePartitionOid, int2 bucketid, HeapTupleHeader oldtuple,
                              TupleTableSlot *planSlot, EPQState *epqstate, ModifyTableState *node, bool canSetTag)
 {
-    // 执行阶段需要先分配xid，为提交阶段准备
-    TransactionId xid = GetCurrentTransactionId();
+    if (!OccSyncDeferHeapWrite()) {
+        (void)GetCurrentTransactionId();
+    }
 
     EState *estate = node->ps.state;
     ResultRelInfo *result_rel_info = NULL;
@@ -148,8 +149,15 @@ TM_Result O_heap_delete(Relation relation, ItemPointer tid, CommandId cid, uint6
 
     old_key_tuple = ExtractReplicaIdentity(relation, &tp, true, &old_key_copied, &identity);
 
-    ComputeNewXmaxInfomask(HeapTupleGetRawXmax(&tp), tp.t_data->t_infomask, tp.t_data->t_infomask2, xid,
-                           LockTupleExclusive, true, &new_xmax, &new_infomask, &new_infomask2);
+    if (O_HeapUseCsnEpochSemantics()) {
+        new_xmax = InvalidTransactionId;
+        new_infomask = HEAP_XMAX_INVALID;
+        new_infomask2 = 0;
+        tp.t_data->is_latest = false;
+    } else {
+        ComputeNewXmaxInfomask(HeapTupleGetRawXmax(&tp), tp.t_data->t_infomask, tp.t_data->t_infomask2, xid,
+                               LockTupleExclusive, true, &new_xmax, &new_infomask, &new_infomask2);
+    }
 
     PageSetPrunable(page, xid);
 

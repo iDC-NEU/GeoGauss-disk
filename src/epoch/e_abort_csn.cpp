@@ -2,8 +2,30 @@
 
 #include "epoch/e_abort_csn.h"
 #include "epoch/e_config.h"
+#include "epoch/e_epoch_capacity.h"
 #include "epoch/e_node_manager.h"
 #include "epoch/e_shmem.h"
+#include "epoch/e_statistician.h"
+
+#include "storage/ipc.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
+
+#include <cstring>
+
+struct EpochAbortCsnSlotHeader {
+    slock_t lock;
+    std::atomic<uint32_t> count;
+};
+
+struct EpochAbortCsnBankHeader {
+    uint32_t cache_slot_count;
+    uint32_t entries_per_slot;
+};
+
+static constexpr const char* EPOCH_ABORT_CSN_SHMEM_NAME = "Epoch Abort CSN Bank";
+
+static EpochAbortCsnBankHeader* g_epochAbortCsnBank = nullptr;
 
 static uint32_t EpochAbortSlotIndex(uint64_t epochId)
 {
@@ -14,114 +36,161 @@ static uint32_t EpochAbortSlotIndex(uint64_t epochId)
     return static_cast<uint32_t>(epochId % slots);
 }
 
-static EpochAbortCsnBank* EpochAbortBank(void)
+static size_t EpochAbortCsnSlotStride(uint32_t entries_per_slot)
 {
-    EpochSharedState* state = EpochGetSharedState();
-    if (state == nullptr) {
-        return nullptr;
-    }
-    return &state->abort_csns;
+    return sizeof(EpochAbortCsnSlotHeader) + static_cast<size_t>(entries_per_slot) * sizeof(EpochAbortCsnEntry);
 }
 
-static EpochAbortCsnSlot* EpochAbortSlotForEpoch(uint64_t epochId, bool bind)
+static EpochAbortCsnSlotHeader* EpochAbortCsnSlotHeaderAt(uint32_t slot_idx)
 {
-    EpochAbortCsnBank* bank = EpochAbortBank();
-    if (bank == nullptr) {
+    if (g_epochAbortCsnBank == nullptr) {
         return nullptr;
     }
-    uint32_t slot = EpochAbortSlotIndex(epochId);
-    if (slot >= EPOCH_DEFAULT_CACHE_SLOTS) {
-        return nullptr;
-    }
-    if (bind) {
-        E_NodeManager::EnsureEpochSlot(epochId);
-    }
-    return &bank->slots[slot];
+    char* base = reinterpret_cast<char*>(g_epochAbortCsnBank + 1);
+    return reinterpret_cast<EpochAbortCsnSlotHeader*>(base + static_cast<size_t>(slot_idx) *
+                                                                 EpochAbortCsnSlotStride(
+                                                                     g_epochAbortCsnBank->entries_per_slot));
 }
 
-void EpochAbortCsnBankInit(EpochAbortCsnBank* bank)
+static EpochAbortCsnEntry* EpochAbortCsnSlotEntries(EpochAbortCsnSlotHeader* slot_hdr)
 {
-    if (bank == nullptr) {
+    return reinterpret_cast<EpochAbortCsnEntry*>(slot_hdr + 1);
+}
+
+Size EpochAbortCsnShmemSize(void)
+{
+    uint32_t cache_slots = EpochGetCacheSlots();
+    uint32_t entries_per_epoch = EpochGetAbortCsnPerEpoch();
+    size_t slots_bytes = static_cast<size_t>(cache_slots) * EpochAbortCsnSlotStride(entries_per_epoch);
+    return sizeof(EpochAbortCsnBankHeader) + slots_bytes;
+}
+
+static void EpochAbortCsnResetSlot(uint32_t slot_idx)
+{
+    EpochAbortCsnSlotHeader* slot_hdr = EpochAbortCsnSlotHeaderAt(slot_idx);
+    if (slot_hdr == nullptr || g_epochAbortCsnBank == nullptr) {
         return;
     }
-    for (uint32_t slot = 0; slot < EPOCH_DEFAULT_CACHE_SLOTS; ++slot) {
-        bank->slots[slot].count.store(0, std::memory_order_relaxed);
-        for (uint32_t i = 0; i < EPOCH_ABORT_CSNS_PER_SLOT; ++i) {
-            bank->slots[slot].entries[i].csn.store(0, std::memory_order_relaxed);
-            bank->slots[slot].entries[i].server_id.store(0, std::memory_order_relaxed);
-        }
+    SpinLockInit(&slot_hdr->lock);
+    uint32_t capacity = g_epochAbortCsnBank->entries_per_slot;
+    EpochAbortCsnEntry* entries = EpochAbortCsnSlotEntries(slot_hdr);
+    for (uint32_t i = 0; i < capacity; ++i) {
+        entries[i].csn = 0;
+        entries[i].server_id = 0;
+    }
+    slot_hdr->count.store(0, std::memory_order_release);
+}
+
+static void EpochAbortCsnBankInitLocked(void)
+{
+    if (g_epochAbortCsnBank == nullptr) {
+        return;
+    }
+    for (uint32_t slot = 0; slot < g_epochAbortCsnBank->cache_slot_count; ++slot) {
+        EpochAbortCsnResetSlot(slot);
+    }
+}
+
+void EpochAbortCsnShmemInit(void)
+{
+    bool found = false;
+    g_epochAbortCsnBank = static_cast<EpochAbortCsnBankHeader*>(
+        ShmemInitStruct(EPOCH_ABORT_CSN_SHMEM_NAME, EpochAbortCsnShmemSize(), &found));
+    if (g_epochAbortCsnBank == nullptr) {
+        return;
+    }
+    if (!found) {
+        g_epochAbortCsnBank->cache_slot_count = EpochGetCacheSlots();
+        g_epochAbortCsnBank->entries_per_slot = EpochGetAbortCsnPerEpoch();
+        EpochAbortCsnBankInitLocked();
     }
 }
 
 void EpochAbortCsnClear(uint64_t epochId)
 {
-    EpochAbortCsnSlot* slot = EpochAbortSlotForEpoch(epochId, false);
-    if (slot == nullptr) {
+    if (g_epochAbortCsnBank == nullptr) {
         return;
     }
-    uint32_t n = slot->count.load(std::memory_order_acquire);
-    if (n > EPOCH_ABORT_CSNS_PER_SLOT) {
-        n = EPOCH_ABORT_CSNS_PER_SLOT;
-    }
-    for (uint32_t i = 0; i < n; ++i) {
-        slot->entries[i].csn.store(0, std::memory_order_relaxed);
-        slot->entries[i].server_id.store(0, std::memory_order_relaxed);
-    }
-    slot->count.store(0, std::memory_order_release);
+    EpochAbortCsnResetSlot(EpochAbortSlotIndex(epochId));
 }
 
 void EpochAbortCsnInsert(uint64_t epochId, uint64_t csn, uint32_t serverId)
 {
-    if (csn == 0) {
+    if (csn == 0 || g_epochAbortCsnBank == nullptr) {
         return;
     }
     if (EpochAbortCsnContains(epochId, csn, serverId)) {
         return;
     }
-    EpochAbortCsnSlot* slot = EpochAbortSlotForEpoch(epochId, true);
-    if (slot == nullptr) {
+
+    E_NodeManager::EnsureEpochSlot(epochId);
+    uint32_t slot_idx = EpochAbortSlotIndex(epochId);
+    EpochAbortCsnSlotHeader* slot_hdr = EpochAbortCsnSlotHeaderAt(slot_idx);
+    if (slot_hdr == nullptr) {
         return;
     }
-    uint32_t idx = slot->count.fetch_add(1, std::memory_order_acq_rel);
-    if (idx >= EPOCH_ABORT_CSNS_PER_SLOT) {
+
+    SpinLockAcquire(&slot_hdr->lock);
+    uint32_t idx = slot_hdr->count.load(std::memory_order_relaxed);
+    if (idx >= g_epochAbortCsnBank->entries_per_slot) {
+        SpinLockRelease(&slot_hdr->lock);
         ereport(WARNING,
-            (errmsg("epoch: abort_csn_set overflow for epoch %lu (csn %lu node %u)",
+            (errmsg("epoch: abort_csn_set overflow for epoch %lu (csn %lu node %u, capacity %u)",
                 epochId,
                 csn,
-                serverId)));
+                serverId,
+                g_epochAbortCsnBank->entries_per_slot)));
         return;
     }
-    slot->entries[idx].csn.store(csn, std::memory_order_release);
-    slot->entries[idx].server_id.store(serverId, std::memory_order_release);
+    EpochAbortCsnEntry* entries = EpochAbortCsnSlotEntries(slot_hdr);
+    entries[idx].csn = csn;
+    entries[idx].server_id = serverId;
+    slot_hdr->count.store(idx + 1, std::memory_order_release);
+    SpinLockRelease(&slot_hdr->lock);
 }
 
 bool EpochAbortCsnContains(uint64_t epochId, uint64_t csn, uint32_t serverId)
 {
-    if (csn == 0) {
+    if (csn == 0 || g_epochAbortCsnBank == nullptr) {
         return false;
     }
-    EpochSharedState* state = EpochGetSharedState();
-    if (state == nullptr) {
-        return false;
-    }
+
     uint32_t slot_idx = EpochAbortSlotIndex(epochId);
-    if (slot_idx >= EPOCH_DEFAULT_CACHE_SLOTS) {
+    EpochSharedState* state = EpochGetSharedState();
+    if (state != nullptr &&
+        state->counters.slot_epoch[slot_idx].load(std::memory_order_acquire) != epochId) {
         return false;
     }
-    if (state->counters.slot_epoch[slot_idx].load(std::memory_order_acquire) != epochId) {
+
+    EpochAbortCsnSlotHeader* slot_hdr = EpochAbortCsnSlotHeaderAt(slot_idx);
+    if (slot_hdr == nullptr) {
         return false;
     }
-    EpochAbortCsnSlot* slot = &state->abort_csns.slots[slot_idx];
-    uint32_t n = slot->count.load(std::memory_order_acquire);
-    if (n > EPOCH_ABORT_CSNS_PER_SLOT) {
-        n = EPOCH_ABORT_CSNS_PER_SLOT;
+
+    SpinLockAcquire(&slot_hdr->lock);
+    uint32_t n = slot_hdr->count.load(std::memory_order_acquire);
+    if (n > g_epochAbortCsnBank->entries_per_slot) {
+        n = g_epochAbortCsnBank->entries_per_slot;
     }
+    EpochAbortCsnEntry* entries = EpochAbortCsnSlotEntries(slot_hdr);
     for (uint32_t i = 0; i < n; ++i) {
-        uint64_t ec = slot->entries[i].csn.load(std::memory_order_acquire);
-        uint32_t es = slot->entries[i].server_id.load(std::memory_order_acquire);
-        if (ec == csn && es == serverId) {
+        if (entries[i].csn == csn && entries[i].server_id == serverId) {
+            SpinLockRelease(&slot_hdr->lock);
             return true;
         }
     }
+    SpinLockRelease(&slot_hdr->lock);
     return false;
+}
+
+void EpochAbortCsnRecordMergeOutcome(uint64_t epochId, const E_WireTxn& txn, const E_CrdtMergeOutcome& outcome)
+{
+    for (const auto& aborted : outcome.aborted_txns) {
+        EpochAbortCsnInsert(epochId, aborted.first, aborted.second);
+    }
+    if (!outcome.txn_accepted) {
+        EpochAbortCsnInsert(epochId, txn.csn, txn.server_id);
+        bool in_abort = EpochAbortCsnContains(epochId, txn.csn, txn.server_id);
+        EpochDiagLogMergeLoserAbortCsn(epochId, txn.csn, txn.server_id, false, in_abort);
+    }
 }

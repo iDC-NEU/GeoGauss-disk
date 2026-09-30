@@ -53,7 +53,7 @@ static bool EpochParseDnRowKey(const std::string& key, E_WireRow* row)
 DnRaftEntry EpochDynNetWireToRaftEntry(const E_WireTxn& txn)
 {
     DnRaftEntry entry;
-    entry.epoch = static_cast<int32_t>(txn.commit_epoch);
+    entry.epoch = static_cast<int32_t>(txn.epoch);
     entry.type = txn.rows.empty() ? DnEntryType::NOOP : DnEntryType::WRITE;
     entry.index = 0;
     entry.term = 0;
@@ -79,8 +79,7 @@ E_WireTxn EpochDynNetDnTxnToWire(const DnTransaction& txn, int32_t epoch)
 {
     E_WireTxn wire;
     wire.csn = txn.client_txn_id;
-    wire.start_epoch = static_cast<uint64_t>(epoch);
-    wire.commit_epoch = static_cast<uint64_t>(epoch);
+    wire.epoch = static_cast<uint64_t>(epoch);
     wire.server_id = txn.origin_node_id;
     wire.txn_state = EPOCH_TXN_COMMIT;
 

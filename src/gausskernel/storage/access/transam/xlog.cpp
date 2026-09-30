@@ -72,6 +72,7 @@
 #endif
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
+#include "epoch/e_statistician.h"
 #ifdef PGXC
 #include "pgxc/barrier.h"
 #endif
@@ -3477,6 +3478,10 @@ void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 
 void XLogWaitFlush(XLogRecPtr recptr)
 {
+    if (EpochShouldSkipBackendWal()) {
+        return;
+    }
+
     /*
      * During REDO, we are reading not writing WAL.
      *

@@ -41,6 +41,7 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "catalog/pg_partition_fn.h"
+#include "epoch/e_heap_version.h"
 #include "commands/cluster.h"
 #include "executor/exec/execdebug.h"
 #include "executor/node/nodeBitmapHeapscan.h"
@@ -558,9 +559,15 @@ bool heapam_scan_bitmap_next_block(TableScanDesc scan, TBMIterateResult* tbmres,
             HeapTupleData heapTuple;
 
             ItemPointerSet(&tid, page, offnum);
-            if (heap_hot_search_buffer(&tid, hscan->rs_base.rs_rd, buffer, snapshot, &heapTuple, NULL, NULL, true,
-                                       has_cur_xact_write))
-                hscan->rs_base.rs_vistuples[ntup++] = ItemPointerGetOffsetNumber(&tid);
+            ItemPointerData chain_root = tid;
+            if (heap_hot_search_buffer(&tid, hscan->rs_base.rs_rd, buffer, snapshot, &heapTuple,
+                &hscan->rs_ctbuf_hdr, NULL, true, has_cur_xact_write)) {
+                (void)EpochHeapMaterializeLatestRead(hscan->rs_base.rs_rd, &chain_root, &heapTuple,
+                    &hscan->rs_ctbuf_hdr);
+                if (ItemPointerGetBlockNumber(&heapTuple.t_self) == page) {
+                    hscan->rs_base.rs_vistuples[ntup++] = ItemPointerGetOffsetNumber(&heapTuple.t_self);
+                }
+            }
         }
     } else {
         /*
@@ -587,6 +594,9 @@ bool heapam_scan_bitmap_next_block(TableScanDesc scan, TBMIterateResult* tbmres,
             HeapTupleCopyBaseFromPage(&loctup, dp);
             ItemPointerSet(&loctup.t_self, page, offnum);
             valid = HeapTupleSatisfiesVisibility(&loctup, snapshot, buffer);
+            if (valid && EpochHeapIsSupersededVersion(hscan->rs_base.rs_rd, loctup.t_data, &loctup.t_self)) {
+                valid = false;
+            }
             if (valid) {
                 hscan->rs_base.rs_vistuples[ntup++] = offnum;
                 PredicateLockTuple(hscan->rs_base.rs_rd, &loctup, snapshot);

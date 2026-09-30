@@ -7,34 +7,140 @@
 #include "epoch/e_node_manager.h"
 #include "epoch/e_shmem.h"
 #include "epoch/e_pipeline.h"
+#include "epoch/e_merge_pool.h"
+#include "epoch/e_epoch_lifecycle.h"
 #include "epoch/e_statistician.h"
 #include "epoch/e_perf.h"
 
+#include <unordered_map>
+
 #include "miscadmin.h"
+
+#include "portability/instr_time.h"
 
 static void EpochMaybeWriteOffStaleChangeSet(uint64_t epoch);
 
+/* physical assign 计数（含 since=0）连续不变超过该时长，视为无客户端，允许未满 limit 也推进 physical */
+static constexpr long EPOCH_PHYSICAL_TXN_IDLE_MS = 1000;
+
+static uint64_t g_physical_txn_idle_last_since = UINT64_MAX;
+static instr_time g_physical_txn_idle_last_change;
+static bool g_physical_txn_idle_tracker_inited = false;
+
+static bool EpochPhysicalTxnAssignIdleReady(uint64_t since, uint64_t limit)
+{
+    if (since >= limit) {
+        g_physical_txn_idle_last_since = since;
+        INSTR_TIME_SET_CURRENT(g_physical_txn_idle_last_change);
+        g_physical_txn_idle_tracker_inited = true;
+        return false;
+    }
+
+    instr_time now;
+    INSTR_TIME_SET_CURRENT(now);
+    if (!g_physical_txn_idle_tracker_inited || since != g_physical_txn_idle_last_since) {
+        g_physical_txn_idle_last_since = since;
+        g_physical_txn_idle_last_change = now;
+        g_physical_txn_idle_tracker_inited = true;
+        return false;
+    }
+
+    instr_time delta = now;
+    INSTR_TIME_SUBTRACT(delta, g_physical_txn_idle_last_change);
+    return INSTR_TIME_GET_MILLISEC(delta) >= EPOCH_PHYSICAL_TXN_IDLE_MS;
+}
+
+static void EpochPhysicalTxnIdleTrackerReset(void)
+{
+    g_physical_txn_idle_last_since = UINT64_MAX;
+    g_physical_txn_idle_tracker_inited = false;
+}
+
 void EpochAdvancePhysicalOnce(void)
 {
-    if (g_enable_epoch_multimaster && EpochGetTotalNodes() > 1) {
+    if (!g_enable_epoch_multimaster) {
+        return;
+    }
+
+    if (EpochGetTotalNodes() > 1) {
         uint64_t physical = E_NodeManager::GetPhysicalEpoch();
         uint64_t logical = E_NodeManager::GetLogicalEpoch();
         uint64_t gap = (physical > logical) ? (physical - logical) : 0;
-        uint64_t limit = EpochGetPhysLogicalGapLimit();
-
-        if (gap >= limit) {
+        if (gap >= EpochGetPhysLogicalGapLimit()) {
             return;
         }
-        /*
-         * logical 关窗因 change_set_pending 卡住时，禁止继续推高 physical，
-         * 否则新事务 START gate 的 commit_epoch 远超 logical，形成不可恢复自旋。
-         */
         if (EpochLogicalEpochHasPendingPack(logical)) {
             return;
         }
     }
+
+    if (g_epoch_physical_txns_per_epoch > 0) {
+        EpochSharedState* state = EpochGetSharedState();
+        if (state == nullptr) {
+            return;
+        }
+        const uint64_t txn_limit = static_cast<uint64_t>(g_epoch_physical_txns_per_epoch);
+        const uint64_t since = state->physical_txn_since_advance.load(std::memory_order_acquire);
+        const bool idle_force = EpochPhysicalTxnAssignIdleReady(since, txn_limit);
+        if (since < txn_limit && !idle_force) {
+            return;
+        }
+        const uint64_t from_epoch = E_NodeManager::GetPhysicalEpoch();
+        EpochRecvDiagLogPhysicalAdvance(from_epoch, from_epoch + 1, since, txn_limit, idle_force ? 1 : 0);
+        (void)E_NodeManager::AddPhysicalEpoch();
+        state->physical_txn_since_advance.store(0, std::memory_order_release);
+        EpochPhysicalTxnIdleTrackerReset();
+        EpochPerfNotePhysicalAdvance();
+        return;
+    }
+
     (void)E_NodeManager::AddPhysicalEpoch();
     EpochPerfNotePhysicalAdvance();
+}
+
+void EpochAdvancePhysicalBurst(void)
+{
+    EpochAdvancePhysicalOnce();
+}
+
+uint64_t EpochGetPhysicalTxnSinceAdvance(void)
+{
+    if (!g_enable_epoch_multimaster || g_epoch_physical_txns_per_epoch <= 0) {
+        return 0;
+    }
+    EpochSharedState* state = EpochGetSharedState();
+    if (state == nullptr) {
+        return 0;
+    }
+    return state->physical_txn_since_advance.load(std::memory_order_acquire);
+}
+
+bool EpochTryReservePhysicalTxnSlot(uint64_t* out_slot_num)
+{
+    if (!g_enable_epoch_multimaster || g_epoch_physical_txns_per_epoch <= 0) {
+        if (out_slot_num != nullptr) {
+            *out_slot_num = 0;
+        }
+        return true;
+    }
+    EpochSharedState* state = EpochGetSharedState();
+    if (state == nullptr) {
+        return false;
+    }
+    const uint64_t limit = static_cast<uint64_t>(g_epoch_physical_txns_per_epoch);
+    for (;;) {
+        uint64_t cur = state->physical_txn_since_advance.load(std::memory_order_acquire);
+        if (cur >= limit) {
+            return false;
+        }
+        if (state->physical_txn_since_advance.compare_exchange_weak(
+                cur, cur + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            if (out_slot_num != nullptr) {
+                *out_slot_num = cur + 1;
+            }
+            return true;
+        }
+    }
 }
 
 bool EpochIsLogicalReady(uint64_t logicalEpoch)
@@ -47,21 +153,7 @@ bool EpochIsLogicalReady(uint64_t logicalEpoch)
     return physical > logicalEpoch + delay;
 }
 
-static bool EpochAllNodesReceiveCompleted(uint64_t epochId)
-{
-    uint32_t totalNodes = EpochGetTotalNodes();
-    for (uint32_t node = 0; node < totalNodes; ++node) {
-        if (node != EpochGetNodeId() && !EpochPeerIsConnected(node)) {
-            return false;
-        }
-        if (!E_NodeManager::IsNodeReceiveCompleted(epochId, node)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-static bool EpochAllNodesSendCompleted(uint64_t epochId)
+bool EpochAllNodesSendCompleted(uint64_t epochId)
 {
     uint32_t totalNodes = EpochGetTotalNodes();
     for (uint32_t node = 0; node < totalNodes; ++node) {
@@ -75,188 +167,44 @@ static bool EpochAllNodesSendCompleted(uint64_t epochId)
     return true;
 }
 
-/* GeoGauss: change_set（仅写）<= produce + abort */
+/* change_set（仅写）<= pack + abort */
 bool EpochLocalTxnExcComplete(uint64_t epochId)
 {
     uint32_t node_id = EpochGetNodeId();
     uint64_t change_set = E_NodeManager::GetChangeSetTxnCounters(epochId, node_id);
-    uint64_t produced = E_NodeManager::GetLocalProduceTxnCounters(epochId, node_id);
-    uint64_t aborts = E_NodeManager::GetAbortTxnCounters(epochId, node_id);
-    return change_set <= produced + aborts;
-}
-
-static bool EpochLocalCommitPathComplete(uint64_t epochId)
-{
-    uint32_t node_id = EpochGetNodeId();
-    uint64_t merged = E_NodeManager::GetMergedTxnCounters(epochId, node_id);
-    uint64_t committed = E_NodeManager::GetCommittedTxnCounters(epochId, node_id);
-    /*
-     * Async best-effort：只要求 merge/apply 计数对齐即可关窗；pack/produce/record
-     * 由 heal 补齐，避免 abort 计数漂移导致 commit_path_incomplete 永久卡住。
-     */
-    if (EpochIsAsyncMultimasterMode()) {
-        return merged <= committed;
-    }
     uint64_t packed = E_NodeManager::GetLocalPackTxnCounters(epochId, node_id);
-    uint64_t produced = E_NodeManager::GetLocalProduceTxnCounters(epochId, node_id);
-    uint64_t record_commit = E_NodeManager::GetLocalRecordCommitCounters(epochId, node_id);
-    if (packed > 0 && produced < packed) {
-        return false;
-    }
-    if (packed > 0 && record_commit < packed) {
-        uint64_t write_abort_after = E_NodeManager::GetWriteAbortAfterSendTxnCounters(epochId, node_id);
-        if (record_commit + write_abort_after < packed) {
-            return false;
-        }
-    }
-    if (merged > committed) {
-        return false;
-    }
-    return true;
+    uint64_t aborts = E_NodeManager::GetAbortTxnCounters(epochId, node_id);
+    return change_set <= packed + aborts;
 }
 
-static void EpochAsyncHealLocalCommitCounters(uint64_t epoch, uint32_t node_id)
+static void EpochHealLocalTxnExc(uint64_t epoch, uint32_t node_id)
 {
-    if (!EpochIsAsyncMultimasterMode()) {
-        return;
-    }
-    uint64_t packed = E_NodeManager::GetLocalPackTxnCounters(epoch, node_id);
-    while (E_NodeManager::GetLocalProduceTxnCounters(epoch, node_id) < packed) {
-        E_NodeManager::IncLocalProduceTxnCounters(epoch, node_id);
-    }
-    while (E_NodeManager::GetLocalRecordCommitCounters(epoch, node_id) < packed) {
-        E_NodeManager::IncLocalRecordCommitCounters(epoch, node_id);
-        E_NodeManager::IncLocalRecordCommittedCounters(epoch, node_id);
-    }
-}
-
-static void EpochAsyncAlignMergedCommitted(uint64_t epoch, uint32_t node_id)
-{
-    if (!EpochIsAsyncMultimasterMode()) {
-        return;
-    }
-    uint64_t merged = E_NodeManager::GetMergedTxnCounters(epoch, node_id);
-    while (E_NodeManager::GetCommittedTxnCounters(epoch, node_id) < merged) {
-        E_NodeManager::IncCommittedTxnCounters(epoch, node_id);
-    }
-}
-
-static void EpochAsyncHealLocalTxnExc(uint64_t epoch, uint32_t node_id)
-{
-    if (!EpochIsAsyncMultimasterMode()) {
+    if (!EpochIsSyncBackgroundWorkerCommit()) {
         return;
     }
     EpochMaybeWriteOffStaleChangeSet(epoch);
     uint64_t change_set = E_NodeManager::GetChangeSetTxnCounters(epoch, node_id);
-    uint64_t produced = E_NodeManager::GetLocalProduceTxnCounters(epoch, node_id);
+    uint64_t packed = E_NodeManager::GetLocalPackTxnCounters(epoch, node_id);
     uint64_t aborts = E_NodeManager::GetAbortTxnCounters(epoch, node_id);
-    while (change_set > produced + aborts) {
+    while (change_set > packed + aborts) {
         E_NodeManager::IncAbortTxnCounters(epoch, node_id);
         aborts++;
     }
-}
-
-static bool EpochLocalRecordApplied(uint64_t epochId)
-{
-    uint32_t node_id = EpochGetNodeId();
-    uint64_t record_committed = E_NodeManager::GetLocalRecordCommittedCounters(epochId, node_id);
-    uint64_t record_commit = E_NodeManager::GetLocalRecordCommitCounters(epochId, node_id);
-    uint64_t write_abort_after = E_NodeManager::GetWriteAbortAfterSendTxnCounters(epochId, node_id);
-    /*
-     * COMMIT 已 IncLocalRecordCommit 但 RECORD_COMMIT 前 revalidate 失败/aborted 的路径
-     * 只计 write_abort_after，不会 IncLocalRecordCommitted。
-     */
-    return record_committed + write_abort_after >= record_commit;
-}
-
-/*
- * GeoGauss 用 merged 与 should_receive 对齐；本实现 merged 仅统计含写且 CRDT 接受的 txn，
- * 只读/merge 输家 wire 仍计入 pack/recv。merge 在 OnRemoteTxnReceived 中与 recv 同步完成，
- * 故以 peer recv 对齐为准，不能用 merged >= pack。
- */
-static bool EpochRemoteMergeReady(uint64_t epochId)
-{
-    if (EpochGetTotalNodes() <= 1) {
-        return true;
-    }
-    uint32_t node_id = EpochGetNodeId();
-    uint32_t total = EpochGetTotalNodes();
-    for (uint32_t n = 0; n < total; ++n) {
-        if (n == node_id) {
-            continue;
-        }
-        if (!EpochPeerIsConnected(n)) {
-            return false;
-        }
-        uint64_t should = E_NodeManager::GetStoreShouldReceivedPackCounters(epochId, n);
-        uint64_t received = E_NodeManager::GetStoreReceivedPackCounters(epochId, n);
-        if (received < should) {
-            return false;
-        }
-    }
-    return true;
-}
-
-/*
- * GeoGauss mot_internal.cpp:3257「Merge结束 开始Commit」：
- * 仅在 commit 路径就绪后短暂置 record_committed=false，并在同函数内等到
- * record 落盘计数对齐；若本轮未凑齐必须恢复 true，避免 START gate 永久冻住连接。
- * 返回 true 表示可 AddLogicalEpoch。
- */
-static bool EpochTryFinishCommitPhase(uint64_t targetEpoch)
-{
-    if (!EpochLocalCommitPathComplete(targetEpoch)) {
-        return false;
-    }
-
-    /*
-     * Async：produce/record_commit/record_committed 均在 COMMIT pack 时入账，
-     * 无 backend 等 record_committed gate；勿在此自旋，否则 logical 卡死。
-     */
-    if (EpochIsAsyncMultimasterMode()) {
-        return true;
-    }
-
-    E_NodeManager::SetRecordCommitted(false);
-    E_NodeManager::SetRemoteRecordCommitted(false);
-
-    static const int kRecordSpin = 500;
-    for (int spin = 0; spin < kRecordSpin && !EpochLocalRecordApplied(targetEpoch); ++spin) {
-        pg_usleep(200L);
-    }
-    if (!EpochLocalRecordApplied(targetEpoch)) {
-        E_NodeManager::SetRecordCommitted(true);
-        EpochRecvDiagLogStall(targetEpoch, "record_incomplete");
-        return false;
-    }
-    return true;
-}
-
-bool EpochIsRemoteMergeReady(uint64_t epochId)
-{
-    if (!g_enable_epoch_multimaster || EpochGetTotalNodes() <= 1) {
-        return true;
-    }
-    if (!EpochAllNodesSendCompleted(epochId)) {
-        return false;
-    }
-    return EpochAllNodesReceiveCompleted(epochId);
 }
 
 static void EpochMaybeWriteOffStaleChangeSet(uint64_t epoch)
 {
     uint32_t node_id = EpochGetNodeId();
     uint64_t change_set = E_NodeManager::GetChangeSetTxnCounters(epoch, node_id);
-    uint64_t produced = E_NodeManager::GetLocalProduceTxnCounters(epoch, node_id);
+    uint64_t packed = E_NodeManager::GetLocalPackTxnCounters(epoch, node_id);
     uint64_t aborts = E_NodeManager::GetAbortTxnCounters(epoch, node_id);
     uint64_t write_abort_after = E_NodeManager::GetWriteAbortAfterSendTxnCounters(epoch, node_id);
     uint64_t abort_net = (aborts > write_abort_after) ? (aborts - write_abort_after) : 0;
     uint64_t should_send = (change_set > abort_net) ? (change_set - abort_net) : 0;
-    uint64_t packed = E_NodeManager::GetLocalPackTxnCounters(epoch, node_id);
     if (should_send > 0 && packed < should_send) {
         return;
     }
-    if (change_set <= produced + aborts) {
+    if (change_set <= packed + aborts) {
         return;
     }
     uint64_t physical = E_NodeManager::GetPhysicalEpoch();
@@ -265,10 +213,22 @@ static void EpochMaybeWriteOffStaleChangeSet(uint64_t epoch)
     if (gap < EpochGetPhysLogicalGapLimit()) {
         return;
     }
-    uint64_t orphan = change_set - produced - aborts;
+    uint64_t orphan = change_set - packed - aborts;
     for (uint64_t i = 0; i < orphan; ++i) {
         E_NodeManager::IncAbortTxnCounters(epoch, node_id);
     }
+}
+
+bool EpochIsLocalCommitStageReady(uint64_t epoch)
+{
+    EpochMaybeWriteOffStaleChangeSet(epoch);
+    if (EpochLocalTxnExcComplete(epoch)) {
+        return true;
+    }
+    if (EpochIsSyncBackgroundWorkerCommit()) {
+        EpochHealLocalTxnExc(epoch, EpochGetNodeId());
+    }
+    return EpochLocalTxnExcComplete(epoch);
 }
 
 bool EpochTryAdvanceLogical(void)
@@ -291,125 +251,35 @@ bool EpochTryAdvanceLogical(void)
             return false;
         }
         E_NodeManager::AddLogicalEpoch();
-        E_NodeManager::SetRecordCommitted(true);
         E_NodeManager::ClearEpochSlot(targetEpoch);
         EpochPerfNoteLogicalAdvanceOk();
         return true;
     }
 
-    if (!EpochAllPeersConnected()) {
-        EpochRecvDiagLogStall(targetEpoch, "peer_not_connected");
-        return false;
-    }
+    EpochLogicalAdvanceTraceReset(targetEpoch);
 
-    {
-        uint32_t self = EpochGetNodeId();
-        uint32_t total = EpochGetTotalNodes();
-        for (uint32_t peer = 0; peer < total; ++peer) {
-            if (peer == self) {
-                continue;
-            }
-            if (targetEpoch > EpochGetPeerMaxSealedEpoch(peer) + 2) {
-                EpochRecvDiagLogStall(targetEpoch, "peer_lag");
-                return false;
-            }
-        }
-    }
-
-    /* GeoGauss 1: physical > logical + delay */
-    if (!EpochIsLogicalReady(targetEpoch)) {
-        EpochRecvDiagLogStall(targetEpoch, "physical_not_ready");
+    if (!EpochPipelineAllStagesReady(targetEpoch)) {
+        EpochPipelineNoteLogicalAdvanceStall(targetEpoch);
         return false;
     }
 
     /*
-     * GeoGauss commit 阶段：对端 recv/merge 就绪后 SetRemoteExeced，backend 在
-     * self seal 前 WaitForRemoteExeced → pack/produce。
-     * 本端 recv 在 seal 后才完成，此处不能要求 self recv，否则 recv_incomplete
-     * 永久成立 → chg=N pack=0 → SEAL_BLOCK change_set_pending。
+     * AllStagesReady 已含 merge_complete(target)。必须在 ClearStageFlags 之前把
+     * merge_epoch 推过本 epoch：否则 Clear 抹掉 merge_complete 后，
+     * MaybeAdvanceMergeEpoch 永远看到 false，merge_epoch 永久卡在已清空的格
+     * （实测 node3：merge_epoch=1、logical=2 → peer epoch-end 断档 → 对端 Assign 槽满）。
+     * 这里只是 merge_complete 之后的 ++，不是按 logical Ensure。
      */
-    if (!EpochIsAllPeersReceiveCompleted(targetEpoch)) {
-        EpochRecvDiagLogStall(targetEpoch, "recv_incomplete");
-        return false;
-    }
-    if (!EpochRemoteMergeReady(targetEpoch)) {
-        EpochRecvDiagLogStall(targetEpoch, "merge_incomplete");
-        return false;
-    }
-    if (!E_NodeManager::IsRemoteExeced()) {
-        E_NodeManager::SetRemoteExeced(true);
+    if (!EpochMergePoolUsesInlineMerge()) {
+        (void)EpochMergePoolTryAdvanceMergeEpoch(targetEpoch);
     }
 
-    /* GeoGauss 2: 写 change_set 已全部 produce/abort（remote_exec 已开，backend 可 pack） */
-    EpochMaybeWriteOffStaleChangeSet(targetEpoch);
-    if (!EpochLocalTxnExcComplete(targetEpoch)) {
-        if (EpochIsAsyncMultimasterMode()) {
-            EpochAsyncHealLocalTxnExc(targetEpoch, EpochGetNodeId());
-        } else {
-            EpochRecvDiagLogStall(targetEpoch, "local_commit_pending");
-            return false;
-        }
-    }
-
-    /* GeoGauss 3: seal 当前 logical epoch（TrySealEpoch 内处理 executing 与对端握手互锁） */
-    EpochMaybeInvalidateStaleSeal(targetEpoch);
-    if (!E_NodeManager::IsNodeSendCompleted(targetEpoch, EpochGetNodeId())) {
-        (void)EpochTrySealEpoch(targetEpoch);
-    }
-
-    if (!EpochAllNodesSendCompleted(targetEpoch)) {
-        EpochRecvDiagLogStall(targetEpoch, "send_incomplete");
-        return false;
-    }
-
-    {
-        uint32_t self = EpochGetNodeId();
-        uint64_t packed = E_NodeManager::GetLocalPackTxnCounters(targetEpoch, self);
-        uint64_t sealed = E_NodeManager::GetSealedPackTxnCounters(targetEpoch, self);
-        EpochMaybeInvalidateStaleSeal(targetEpoch);
-        if (packed != sealed) {
-            (void)EpochTrySealEpoch(targetEpoch);
-            sealed = E_NodeManager::GetSealedPackTxnCounters(targetEpoch, self);
-            if (packed != sealed) {
-                EpochRecvDiagLogStall(targetEpoch, "reseal_pending");
-                return false;
-            }
-        }
-        if (!E_NodeManager::IsNodeSendCompleted(targetEpoch, self)) {
-            EpochRecvDiagLogStall(targetEpoch, "reseal_pending");
-            return false;
-        }
-    }
-
-    if (!EpochIsAllPeersReceiveCompleted(targetEpoch)) {
-        EpochRecvDiagLogStall(targetEpoch, "recv_incomplete");
-        return false;
-    }
-
-    /*
-     * Poll 里 ApplyReadyEpochs 往往早于 self seal，recv 未齐时跳过 apply →
-     * merged>0 但 committed 恒 0 → commit_path_incomplete。关窗前再 apply 一次。
-     */
-    (void)EpochPipelineTryApplyMergedEpoch(targetEpoch);
-    if (EpochIsAsyncMultimasterMode()) {
-        EpochAsyncHealLocalCommitCounters(targetEpoch, EpochGetNodeId());
-        EpochAsyncAlignMergedCommitted(targetEpoch, EpochGetNodeId());
-    }
-
-    if (!EpochLocalCommitPathComplete(targetEpoch)) {
-        EpochRecvDiagLogStall(targetEpoch, "commit_path_incomplete");
-        return false;
-    }
-    if (!EpochTryFinishCommitPhase(targetEpoch)) {
-        return false;
-    }
-
-    E_NodeManager::SetRemoteExeced(false);
-    E_NodeManager::SetRemoteRecordCommitted(false);
     E_NodeManager::AddLogicalEpoch();
-    E_NodeManager::SetRecordCommitted(true);
+    EpochLifecycleEmitOnAdvance(targetEpoch);
     E_NodeManager::ClearEpochSlot(targetEpoch);
+    EpochPipelineClearStageFlags(targetEpoch);
     EpochPerfNoteLogicalAdvanceOk();
+    EpochLogicalAdvanceTraceOnOk(targetEpoch);
     return true;
 }
 
@@ -420,26 +290,10 @@ bool EpochWaitForCommitGate(uint64_t commitEpoch)
     }
 
     /*
-     * GeoGauss is_sync_exec COMMIT gate:
-     * commit_epoch <= logical && record_committed.
+     * GeoGauss is_sync_exec COMMIT gate: commit_epoch <= logical.
      */
     const long waitUs = 200;
-    while (commitEpoch > E_NodeManager::GetLogicalEpoch() ||
-           !E_NodeManager::IsRecordCommitted()) {
-        pg_usleep(waitUs);
-        CHECK_FOR_INTERRUPTS();
-    }
-    return true;
-}
-
-bool EpochWaitForRemoteMerge(uint64_t commitEpoch)
-{
-    if (!g_enable_epoch_multimaster) {
-        return true;
-    }
-
-    const long waitUs = 200;
-    while (!EpochIsRemoteMergeReady(commitEpoch)) {
+    while (commitEpoch > E_NodeManager::GetLogicalEpoch()) {
         pg_usleep(waitUs);
         CHECK_FOR_INTERRUPTS();
     }
@@ -460,47 +314,14 @@ bool EpochWaitForLogicalPast(uint64_t commitEpoch)
     return true;
 }
 
-bool EpochWaitForSyncCommit(uint64_t commitEpoch)
-{
-    (void)commitEpoch;
-    /*
-     * GeoGauss 同步等待在 RECORD_COMMIT 之后、END 里 EndTransaction 之后
-     * 等待 remote_record_committed。
-     */
-    return true;
-}
-
-bool EpochWaitForRecordCommitted(uint64_t commitEpoch)
-{
-    if (!g_enable_epoch_multimaster || EpochGetTotalNodes() <= 1) {
-        return true;
-    }
-    uint32_t self = EpochGetNodeId();
-    for (uint32_t node = 0; node < EpochGetTotalNodes(); ++node) {
-        if (node != self && !EpochPeerIsConnected(node)) {
-            return true;
-        }
-    }
-    const long waitUs = 200;
-    while (!E_NodeManager::IsRemoteRecordCommitted()) {
-        (void)commitEpoch;
-        pg_usleep(waitUs);
-        CHECK_FOR_INTERRUPTS();
-    }
-    return true;
-}
-
 uint64_t EpochAssignTxnEpoch(void)
 {
     if (!g_enable_epoch_multimaster) {
         return 0;
     }
     /*
-     * GeoGauss 用 physical 发号；cap 到 logical+gap_limit 避免重启后 physical 远超 logical。
-     * sync START/COMMIT gate 要求 commit_epoch <= logical，事务在 gate 自旋直到 logical 追上。
+     * GeoGauss：直接用 physical 发号。physical 领先 logical 的上限由
+     * EpochAdvancePhysicalOnce 的 gap_limit 背压保证；sync START gate 再约束执行时机。
      */
-    uint64_t physical = E_NodeManager::GetPhysicalEpoch();
-    uint64_t logical = E_NodeManager::GetLogicalEpoch();
-    uint64_t cap = logical + EpochGetPhysLogicalGapLimit();
-    return (physical > cap) ? cap : physical;
+    return E_NodeManager::GetPhysicalEpoch();
 }

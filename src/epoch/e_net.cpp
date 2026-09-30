@@ -2,6 +2,7 @@
 
 #include "epoch/e_net.h"
 #include "epoch/e_config.h"
+#include "epoch/e_log_path.h"
 #include "epoch/e_statistician.h"
 #include "epoch/e_types.h"
 #include "epoch/e_txn_wire.h"
@@ -79,6 +80,7 @@ static int EpochNodeDirectPort(uint32_t node_id)
 
 static void EpochListenLoop(void)
 {
+    EpochSetAuxThreadName("epochlisten");
     zmq::pollitem_t items[32];
     int item_count = 0;
     for (size_t i = 0; i < g_zmq_subs.size() && item_count < 31; ++i) {
@@ -154,8 +156,7 @@ static bool EpochNetBuildHelloPayload(std::string* out)
     }
     E_WireTxn hello;
     hello.csn = 0;
-    hello.start_epoch = 0;
-    hello.commit_epoch = 0;
+    hello.epoch = 0;
     hello.server_id = EpochGetNodeId();
     hello.txn_state = EPOCH_TXN_EMPTY;
     return E_WireSerializeTxn(hello, out);
@@ -191,6 +192,11 @@ void EpochNetMaybePublishHello(void)
         return;
     }
     EpochNetPublishHello();
+}
+
+bool EpochNetIsReady(void)
+{
+    return g_net_running.load(std::memory_order_acquire);
 }
 
 bool EpochNetInit(void)

@@ -5,7 +5,9 @@
 #include "occ/occ_mem.h"
 #include "occ/o_txn.h"
 #include "occ/occ_internal.h"
+#include "occ/o_executor.h"
 #include "epoch/e_exec_track.h"
+#include "occ/o_global.h"
 
 #include "access/heapam.h"
 #include "utils/rel.h"
@@ -17,6 +19,7 @@ O_TxnManager::O_TxnManager(bool global)
       m_internalStmtCount(0),
       m_cachedRelCnt(0),
       m_shareCachedRelCnt(0),
+      m_deferredInsertSeq(0),
       m_global(global)
 {
 }
@@ -159,17 +162,37 @@ bool O_TxnManager::CheckUnique(const AccessType type, occ_sentinel const &origin
     return false;
 }
 
+static const char* OccAccessTypeTag(AccessType type)
+{
+    switch (type) {
+        case RD:
+            return "RD";
+        case RD_FOR_UPDATE:
+            return "RD_FOR_UPDATE";
+        case WR:
+            return "WR";
+        case DEL:
+            return "DEL";
+        case INS:
+            return "INS";
+        default:
+            return "INV";
+    }
+}
+
 RC O_TxnManager::AccessLookup(const AccessType type, occ_sentinel const &originalSentinel, HeapTuple &localRow)
 {
     if (type == INS || type == WR || type == DEL) {
-        EpochMaybeMarkTxnExecuting();
+        EpochEnsureTxnEpochOnAccess(true);
     }
+    EpochMaybeLogTxnProgress("OCC_ACCESS", OccAccessTypeTag(type));
     return m_accessMgr->AccessLookup(type, originalSentinel, localRow);
 }
 
 RC O_TxnManager::InsertRow(HeapTuple heap_tuple, occ_sentinel sentinel)
 {
-    EpochMaybeMarkTxnExecuting();
+    EpochEnsureTxnEpochOnAccess(true);
+    EpochMaybeLogTxnProgress("OCC_INSERT", "row");
     RC rc;
     m_accessMgr->GetInsertMgr()->ExecuteOptimisticInsert(heap_tuple, sentinel);
     return rc;
@@ -178,8 +201,9 @@ RC O_TxnManager::InsertRow(HeapTuple heap_tuple, occ_sentinel sentinel)
 RC O_TxnManager::UpdateLastRowState(AccessType state, bool update_index)
 {
     if (state == WR || state == DEL) {
-        EpochMaybeMarkTxnExecuting();
+        EpochEnsureTxnEpochOnAccess(true);
     }
+    EpochMaybeLogTxnProgress("OCC_UPDATE_STATE", OccAccessTypeTag(state));
     O_Access *ac = m_accessMgr->GetLastAccess();
     if (ac == nullptr) {
         return RC_ERROR;
@@ -218,7 +242,7 @@ void O_TxnManager::ReleaseOccLocks()
 bool O_TxnManager::RevalidateWriteSet()
 {
     m_occManager.SetActiveTxn(this);
-    bool ok = m_occManager.ValidateWriteSet(this);
+    bool ok = m_occManager.ValidateWriteSet(this, OCC_WSV_HEAP_NOWAIT);
     m_occManager.SetActiveTxn(nullptr);
     return ok;
 }
@@ -231,7 +255,8 @@ void O_TxnManager::CommitInternal()
 
 RC O_TxnManager::DeleteLastRow()
 {
-    EpochMaybeMarkTxnExecuting();
+    EpochEnsureTxnEpochOnAccess(true);
+    EpochMaybeLogTxnProgress("OCC_DELETE", "row");
     RC rc;
     O_Access *access = m_accessMgr->GetLastAccess();
     if (access == nullptr)
@@ -244,13 +269,18 @@ RC O_TxnManager::DeleteLastRow()
     return rc;
 }
 
+void O_TxnManager::PrepareWriteSetForPack()
+{
+    if (m_accessMgr != nullptr) {
+        m_accessMgr->WriteSetRemoveReadEntries();
+    }
+}
+
 RC O_TxnManager::ValidateCommit()
 {
-    RC res = RC_OK;
-    if (res == RC_OK)
-    {
-        res = m_occManager.ValidateOcc(this);
-    }
+    EpochMaybeLogTxnProgress("OCC_VALIDATE", "begin");
+    RC res = m_occManager.ValidateOcc(this);
+    EpochMaybeLogTxnProgress("OCC_VALIDATE", (res == RC_OK) ? "ok" : "fail");
 
     return res;
 }
@@ -278,6 +308,7 @@ inline void O_TxnManager::Cleanup()
 
     m_csn = INVALID_CSN;
     m_internalStmtCount = 0;
+    m_deferredInsertSeq = 0;
     m_occManager.CleanUp();
     O_ResetOccTxnMemory();
     /* 保留 txn_manager 供会话内复用，勿置 NULL（旧版 palloc 方案会随上下文回收悬空） */

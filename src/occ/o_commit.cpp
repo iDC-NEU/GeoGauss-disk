@@ -67,6 +67,14 @@ RC O_ValidateCommit()
     return txn->ValidateCommit();
 }
 
+void O_PrepareWriteSetForPack(void)
+{
+    O_TxnManager *txn = GetTxnManager();
+    if (txn != nullptr) {
+        txn->PrepareWriteSetForPack();
+    }
+}
+
 bool O_RevalidateWriteSet(void)
 {
     O_TxnManager *txn = u_sess->occ_cxt.txn_manager;

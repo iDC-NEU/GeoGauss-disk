@@ -223,6 +223,8 @@ static void knl_t_epoch_worker_init(knl_t_epoch_worker_context* epoch_worker_cxt
 {
     epoch_worker_cxt->got_SIGHUP = false;
     epoch_worker_cxt->shutdown_requested = false;
+    epoch_worker_cxt->apply_worker_id = -1;
+    epoch_worker_cxt->merge_worker_id = -1;
 }
 
 static void knl_t_shemem_ptr_init(knl_t_shemem_ptr_context* shemem_ptr_cxt)

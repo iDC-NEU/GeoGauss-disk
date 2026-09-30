@@ -1442,11 +1442,14 @@ void knl_u_occ_init(knl_u_occ_context* occ_cxt)
 void knl_u_epoch_init(knl_u_epoch_context* epoch_cxt)
 {
     Assert(epoch_cxt != NULL);
-    epoch_cxt->start_epoch = 0;
-    epoch_cxt->commit_epoch = 0;
+    epoch_cxt->txn_epoch = 0;
     epoch_cxt->epoch_assigned = false;
     epoch_cxt->deferred_commit = false;
     epoch_cxt->epoch_exec_counted = false;
+    epoch_cxt->epoch_sync_heap_recorded = false;
+    epoch_cxt->epoch_procarray_ended = false;
+    epoch_cxt->read_frontier = 0;
+    epoch_cxt->read_frontier_pinned = false;
 }
 
 #ifdef USE_SPQ

@@ -6,13 +6,16 @@
 
 #include "postmaster/epoch_worker.h"
 #include "epoch/e_apply.h"
+#include "epoch/e_apply_pool.h"
+#include "epoch/e_apply_shmem.h"
 #include "epoch/e_config.h"
-#include "epoch/e_epoch.h"
-#include "epoch/e_dyn_net.h"
+#include "epoch/e_merge_pool.h"
+#include "epoch/e_log_path.h"
 #include "epoch/e_node_manager.h"
 #include "epoch/e_pipeline.h"
 #include "epoch/e_statistician.h"
 #include "epoch/e_perf.h"
+#include "epoch/e_epoch_lifecycle.h"
 
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -37,8 +40,9 @@ static void EpochWorkerShutdown(SIGNAL_ARGS);
  * 磁盘表等价路径：logical apply worker（主备逻辑复制）的 InitApplyWorker + replica 角色。
  * 参见 replication/logical/worker.cpp ApplyWorkerMain()。
  */
-static void EpochWorkerInitSession(void)
+void EpochWorkerInitApplySession(void)
 {
+    ResourceOwner worker_resowner = t_thrd.utils_cxt.CurrentResourceOwner;
     const char* dbname = (g_epoch_apply_database != nullptr && g_epoch_apply_database[0] != '\0')
         ? g_epoch_apply_database
         : "test";
@@ -69,12 +73,18 @@ static void EpochWorkerInitSession(void)
     u_sess->proc_cxt.MyProcPort->database_name = pstrdup(resolvedDbname);
     u_sess->proc_cxt.MyProcPort->user_name = pstrdup(username);
     (void)MemoryContextSwitchTo(oldctx);
+
+    /*
+     * InitApplyWorker 会 commit 初始化事务并把 CurrentResourceOwner 置 NULL。
+     * merge/epoch worker 的 heap bootstrap 读路径依赖 CurrentResourceOwner 管理
+     * TupleDesc 引用，但不走 backend 的 StartTransactionCommand。
+     */
+    if (worker_resowner != nullptr) {
+        t_thrd.utils_cxt.CurrentResourceOwner = worker_resowner;
+    }
 }
 
-static void EpochWorkerProcessQueue(void)
-{
-    EpochPipelinePoll();
-}
+static constexpr long EPOCH_WORKER_PIPELINE_IDLE_US = 200;
 
 void EpochWorkerMain(void)
 {
@@ -106,6 +116,7 @@ void EpochWorkerMain(void)
 #ifndef EXEC_BACKEND
     InitProcess();
 #endif
+    EpochLogPathInit();
 
     gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
     (void)gs_signal_unblock_sigusr2();
@@ -156,42 +167,62 @@ void EpochWorkerMain(void)
     t_thrd.utils_cxt.CurrentResourceOwner =
         ResourceOwnerCreate(NULL, "epoch worker", THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
-    EpochWorkerInitSession();
+    EpochWorkerInitApplySession();
+    E_ApplyWarmup();
 
     pgstat_report_appname("epoch worker");
     pgstat_report_activity(STATE_IDLE, NULL);
 
-    EpochPipelineInit();
-    OccStagingEnsureInit();
-    EpochDiagReset();
-    EpochRecvDiagReset();
-    EpochPerfReset();
-
-    int interval_ms = g_epoch_physical_interval_ms > 0 ? g_epoch_physical_interval_ms : 10;
+    /*
+     * Pack 活跃：本线程只做管理 Init/Shutdown，不跑 seal/发包/merge/apply。
+     * 无 Pack：本线程兼数据面（PollSendSeal）。
+     */
+    EpochPipelineBootstrapOwner();
 
     for (;;) {
         if (t_thrd.epoch_worker_cxt.got_SIGHUP) {
             t_thrd.epoch_worker_cxt.got_SIGHUP = false;
             ProcessConfigFile(PGC_SIGHUP);
-            interval_ms = g_epoch_physical_interval_ms > 0 ? g_epoch_physical_interval_ms : 10;
         }
         if (t_thrd.epoch_worker_cxt.shutdown_requested) {
             EpochPipelineShutdown();
             proc_exit(0);
         }
 
+        if (EpochPipelinePackSendActive()) {
+            /* 管理线程：仅待命，数据面已拆到 Pack/Send/Merge/Apply */
+            pgstat_report_activity(STATE_IDLE, NULL);
+            pg_usleep(EPOCH_WORKER_PIPELINE_IDLE_US);
+            continue;
+        }
+
         pgstat_report_activity(STATE_RUNNING, NULL);
-        EpochPerfNoteWorkerPoll();
-        EpochWorkerProcessQueue();
-        /* 每 tick 只推进一个 logical epoch，避免双节点 ZMQ 往返下一边狂飙、另一边 peer_send 永远追不上 */
-        (void)EpochTryAdvanceLogical();
-        EpochDiagMaybeReport();
-        EpochPerfMaybeReport();
-        EpochDynNetMaybeCatchup();
-        OccStagingFlusherTick();
-        EpochAdvancePhysicalOnce();
+
+        bool progress = EpochPipelinePollSendSeal();
+
         pgstat_report_activity(STATE_IDLE, NULL);
-        pg_usleep(static_cast<long>(interval_ms) * 1000L);
+        if (!progress) {
+            bool merge_done = false;
+            bool apply_done = false;
+            EpochPipelineReadStageFlagsForDiag(E_NodeManager::GetLogicalEpoch(),
+                nullptr,
+                nullptr,
+                nullptr,
+                &merge_done,
+                &apply_done);
+            if (merge_done && !apply_done) {
+                uint64_t apply_ep = EpochApplyPoolGetApplyEpoch();
+                if (apply_ep == 0) {
+                    apply_ep = E_NodeManager::GetLogicalEpoch();
+                }
+                if (EpochApplyQueueInflightForEpoch(apply_ep) == 0) {
+                    EpochLifecycleNoteApplyStarveTick(apply_ep);
+                }
+                pg_usleep(50L);
+            } else {
+                pg_usleep(EPOCH_WORKER_PIPELINE_IDLE_US);
+            }
+        }
     }
 }
 

@@ -9,7 +9,10 @@
 #include "occ/o_staging.h"
 #include "occ/occ_internal.h"
 
+#include "epoch/e_config.h"
+
 #include "utils/rel.h"
+#include "access/heapam.h"
 #include "access/xact.h"
 
 static Relation O_OpenAccessRelation(O_Access *access, bool *needClose)
@@ -106,7 +109,12 @@ void O_Access::WriteGlobalChanges(uint64_t csn, const occ_sentinel &key)
     }
     m_origSentinel.tuple_id = tid;
 
-    if (g_enable_occ_staging) {
+    /*
+     * Tip staging（g_epoch_local_tip_staging）：UPDATE/DELETE 只写 tip staging，
+     * 与 apply 共用 EpochTipStaging，避免本地 O_heap_update 把 tip 搬走后
+     * flush inplace 永远对着旧 root 失败。INSERT 仍走堆上 finalize。
+     */
+    if (g_enable_occ_staging || (g_epoch_local_tip_staging && m_type != INS)) {
         (void)O_StageAccessCommit(this, rel, &tid, csn);
         if (relClosed) {
             heap_close(rel, RowExclusiveLock);

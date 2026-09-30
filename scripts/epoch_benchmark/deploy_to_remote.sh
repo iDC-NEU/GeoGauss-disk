@@ -12,12 +12,15 @@ if [ -n "${LD_LIBRARY_PATH:-}" ] && [ -z "${EPOCH_DEPLOY_SANITIZED:-}" ]; then
         EPOCH_BENCH_ROOT="${EPOCH_BENCH_ROOT:-}" \
         EPOCH_PROFILE="${EPOCH_PROFILE:-}" \
         EPOCH_PHYS_LOGICAL_GAP_LIMIT="${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}" \
-        EPOCH_PHYSICAL_INTERVAL_MS="${EPOCH_PHYSICAL_INTERVAL_MS:-}" \
-        EPOCH_NODE0_IP="${EPOCH_NODE0_IP:-}" \
+        EPOCH_PHYSICAL_TXNS_PER_EPOCH="${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}" \
+        EPOCH_SYNC_START_GATE="${EPOCH_SYNC_START_GATE:-}" \
         EPOCH_NODE1_IP="${EPOCH_NODE1_IP:-}" \
         EPOCH_NODE2_IP="${EPOCH_NODE2_IP:-}" \
+        EPOCH_NODE3_IP="${EPOCH_NODE3_IP:-}" \
+        EPOCH_SKIP_NODE="${EPOCH_SKIP_NODE:-}" \
+        EPOCH_SKIP_NODE2="${EPOCH_SKIP_NODE2:-}" \
         EPOCH_REMOTE_USER="${EPOCH_REMOTE_USER:-}" \
-        EPOCH_REMOTE_BENCH_ROOT="${EPOCH_REMOTE_BENCH_ROOT:-}" \
+        EPOCH_NODE3_BENCH_ROOT="${EPOCH_NODE3_BENCH_ROOT:-}" \
         EPOCH_NODE2_REMOTE_USER="${EPOCH_NODE2_REMOTE_USER:-}" \
         EPOCH_NODE2_BENCH_ROOT="${EPOCH_NODE2_BENCH_ROOT:-}" \
         PATH="/usr/bin:/bin:/usr/local/bin" \
@@ -34,13 +37,16 @@ unset LD_LIBRARY_PATH
 NODE_ID="${1:-}"
 if [ -z "${NODE_ID}" ]; then
     echo "usage: $(basename "$0") REMOTE_NODE_ID" >&2
-    echo "  1 -> ${EPOCH_NODE1_IP} (${EPOCH_REMOTE_USER})" >&2
-    echo "  2 -> ${EPOCH_NODE2_IP} (${EPOCH_NODE2_REMOTE_USER})" >&2
+    echo "  2 -> node2 ${EPOCH_NODE2_IP} (${EPOCH_NODE2_REMOTE_USER})" >&2
+    echo "  3 -> node3 ${EPOCH_NODE3_IP} (${EPOCH_REMOTE_USER})" >&2
+    if [ "${EPOCH_SKIP_NODE:-0}" != "0" ]; then
+        echo "  (node${EPOCH_SKIP_NODE} skipped: EPOCH_SKIP_NODE=${EPOCH_SKIP_NODE})" >&2
+    fi
     exit 2
 fi
 validate_node_id "${NODE_ID}"
-if [ "${NODE_ID}" = "0" ]; then
-    echo "node0 is local; deploy_to_remote is for node1/node2 only" >&2
+if [ "${NODE_ID}" = "1" ]; then
+    echo "node1 (id=1) is local; deploy_to_remote is for remote nodes only (id 2=node2, id 3=node3)" >&2
     exit 2
 fi
 
@@ -72,7 +78,7 @@ stage_runtime_libs() {
     fi
 }
 
-echo "=== deploy epoch build to node${NODE_ID} (${REMOTE}) ==="
+echo "=== deploy $(epoch_node_display_name "${NODE_ID}") (id=${NODE_ID}, ${REMOTE}) ==="
 echo "remote root: ${REMOTE_ROOT}"
 
 stage_runtime_libs
@@ -91,6 +97,16 @@ rsync -avz \
     "${SCRIPT_DIR}/" \
     "${REMOTE}:${REMOTE_ROOT}/openGauss-server/scripts/epoch_benchmark/"
 
+echo "syncing benchmarksql-5.0-epoch (TPCC client jar + sources) ..."
+rsync -avz \
+    --exclude 'run/my_result_*' \
+    --exclude 'run/hs_err_pid*.log' \
+    --exclude 'run/benchmarksql-error.log' \
+    --exclude 'run/full_output.log' \
+    --exclude 'build/' \
+    "${LOCAL_ROOT}/benchmarksql-5.0-epoch/" \
+    "${REMOTE}:${REMOTE_ROOT}/benchmarksql-5.0-epoch/"
+
 echo "syncing epoch_deploy/runtime_libs (libzmq, libncurses.so.5, ...) ..."
 rsync -avz \
     "${RUNTIME_LIBS}/" \
@@ -98,23 +114,23 @@ rsync -avz \
 
 cat <<EOF
 
-部署包已同步到 node${NODE_ID}。首次部署请先配置 SSH 免密：
+部署包已同步到 $(epoch_node_display_name "${NODE_ID}")（id=${NODE_ID}）。首次部署请先配置 SSH 免密：
   ssh-copy-id ${REMOTE}
 
 然后在远程执行（node2 需 export EPOCH_LOCAL_NODE_ID=${NODE_ID}）：
 
   export EPOCH_BENCH_ROOT=${REMOTE_ROOT}
-  export EPOCH_NODE0_IP=${EPOCH_NODE0_IP}
   export EPOCH_NODE1_IP=${EPOCH_NODE1_IP}
   export EPOCH_NODE2_IP=${EPOCH_NODE2_IP}
+  export EPOCH_NODE3_IP=${EPOCH_NODE3_IP}
   export EPOCH_LOCAL_NODE_ID=${NODE_ID}
   bash ${REMOTE_ROOT}/openGauss-server/scripts/epoch_benchmark/configure_node.sh ${NODE_ID}
   bash ${REMOTE_ROOT}/openGauss-server/scripts/epoch_benchmark/start_node.sh ${NODE_ID}
 
 三端 TPCC props 参考（benchmarksql-5.0-epoch/run）：
-  node0: runWarehouseOffset=0,   runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE0}
-  node1: runWarehouseOffset=${EPOCH_RUN_WAREHOUSES_PER_NODE}, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE1}
-  node2: runWarehouseOffset=$((EPOCH_RUN_WAREHOUSES_PER_NODE * 2)), runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE2}
+  node1 (id=1): runWarehouseOffset=0, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE1}
+  node2 (id=2): runWarehouseOffset=33, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE2}  props=$(epoch_tpcc_props_for_node 2)
+  node3 (id=3): runWarehouseOffset=33, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE3}  (EPOCH_SKIP_NODE=3 时不跑)
   warehouses=${EPOCH_LOAD_WAREHOUSES}
 
 EOF

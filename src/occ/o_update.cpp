@@ -6,6 +6,12 @@
 #include "occ/o_executor.h"
 #include "occ/o_txn.h"
 #include "occ/occ_internal.h"
+#include "epoch/e_read_frontier.h"
+#include "epoch/e_heap_version.h"
+#include "epoch/e_apply_buflock.h"
+#include "epoch/e_types.h"
+
+#include "portability/instr_time.h"
 
 #include "access/tableam.h"
 #include "access/sysattr.h"
@@ -13,8 +19,44 @@
 #include "catalog/index.h"
 #include "utils/lsyscache.h"
 #include "access/tuptoaster.h"
+#include "executor/executor.h"
+#include "nodes/makefuncs.h"
 
 #include "occ/occ_mem.h"
+
+/* 释放 buffer 锁之后机会性 prune，不阻塞其它 find/update */
+static void EpochHeapOpportunisticPrune(Relation relation, BlockNumber blk, const ItemPointerData* tip_hint)
+{
+    if (!EpochHeapVersionChainEnabled(relation) || blk == InvalidBlockNumber) {
+        return;
+    }
+    uint64_t f_safe = EpochGetPruneSafeFrontier();
+    if (f_safe == 0) {
+        return;
+    }
+    Buffer buf = ReadBuffer(relation, blk);
+    if (!ConditionalLockBuffer(buf)) {
+        ReleaseBuffer(buf);
+        return;
+    }
+    (void)EpochHeapPrunePageLimited(relation, buf, f_safe, tip_hint, EPOCH_PRUNE_HOT_MAX_ITEMS);
+    /* 大页也做限量全页回收（O(n)+max_items）；旧 FULL_MAXOFF 门槛会放过 stock 膨胀页 */
+    (void)EpochHeapPrunePageLimited(relation, buf, f_safe, nullptr, EPOCH_PRUNE_PAGE_MAX_ITEMS);
+    LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(buf);
+}
+
+/* prune 后 Item 指针可能因 PageRepairFragmentation 失效，按 TID 重钉 */
+static void EpochRefreshTupleFromTid(HeapTupleData* tup, Page page, ItemPointer tid)
+{
+    ItemId lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
+    if (!ItemIdIsNormal(lp)) {
+        return;
+    }
+    tup->t_data = (HeapTupleHeader)PageGetItem(page, lp);
+    tup->t_len = ItemIdGetLength(lp);
+    HeapTupleCopyBaseFromPage(tup, page);
+}
 
 static void HeapSatisfiesHOTUpdate(Relation relation, Bitmapset *hot_attrs, Bitmapset *key_attrs, Bitmapset *id_attrs,
                                    bool *satisfies_hot, bool *satisfies_key, bool *satisfies_id, HeapTuple oldtup, HeapTuple newtup, char *page);
@@ -43,7 +85,56 @@ void O_FormIndexDatum(IndexInfo *indexInfo, TupleTableSlot *slot, Datum *values,
 static void O_FormIndexDatumFromHeap(IndexInfo *indexInfo, Relation heapRel, HeapTuple tup,
                                      Datum *values, bool *isnull);
 
-static void O_InsertIndexTuplesForHeap(Relation heapRel, HeapTuple tup, ItemPointer tupleid);
+/*
+ * 并发 prune/update 导致 ctid 失效时，用唯一索引从 slot 重定位 tip TID。
+ * 成功则写回 *tupleid 并返回 true。
+ */
+static bool O_RefindTipTidFromSlot(Relation relation, EState *estate, TupleTableSlot *slot, ItemPointer tupleid)
+{
+    if (relation == nullptr || estate == nullptr || slot == nullptr || tupleid == nullptr) {
+        return false;
+    }
+    if (!EpochHeapVersionChainEnabled(relation)) {
+        return false;
+    }
+
+    List *indexoidlist = RelationGetIndexList(relation);
+    if (indexoidlist == NIL) {
+        return false;
+    }
+
+    bool found = false;
+    ListCell *lc = nullptr;
+    foreach (lc, indexoidlist) {
+        Oid idxoid = lfirst_oid(lc);
+        Relation idxrel = index_open(idxoid, AccessShareLock);
+        if (!idxrel->rd_index->indisunique || !idxrel->rd_index->indisvalid) {
+            index_close(idxrel, AccessShareLock);
+            continue;
+        }
+
+        TupleTableSlot *outslot = MakeSingleTupleTableSlot(RelationGetDescr(relation));
+        FakeRelationPartition fake;
+        errno_t rc = memset_s(&fake, sizeof(fake), 0, sizeof(fake));
+        securec_check(rc, "\0", "\0");
+
+        if (RelationFindReplTupleEpoch(estate, relation, idxoid, slot, outslot, &fake)) {
+            HeapTuple htup = (HeapTuple)outslot->tts_tuple;
+            if (htup != nullptr && ItemPointerIsValid(&htup->t_self)) {
+                ItemPointerCopy(&htup->t_self, tupleid);
+                found = true;
+            }
+        }
+
+        ExecDropSingleTupleTableSlot(outslot);
+        index_close(idxrel, AccessShareLock);
+        if (found) {
+            break;
+        }
+    }
+    list_free(indexoidlist);
+    return found;
+}
 
 List *O_ExecInsertIndexTuples(TupleTableSlot *slot, ItemPointer tupleid, EState *estate,
                               Bitmapset *modifiedIdxAttrs);
@@ -63,24 +154,56 @@ RC O_UpdateRow(O_TxnManager *txn, HeapTuple heap_tuple, TupleTableSlot *slot, ES
         txn->m_accessMgr->SetLastAccessedSlot(slot, update_index);
 
         rc = txn->UpdateLastRowState(AccessType::WR, update_index);
-
-        HeapTuple currDraft = txn->GetLastAccessedDraft();
-        currDraft->t_len = heap_tuple->t_len;
-
-        if (update_index)
-        {
-            currDraft->t_self = heap_tuple->t_self;
-            currDraft->t_tableOid = heap_tuple->t_tableOid;
-            currDraft->t_bucketId = heap_tuple->t_bucketId;
-            HeapTupleCopyBase(currDraft, heap_tuple);
+        if (rc != RC_OK) {
+            break;
         }
 
-        memcpy_s((char *)currDraft->t_data, currDraft->t_len, (char *)heap_tuple->t_data, heap_tuple->t_len);
+        O_Access *access = txn->m_accessMgr->GetLastAccess();
+        if (access == nullptr || heap_tuple == nullptr || heap_tuple->t_data == nullptr) {
+            rc = RC_ERROR;
+            break;
+        }
 
-        //        rc = txn->OverwriteRow(currDraft);
+        /*
+         * 必须用 O_heap_copytuple 按新 t_len 重新分配 draft。
+         * EnsureRowAccessForModify / CreateMVCCDraft 按旧行长度分配缓冲区，
+         * 原地 memcpy 会在新 tuple 更大时写穿 arena，污染相邻 O_Access/HeapTuple 指针
+         * （E_BuildWireTxn pack 时 SIGSEGV）。
+         */
+        HeapTuple newDraft = O_heap_copytuple(heap_tuple);
+        if (newDraft == nullptr) {
+            rc = RC_ERROR;
+            break;
+        }
+        if (!ItemPointerIsValid(&newDraft->t_self) &&
+            OccTidIsPlausible(&access->m_origSentinel.tuple_id)) {
+            newDraft->t_self = access->m_origSentinel.tuple_id;
+        }
+
+        if (access->m_type == INS) {
+            access->m_localInsertRow = newDraft;
+        } else {
+            access->m_localRow = newDraft;
+        }
     } while (0);
 
     return rc;
+}
+
+static void O_DeferRegisterUpdateWriteSet(O_TxnManager *txn, Relation relation, ItemPointer tupleid,
+    HeapTupleData *oldtup, HeapTuple newtuple, TupleTableSlot *slot, EState *estate, Buffer buffer)
+{
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tupleid, oldtup)) {
+        ReleaseBuffer(buffer);
+        ereport(ERROR, (errmsg("OCC: failed to establish row access for deferred update")));
+    }
+    /*
+     * sync 双主 defer：写集仅登记旧 tid + 新 tuple draft，不区分 HOT。
+     * heap/index 维护（含跨页 UPDATE）由 apply 侧 tableam_tuple_update 完成。
+     */
+    O_UpdateRow(txn, newtuple, slot, estate, false);
+    ReleaseBuffer(buffer);
 }
 
 // 接口 只判断索引列修改,目前tpcc不涉及
@@ -89,9 +212,6 @@ TupleTableSlot *O_ExecUpdate(ItemPointer tupleid,
                              int2 bucketid, HeapTupleHeader oldtuple, TupleTableSlot *slot, TupleTableSlot *planSlot, EPQState *epqstate,
                              ModifyTableState *node, bool canSetTag, bool partKeyUpdate, TM_Result *uresultp, char *partExprKeyStr, TM_FailureData *tmfdp)
 {
-    // 执行阶段需要先分配xid，为提交阶段准备
-    TransactionId xid = GetCurrentTransactionId();
-
     EState *estate = node->ps.state;
     Tuple tuple = NULL;
     ResultRelInfo *result_rel_info = NULL;
@@ -125,23 +245,65 @@ TupleTableSlot *O_ExecUpdate(ItemPointer tupleid,
     BlockNumber block;
     Buffer buffer = InvalidBuffer;
     ItemId lp;
+    ItemPointerData working_tid = *tupleid;
+    ItemPointer tid = &working_tid;
 
-    block = ItemPointerGetBlockNumber(tupleid);
+    block = ItemPointerGetBlockNumber(tid);
     buffer = ReadBuffer(relation, block);
     page = BufferGetPage(buffer);
 
     LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
-    lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tupleid));
+    lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
+    if (!ItemIdIsNormal(lp)) {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+        buffer = InvalidBuffer;
+        if (!O_RefindTipTidFromSlot(relation, estate, slot, tid)) {
+            bms_free(hot_attrs);
+            bms_free(key_attrs);
+            bms_free(id_attrs);
+            if (uresultp != nullptr) {
+                *uresultp = TM_Deleted;
+            }
+            return NULL;
+        }
+        block = ItemPointerGetBlockNumber(tid);
+        buffer = ReadBuffer(relation, block);
+        page = BufferGetPage(buffer);
+        LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+        lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
+        if (!ItemIdIsNormal(lp)) {
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+            bms_free(hot_attrs);
+            bms_free(key_attrs);
+            bms_free(id_attrs);
+            if (uresultp != nullptr) {
+                *uresultp = TM_Deleted;
+            }
+            return NULL;
+        }
+    }
 
     oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
     oldtup.t_len = ItemIdGetLength(lp);
-    oldtup.t_self = *tupleid;
+    oldtup.t_self = *tid;
     oldtup.t_tableOid = RelationGetRelid(relation);
     oldtup.t_bucketId = RelationGetBktid(relation);
 
     HeapSatisfiesHOTUpdate(relation, hot_attrs, key_attrs, id_attrs, &satisfies_hot,
                            &satisfies_key, &satisfies_id, &oldtup, (HeapTuple)tuple, page);
+
+    if (OccSyncDeferHeapWrite()) {
+        O_DeferRegisterUpdateWriteSet(txn, relation, tid, &oldtup, (HeapTuple)tuple, slot, estate, buffer);
+        bms_free(hot_attrs);
+        bms_free(key_attrs);
+        bms_free(id_attrs);
+        return NULL;
+    }
+
+    (void)GetCurrentTransactionId();
 
     if (!satisfies_hot)
     {
@@ -149,7 +311,7 @@ TupleTableSlot *O_ExecUpdate(ItemPointer tupleid,
 
         occ_heap_insert(relation, (HeapTuple)tuple, estate->es_output_cid, 0, NULL, false);
 
-        if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tupleid, &oldtup)) {
+        if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tid, &oldtup)) {
             ereport(ERROR, (errmsg("OCC: failed to establish row access for non-HOT update")));
         }
         O_UpdateRow(txn, (HeapTuple)tuple, slot, estate, true); // 旧的版本需要无效掉
@@ -166,7 +328,7 @@ TupleTableSlot *O_ExecUpdate(ItemPointer tupleid,
             exec_index_tuples_state.conflict = NULL;
             exec_index_tuples_state.rollbackIndex = false;
             // 这个tupleid是旧的还是新的?
-            tableam_tops_exec_update_index_tuples(slot, oldslot, relation, node, tuple, tupleid,
+            tableam_tops_exec_update_index_tuples(slot, oldslot, relation, node, tuple, tid,
                                                   exec_index_tuples_state, bucketid, modifiedIdxAttrs);
         }
 
@@ -178,10 +340,18 @@ TupleTableSlot *O_ExecUpdate(ItemPointer tupleid,
     }
     else
     {
-        if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tupleid, &oldtup)) {
+        /*
+         * HOT：oldtup 已拷入栈变量，释放 EXCLUSIVE 后再 O_UpdateRow（内含 START gate），
+         * 避免 gate 自旋期间持页锁阻塞 epoch worker apply 的 index fetch。
+         */
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tid, &oldtup)) {
+            ReleaseBuffer(buffer);
             ereport(ERROR, (errmsg("OCC: failed to establish row access for HOT update")));
         }
         O_UpdateRow(txn, (HeapTuple)tuple, slot, estate);
+        ReleaseBuffer(buffer);
+        return NULL;
     }
 
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -213,6 +383,31 @@ bool O_OpFusionExecUpdate(Relation relation, ItemPointer tupleid, HeapTuple newt
     LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
     ItemId lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tupleid));
+    if (!ItemIdIsNormal(lp)) {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(buffer);
+        ItemPointerData fresh_tid = *tupleid;
+        if (!O_RefindTipTidFromSlot(relation, estate, slot, &fresh_tid)) {
+            bms_free(hot_attrs);
+            bms_free(key_attrs);
+            bms_free(id_attrs);
+            return false;
+        }
+        *tupleid = fresh_tid;
+        block = ItemPointerGetBlockNumber(tupleid);
+        buffer = ReadBuffer(relation, block);
+        page = BufferGetPage(buffer);
+        LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+        lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tupleid));
+        if (!ItemIdIsNormal(lp)) {
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+            ReleaseBuffer(buffer);
+            bms_free(hot_attrs);
+            bms_free(key_attrs);
+            bms_free(id_attrs);
+            return false;
+        }
+    }
 
     HeapTupleData oldtup;
     oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
@@ -223,6 +418,16 @@ bool O_OpFusionExecUpdate(Relation relation, ItemPointer tupleid, HeapTuple newt
 
     HeapSatisfiesHOTUpdate(relation, hot_attrs, key_attrs, id_attrs, &satisfies_hot,
                            &satisfies_key, &satisfies_id, &oldtup, newtuple, page);
+
+    if (OccSyncDeferHeapWrite()) {
+        *needsIndexUpdate = false;
+        *indexUpdateDone = false;
+        O_DeferRegisterUpdateWriteSet(txn, relation, tupleid, &oldtup, newtuple, slot, estate, buffer);
+        bms_free(hot_attrs);
+        bms_free(key_attrs);
+        bms_free(id_attrs);
+        return true;
+    }
 
     *needsIndexUpdate = !satisfies_hot || satisfies_key;
     *indexUpdateDone = false;
@@ -258,13 +463,21 @@ bool O_OpFusionExecUpdate(Relation relation, ItemPointer tupleid, HeapTuple newt
         O_InsertRow(pTSelf, estate, newtuple);
         *indexUpdateDone = true;
     } else {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
         if (!txn->m_accessMgr->EnsureRowAccessForModify(relation, tupleid, &oldtup)) {
-            LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
             ReleaseBuffer(buffer);
             ereport(ERROR, (errmsg("OCC: failed to establish row access for HOT update")));
         }
-        O_UpdateRow(txn, newtuple, slot, estate);
+        O_UpdateRow(txn, newtuple, slot, estate, false);
         *needsIndexUpdate = satisfies_key;
+
+        ReleaseBuffer(buffer);
+        bms_free(hot_attrs);
+        bms_free(key_attrs);
+        bms_free(id_attrs);
+
+        (void)GetCurrentTransactionId();
+        return true;
     }
 
     LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -316,9 +529,9 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
     HeapTupleData oldtup;
     TM_Result result;
     TransactionId xid = GetCurrentTransactionId();
-    //    Bitmapset* hot_attrs = NULL;
-    //    Bitmapset* key_attrs = NULL;
-    //    Bitmapset* id_attrs = NULL;
+    Bitmapset* hot_attrs = NULL;
+    Bitmapset* key_attrs = NULL;
+    Bitmapset* id_attrs = NULL;
     TransactionId xmax_new_tuple;
     TransactionId xmax_old_tuple;
     uint16 infomask_old_tuple;
@@ -330,10 +543,11 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
     bool already_marked = false;
     bool is_combo = false;
 
-    //    bool satisfies_key = false;
-    //    bool satisfies_id = false;
-    bool satisfies_hot = true; // 此处已经判断过
+    bool satisfies_key = false;
+    bool satisfies_id = false;
+    bool satisfies_hot = true;
     bool use_hot_update = false;
+    bool csn_cross_page_heap_only = false; /* HEAP_ONLY without HOT_UPDATED */
 
     Size new_tup_size, pagefree;
     int options = 0;
@@ -344,6 +558,9 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
     HeapTuple old_key_tuple = NULL;
     bool old_key_copied = false;
     char relreplident;
+
+    ItemPointerData prune_hint;
+    ItemPointerSetInvalid(&prune_hint);
 
     block = ItemPointerGetBlockNumber(otid);
     buffer = ReadBuffer(relation, block);
@@ -358,26 +575,88 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
         visibilitymap_pin(relation, block, &vmbuffer);
     }
 
-    LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+    EpochApplyBufLockExclusive(buffer);
 
     lp = PageGetItemId(page, ItemPointerGetOffsetNumber(otid));
+    if (!ItemIdIsNormal(lp)) {
+        EpochApplyBufLockUnlock(buffer);
+        ReleaseBuffer(buffer);
+        if (BufferIsValid(vmbuffer)) {
+            ReleaseBuffer(vmbuffer);
+        }
+        return TM_Deleted;
+    }
     oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
     oldtup.t_len = ItemIdGetLength(lp);
     oldtup.t_self = *otid;
     oldtup.t_tableOid = RelationGetRelid(relation);
     oldtup.t_bucketId = RelationGetBktid(relation);
 
-    //    hot_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_ALL);
-    //    key_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
-    //    id_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
-    //
-    //    HeapSatisfiesHOTUpdate(relation, hot_attrs, key_attrs, id_attrs, &satisfies_hot, &satisfies_key, &satisfies_id,
-    //                           &oldtup, newtup, page);
+    /*
+     * CSN 版本链：apply find 与 update 之间 tip 可能已前进；必须在 EXCLUSIVE 下再追到
+     * 当前 is_latest，否则会分叉出多个 tip（warehouse 曾出现每行近百个 is_latest）。
+     */
+    if (EpochHeapVersionChainEnabled(relation)) {
+        Buffer tip_buf = buffer;
+        instr_time tip_t0;
+        INSTR_TIME_SET_CURRENT(tip_t0);
+        if (!EpochHeapLockFollowToTip(relation, otid, &tip_buf, &oldtup)) {
+            EpochApplyBufLockUnlock(tip_buf);
+            ReleaseBuffer(tip_buf);
+            if (BufferIsValid(vmbuffer)) {
+                ReleaseBuffer(vmbuffer);
+            }
+            return TM_Deleted;
+        }
+        {
+            instr_time tip_t1;
+            INSTR_TIME_SET_CURRENT(tip_t1);
+            INSTR_TIME_SUBTRACT(tip_t1, tip_t0);
+            EpochApplyBufLockAddFollowTipUs(static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(tip_t1)));
+        }
+        if (tip_buf != buffer) {
+            /* tip 在其它页：释放旧页相关 vm pin，按 tip 页重钉 */
+            if (BufferIsValid(vmbuffer)) {
+                ReleaseBuffer(vmbuffer);
+                vmbuffer = InvalidBuffer;
+            }
+            buffer = tip_buf;
+            block = BufferGetBlockNumber(buffer);
+            page = BufferGetPage(buffer);
+            if (PageIsAllVisible(page)) {
+                visibilitymap_pin(relation, block, &vmbuffer);
+            }
+        } else {
+            page = BufferGetPage(buffer);
+        }
+    }
+
+    hot_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_ALL);
+    key_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_KEY);
+    id_attrs = RelationGetIndexAttrBitmap(relation, INDEX_ATTR_BITMAP_IDENTITY_KEY);
+
+    HeapSatisfiesHOTUpdate(relation, hot_attrs, key_attrs, id_attrs, &satisfies_hot, &satisfies_key, &satisfies_id,
+                           &oldtup, newtup, (char*)page);
 
     HeapTupleCopyBaseFromPage(&oldtup, BufferGetPage(buffer));
 
-    xmax_old_tuple = xid;
-    infomask_old_tuple = 0;
+    if (O_HeapUseCsnEpochSemantics()) {
+        /*
+         * 索引列未变：旧索引项 + t_ctid 链仍有效，无需 insert 新索引项。
+         * 索引列已变：旧行须 xid xmax，否则 HEAP_XMAX_INVALID 下 _bt_check_unique
+         * 仍视旧索引项 alive，跨页 UPDATE 会 duplicate PK（Payment 写 warehouse 触发）。
+         */
+        if (!satisfies_hot) {
+            xmax_old_tuple = xid;
+            infomask_old_tuple = 0;
+        } else {
+            xmax_old_tuple = InvalidTransactionId;
+            infomask_old_tuple = HEAP_XMAX_INVALID;
+        }
+    } else {
+        xmax_old_tuple = xid;
+        infomask_old_tuple = 0;
+    }
     infomask2_old_tuple = 0;
     infomask_new_tuple = HEAP_XMAX_INVALID;
     infomask2_new_tuple = 0;
@@ -403,38 +682,177 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
     newtup->t_bucketId = RelationGetBktid(relation);
     newtup->t_data->m_rowCSN = csn;
     newtup->t_data->is_latest = true;
+    if (O_HeapUseCsnEpochSemantics()) {
+        newtup->t_data->m_status = EpochHeapCommitEpochForWrite();
+    }
 
     HeapTupleHeaderAdjustCmax(oldtup.t_data, &cid, &is_combo, buffer);
 
     pagefree = PageGetHeapFreeSpace(page);
     new_tup_size = MAXALIGN(newtup->t_len);
 
+    /*
+     * 空间不足时先在已持有的 EXCLUSIVE 下做限量 prune（对齐 heap_update），尽量同页 HOT。
+     * 完全跳过会导致跨页链爆炸：异页后继旧逻辑不回收 → heap_insert/find 随时间恶化。
+     * 限量 + O(n) 前驱表，避免旧 O(n²) 长持锁。
+     */
+    if (EpochHeapVersionChainEnabled(relation) && new_tup_size > pagefree) {
+        uint64_t f_safe = EpochGetPruneSafeFrontier();
+        if (f_safe != 0) {
+            instr_time prune_t0;
+            INSTR_TIME_SET_CURRENT(prune_t0);
+            (void)EpochHeapPrunePageLimited(relation, buffer, f_safe, &oldtup.t_self, EPOCH_PRUNE_PAGE_MAX_ITEMS);
+            EpochRefreshTupleFromTid(&oldtup, page, &oldtup.t_self);
+            pagefree = PageGetHeapFreeSpace(page);
+            if (new_tup_size > pagefree) {
+                (void)EpochHeapPrunePageLimited(relation, buffer, f_safe, nullptr, EPOCH_PRUNE_PAGE_MAX_ITEMS);
+                EpochRefreshTupleFromTid(&oldtup, page, &oldtup.t_self);
+                pagefree = PageGetHeapFreeSpace(page);
+            }
+            instr_time prune_t1;
+            INSTR_TIME_SET_CURRENT(prune_t1);
+            INSTR_TIME_SUBTRACT(prune_t1, prune_t0);
+            EpochApplyBufLockAddPruneUs(static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(prune_t1)));
+        }
+    }
+
     if (new_tup_size > pagefree)
     {
         /* Clear obsolete visibility flags ... */
         oldtup.t_data->t_infomask &= ~HEAP_XMAX_BITS;
         oldtup.t_data->t_infomask2 &= ~(HEAP_XMAX_LOCK_ONLY | HEAP_KEYS_UPDATED);
-        Assert(TransactionIdIsValid(xmax_old_tuple));
         oldtup.t_data->t_infomask |= infomask_old_tuple;
         oldtup.t_data->t_infomask2 |= infomask2_old_tuple;
         HeapTupleClearHotUpdated(&oldtup);
-        /* ... and store info about transaction updating this tuple */
         HeapTupleHeaderSetXmax(page, oldtup.t_data, xmax_old_tuple);
-        HeapTupleHeaderSetCmax(oldtup.t_data, cid, is_combo);
-        /* temporarily make it look not-updated */
-        oldtup.t_data->t_ctid = oldtup.t_self;
+        if (TransactionIdIsValid(xmax_old_tuple)) {
+            HeapTupleHeaderSetCmax(oldtup.t_data, cid, is_combo);
+        }
+        if (!O_HeapUseCsnEpochSemantics()) {
+            oldtup.t_data->m_rowCSN = csn;
+            oldtup.t_data->is_latest = false;
+            /* temporarily make it look not-updated */
+            oldtup.t_data->t_ctid = oldtup.t_self;
+        }
+        /*
+         * CSN 路径：勿在换页窗口把 tip 标成 is_latest=false 且 t_ctid=self
+         * （既非 tip 也非 superseded，易残留多 tip）。最终 CRIT 段再链接。
+         */
 
         HeapTupleCopyBaseFromPage(&oldtup, page);
 
         already_marked = true;
+        /* 换页前暂放 tip 锁：暂停 excl_hold 计时 */
+        EpochApplyBufLockMarkExclReleased();
         LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
         heaptup = newtup;
 
         if (new_tup_size > pagefree)
         {
+            /*
+             * RelationGetBufferForTuple 返回时已对 newbuf 与 otherBuffer(本 tip 页)
+             * 都加好 EXCLUSIVE；切勿再 LockBuffer(buffer)，否则对本进程自死锁。
+             */
+            instr_time gb_t0;
+            INSTR_TIME_SET_CURRENT(gb_t0);
             newbuf = RelationGetBufferForTuple(relation, heaptup->t_len, buffer, options, NULL, &vmbuffer_new,
                                                &vmbuffer, rel_end_block);
+            instr_time gb_t1;
+            INSTR_TIME_SET_CURRENT(gb_t1);
+            INSTR_TIME_SUBTRACT(gb_t1, gb_t0);
+            EpochApplyBufLockAddGetBufUs(static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(gb_t1)));
+            EpochApplyBufLockMarkExclHeld();
+        }
+
+        /*
+         * 解锁窗口内并发 apply 可能已推进 tip。同页内再追到 tip；若 tip 已跨页，
+         * 放弃本次换页更新（避免释放 otherBuffer 破坏 RelationGetBufferForTuple 约定）。
+         */
+        if (EpochHeapVersionChainEnabled(relation) && BufferIsValid(buffer)) {
+            page = BufferGetPage(buffer);
+            BlockNumber tip_blk = BufferGetBlockNumber(buffer);
+            lp = PageGetItemId(page, ItemPointerGetOffsetNumber(&oldtup.t_self));
+            if (ItemIdIsNormal(lp)) {
+                oldtup.t_data = (HeapTupleHeader)PageGetItem(page, lp);
+                oldtup.t_len = ItemIdGetLength(lp);
+                HeapTupleCopyBaseFromPage(&oldtup, page);
+            }
+            int hop = 0;
+            while (oldtup.t_data != nullptr && !oldtup.t_data->is_latest &&
+                   !ItemPointerEquals(&oldtup.t_self, &oldtup.t_data->t_ctid) &&
+                   ItemPointerGetBlockNumber(&oldtup.t_data->t_ctid) == tip_blk &&
+                   hop++ < EPOCH_HEAP_VERSION_CHAIN_MAX) {
+                OffsetNumber next_off = ItemPointerGetOffsetNumber(&oldtup.t_data->t_ctid);
+                ItemId next_lp = PageGetItemId(page, next_off);
+                if (!ItemIdIsNormal(next_lp)) {
+                    break;
+                }
+                oldtup.t_self = oldtup.t_data->t_ctid;
+                oldtup.t_data = (HeapTupleHeader)PageGetItem(page, next_lp);
+                oldtup.t_len = ItemIdGetLength(next_lp);
+                HeapTupleCopyBaseFromPage(&oldtup, page);
+            }
+            if (oldtup.t_data != nullptr && !oldtup.t_data->is_latest &&
+                !ItemPointerEquals(&oldtup.t_self, &oldtup.t_data->t_ctid) &&
+                ItemPointerGetBlockNumber(&oldtup.t_data->t_ctid) != tip_blk) {
+                /* tip 已跨页：丢掉新页，整链重追后再决定同页/换页 */
+                if (BufferIsValid(newbuf) && newbuf != buffer) {
+                    UnlockReleaseBuffer(newbuf);
+                    newbuf = InvalidBuffer;
+                }
+                if (BufferIsValid(vmbuffer_new)) {
+                    ReleaseBuffer(vmbuffer_new);
+                    vmbuffer_new = InvalidBuffer;
+                }
+                Buffer tip_buf = buffer;
+                if (!EpochHeapLockFollowToTip(relation, &oldtup.t_self, &tip_buf, &oldtup)) {
+                    EpochApplyBufLockUnlock(tip_buf);
+                    ReleaseBuffer(tip_buf);
+                    if (BufferIsValid(vmbuffer)) {
+                        ReleaseBuffer(vmbuffer);
+                    }
+                    bms_free(hot_attrs);
+                    bms_free(key_attrs);
+                    bms_free(id_attrs);
+                    return TM_Deleted;
+                }
+                if (tip_buf != buffer) {
+                    if (BufferIsValid(vmbuffer)) {
+                        ReleaseBuffer(vmbuffer);
+                        vmbuffer = InvalidBuffer;
+                    }
+                    buffer = tip_buf;
+                    block = BufferGetBlockNumber(buffer);
+                    page = BufferGetPage(buffer);
+                    if (PageIsAllVisible(page)) {
+                        visibilitymap_pin(relation, block, &vmbuffer);
+                    }
+                } else {
+                    page = BufferGetPage(buffer);
+                }
+                pagefree = PageGetHeapFreeSpace(page);
+                if (new_tup_size <= pagefree) {
+                    already_marked = false;
+                    newbuf = buffer;
+                    heaptup = newtup;
+                } else {
+                    already_marked = true;
+                    EpochApplyBufLockMarkExclReleased();
+                    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+                    /* GetBufferForTuple 已锁住 buffer，勿再 EXCLUSIVE */
+                    instr_time gb2_t0;
+                    INSTR_TIME_SET_CURRENT(gb2_t0);
+                    newbuf = RelationGetBufferForTuple(relation, heaptup->t_len, buffer, options, NULL,
+                        &vmbuffer_new, &vmbuffer, rel_end_block);
+                    instr_time gb2_t1;
+                    INSTR_TIME_SET_CURRENT(gb2_t1);
+                    INSTR_TIME_SUBTRACT(gb2_t1, gb2_t0);
+                    EpochApplyBufLockAddGetBufUs(static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(gb2_t1)));
+                    EpochApplyBufLockMarkExclHeld();
+                    page = BufferGetPage(buffer);
+                }
+            }
         }
     }
     else
@@ -454,6 +872,15 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
     else
     {
         PageSetFull(page);
+        /*
+         * CSN + index cols unchanged: skip unique-index insert (see below:
+         * !use_hot_update && !satisfies_hot) and mark new version HEAP_ONLY
+         * for prune. Must NOT set HOT_UPDATED — that requires same-page t_ctid;
+         * heap_hot_search_buffer Asserts on cross-page HOT (postmaster TRAP).
+         */
+        if (O_HeapUseCsnEpochSemantics() && satisfies_hot) {
+            csn_cross_page_heap_only = true;
+        }
     }
 
     //    bool keyChanged = XLogLogicalInfoActive() ? true : !satisfies_id;
@@ -469,6 +896,8 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
     HeapTupleCopyBaseFromPage(heaptup, newpage);
     HeapTupleHeaderSetXmax(newpage, heaptup->t_data, xmax_new_tuple);
 
+    instr_time crit_t0;
+    INSTR_TIME_SET_CURRENT(crit_t0);
     START_CRIT_SECTION();
 
     if (!(options & HEAP_INSERT_SKIP_FSM))
@@ -478,7 +907,14 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 
     if (use_hot_update)
     {
+        /* Same-page only — guaranteed by newbuf == buffer above. */
         HeapTupleSetHotUpdated(&oldtup);
+        HeapTupleSetHeapOnly(heaptup);
+        HeapTupleSetHeapOnly(newtup);
+    }
+    else if (csn_cross_page_heap_only)
+    {
+        HeapTupleClearHotUpdated(&oldtup);
         HeapTupleSetHeapOnly(heaptup);
         HeapTupleSetHeapOnly(newtup);
     }
@@ -501,9 +937,19 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
         HeapTupleHeaderSetCmax(oldtup.t_data, cid, is_combo);
     }
 
-    oldtup.t_data->m_rowCSN = csn;
-    oldtup.t_data->is_latest = false;
-    oldtup.t_data->t_ctid = heaptup->t_self;
+    if (O_HeapUseCsnEpochSemantics()) {
+        /*
+         * 旧版本保留原 m_rowCSN（MVCC 链），仅标记非 latest 并链接新版本（正向）。
+         * backend 按哨兵 TID + pinned CSN / read_frontier 仍可读旧版本。
+         * 索引列未变时不更新索引 TID（HOT），find 从链头正向追到 is_latest。
+         */
+        oldtup.t_data->is_latest = false;
+        oldtup.t_data->t_ctid = heaptup->t_self;
+    } else {
+        oldtup.t_data->m_rowCSN = csn;
+        oldtup.t_data->is_latest = false;
+        oldtup.t_data->t_ctid = heaptup->t_self;
+    }
 
     if (PageIsAllVisible(BufferGetPage(buffer)))
     {
@@ -549,12 +995,21 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
     }
 
     END_CRIT_SECTION();
+    {
+        instr_time crit_t1;
+        INSTR_TIME_SET_CURRENT(crit_t1);
+        INSTR_TIME_SUBTRACT(crit_t1, crit_t0);
+        EpochApplyBufLockAddCritUs(static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(crit_t1)));
+    }
 
+    prune_hint = heaptup->t_self;
+
+    /* 先放新页锁（若跨页），hold 计时仍挂在 tip/旧页上；最后 Unlock tip 结束 hold */
     if (newbuf != buffer)
     {
         LockBuffer(newbuf, BUFFER_LOCK_UNLOCK);
     }
-    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    EpochApplyBufLockUnlock(buffer);
 
     if (newbuf != buffer)
     {
@@ -570,7 +1025,19 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
         ReleaseBuffer(vmbuffer);
     }
 
-    if (!use_hot_update)
+    /* buffer 锁外机会性回收 */
+    if (EpochHeapVersionChainEnabled(relation) && ItemPointerIsValid(&prune_hint)) {
+        EpochHeapOpportunisticPrune(relation, ItemPointerGetBlockNumber(&prune_hint), &prune_hint);
+        if (block != ItemPointerGetBlockNumber(&prune_hint)) {
+            EpochHeapOpportunisticPrune(relation, block, nullptr);
+        }
+    }
+
+    /*
+     * 索引列未变时旧索引项仍指向根 TID，经 t_ctid 正向链可达新版本（同 PG HOT 语义），
+     * 跨页 UPDATE 也不应 insert 新索引项。
+     */
+    if (!use_hot_update && !satisfies_hot)
     {
         if (estate != nullptr && slot != nullptr)
         {
@@ -592,9 +1059,9 @@ TM_Result O_heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
         heap_freetuple(heaptup);
     }
 
-    //    bms_free(hot_attrs);
-    //    bms_free(key_attrs);
-    //    bms_free(id_attrs);
+    bms_free(hot_attrs);
+    bms_free(key_attrs);
+    bms_free(id_attrs);
     //
     //    if (old_key_tuple != NULL && old_key_copied) {
     //        heap_freetuple(old_key_tuple);
@@ -664,8 +1131,13 @@ TM_Result O_heap_update2(Relation relation, ItemPointer otid, HeapTuple newtup,
 
     HeapTupleCopyBaseFromPage(&oldtup, BufferGetPage(buffer));
 
-    xmax_old_tuple = xid;
-    infomask_old_tuple = 0;
+    if (O_HeapUseCsnEpochSemantics()) {
+        xmax_old_tuple = InvalidTransactionId;
+        infomask_old_tuple = HEAP_XMAX_INVALID;
+    } else {
+        xmax_old_tuple = xid;
+        infomask_old_tuple = 0;
+    }
     infomask2_old_tuple = 0;
 
     heap_page_prepare_for_xid(relation, buffer, xid, false);
@@ -1553,7 +2025,7 @@ static void O_FormIndexDatumFromHeap(IndexInfo *indexInfo, Relation heapRel, Hea
     }
 }
 
-static void O_InsertIndexTuplesForHeap(Relation heapRel, HeapTuple tup, ItemPointer tupleid)
+void O_InsertIndexTuplesForHeap(Relation heapRel, HeapTuple tup, ItemPointer tupleid)
 {
     List *indexoidlist = RelationGetIndexList(heapRel);
     ListCell *l = NULL;

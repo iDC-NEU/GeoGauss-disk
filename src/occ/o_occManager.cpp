@@ -8,7 +8,11 @@
 #include "occ/occ_internal.h"
 #include "occ/occ_stats.h"
 
+#include "epoch/e_config.h"
+#include "epoch/e_heap_version.h"
+
 #include "access/heapam.h"
+#include "storage/buf/bufmgr.h"
 #include "utils/rel.h"
 
 #include <algorithm>
@@ -103,6 +107,68 @@ static bool OccTupleVersionMatches(O_Access* access, HeapTupleHeader hdr, bool c
     return true;
 }
 
+static bool OccQuickLocalDraftCheck(O_Access* access)
+{
+    const bool checkLatest = true;
+    HeapTuple localTuple = access->GetLocalVersion();
+    if (localTuple == nullptr) {
+        localTuple = access->m_globalRow;
+    }
+    if (localTuple == nullptr || localTuple->t_data == nullptr) {
+        return false;
+    }
+    return OccTupleVersionMatches(access, localTuple->t_data, checkLatest);
+}
+
+static bool OccAcquireBufferShareLock(Buffer buffer, OccWriteSetValidateMode mode)
+{
+    if (mode == OCC_WSV_HEAP_NOWAIT) {
+        return TryLockBuffer(buffer, BUFFER_LOCK_SHARE, false);
+    }
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    return true;
+}
+
+static bool OccReadBufferTupleVersion(O_Access* access, Relation rel, const occ_sentinel& sent, bool checkLatest,
+    OccWriteSetValidateMode mode)
+{
+    if (EpochHeapVersionChainEnabled(rel)) {
+        HeapTuple chain_copy = nullptr;
+        bool ok = false;
+        if (checkLatest) {
+            if (EpochHeapFetchLatestCopy(rel, &sent.tuple_id, &chain_copy, NULL) && chain_copy != nullptr &&
+                chain_copy->t_data != nullptr) {
+                ok = OccTupleVersionMatches(access, chain_copy->t_data, true);
+            }
+        } else if (EpochHeapFetchPinnedCsnCopy(rel, &sent.tuple_id, access->m_csn, &chain_copy) &&
+                   chain_copy != nullptr && chain_copy->t_data != nullptr) {
+            ok = (access->m_csn == chain_copy->t_data->m_rowCSN);
+        }
+        if (chain_copy != nullptr) {
+            heap_freetuple(chain_copy);
+        }
+        return ok;
+    }
+
+    Buffer buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(&sent.tuple_id));
+    if (!OccAcquireBufferShareLock(buffer, mode)) {
+        ReleaseBuffer(buffer);
+        return false;
+    }
+
+    HeapTupleData tuple;
+    occ_sentinel readSent = sent;
+    readSent.relation = rel;
+    readSent.GetData(&tuple, buffer);
+
+    bool ok = checkLatest ? OccTupleVersionMatches(access, tuple.t_data, true)
+                          : (tuple.t_data != nullptr && access->m_csn == tuple.t_data->m_rowCSN);
+
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+    ReleaseBuffer(buffer);
+    return ok;
+}
+
 }  // namespace
 
 void OccTransactionManager::WriteChanges(O_TxnManager* txMan)
@@ -137,6 +203,15 @@ RC OccTransactionManager::ValidateOcc(O_TxnManager* txMan)
         }
 
         m_lastAbortReason = OCC_ABORT_NONE;
+        /*
+         * epoch 多主：pack 前不做 ValidateWriteSet / LockHeaders。
+         * 写-写冲突由 CRDT merge + abort_csn 处理；heap 版本检查仅在 RECORD_COMMIT
+         * RevalidateWriteSet（HEAP_NOWAIT）。PreAbortCheck 仅整理写集。
+         */
+        if (g_enable_epoch_multimaster && EpochGetTotalNodes() > 1) {
+            break;
+        }
+
         rc = LockHeaders(txMan, numSentinelLock);
         if (rc != RC_OK) {
             if (m_lastAbortReason != OCC_ABORT_NONE) {
@@ -267,18 +342,27 @@ RC OccTransactionManager::LockHeaders(O_TxnManager* txMan, uint32_t& numSentinel
     }
 }
 
-bool OccTransactionManager::QuickHeaderValidation(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase)
+bool OccTransactionManager::QuickHeaderValidation(O_Access* access, const occ_sentinel& key, bool lockHeld,
+    bool preAbortPhase, OccWriteSetValidateMode mode)
 {
     if (access->m_type != INS) {
-        return QuickVersionCheck(access, key, lockHeld, preAbortPhase);
+        return QuickVersionCheck(access, key, lockHeld, preAbortPhase, mode);
     }
-    return QuickInsertCheck(access, key, lockHeld, preAbortPhase);
+    return QuickInsertCheck(access, key, lockHeld, preAbortPhase, mode);
 }
 
-bool OccTransactionManager::QuickInsertCheck(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase)
+bool OccTransactionManager::QuickInsertCheck(O_Access* access, const occ_sentinel& key, bool lockHeld,
+    bool preAbortPhase, OccWriteSetValidateMode mode)
 {
     (void)lockHeld;
     (void)preAbortPhase;
+
+    if (mode == OCC_WSV_LOCAL_DRAFT) {
+        if (access->m_localInsertRow != nullptr && access->m_localInsertRow->t_data != nullptr) {
+            return (access->m_csn == access->m_localInsertRow->t_data->m_rowCSN);
+        }
+        return OccQuickLocalDraftCheck(access);
+    }
 
     if (access->m_localInsertRow != nullptr && access->m_localInsertRow->t_data != nullptr) {
         return (access->m_csn == access->m_localInsertRow->t_data->m_rowCSN);
@@ -291,7 +375,6 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, const occ_sentine
     }
 
     occ_sentinel sent = access->m_origSentinel;
-    HeapTupleData tuple;
     bool relClosed = false;
     Relation rel = O_OpenRelationForValidation(m_activeTxn, relid, &relClosed);
     if (rel == nullptr || !OccTidIsPlausible(&tid, rel)) {
@@ -339,26 +422,24 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, const occ_sentine
         }
     }
 
-    Buffer buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(&sent.tuple_id));
-    LockBuffer(buffer, BUFFER_LOCK_SHARE);
-    occ_sentinel readSent = sent;
-    readSent.relation = rel;
-    readSent.GetData(&tuple, buffer);
-
-    bool ok = (tuple.t_data != nullptr) && (access->m_csn == tuple.t_data->m_rowCSN);
-
-    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-    ReleaseBuffer(buffer);
+    if (!OccReadBufferTupleVersion(access, rel, sent, false, mode)) {
+        O_CloseRelationIfOpened(rel, relClosed);
+        return false;
+    }
     O_CloseRelationIfOpened(rel, relClosed);
-
-    return ok;
+    return true;
 }
 
-bool OccTransactionManager::QuickVersionCheck(O_Access* access, const occ_sentinel& key, bool lockHeld, bool preAbortPhase)
+bool OccTransactionManager::QuickVersionCheck(O_Access* access, const occ_sentinel& key, bool lockHeld,
+    bool preAbortPhase, OccWriteSetValidateMode mode)
 {
     (void)lockHeld;
     (void)preAbortPhase;
     const bool checkLatest = true;
+
+    if (mode == OCC_WSV_LOCAL_DRAFT) {
+        return OccQuickLocalDraftCheck(access);
+    }
 
     if (access->m_type != WR && access->m_type != DEL) {
         HeapTuple localTuple = access->GetLocalVersion();
@@ -379,7 +460,6 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, const occ_sentin
     }
 
     occ_sentinel sent = access->m_origSentinel;
-    HeapTupleData tuple;
     bool relClosed = false;
     Relation rel = O_OpenRelationForValidation(m_activeTxn, relid, &relClosed);
     if (rel == nullptr || !OccTidIsPlausible(&tid, rel)) {
@@ -427,27 +507,20 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, const occ_sentin
         }
     }
 
-    Buffer buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(&sent.tuple_id));
-    LockBuffer(buffer, BUFFER_LOCK_SHARE);
-    occ_sentinel readSent = sent;
-    readSent.relation = rel;
-    readSent.GetData(&tuple, buffer);
-
-    bool ok = OccTupleVersionMatches(access, tuple.t_data, checkLatest);
-
-    LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-    ReleaseBuffer(buffer);
+    if (!OccReadBufferTupleVersion(access, rel, sent, checkLatest, mode)) {
+        O_CloseRelationIfOpened(rel, relClosed);
+        return false;
+    }
     O_CloseRelationIfOpened(rel, relClosed);
-
-    return ok;
+    return true;
 }
 
-bool OccTransactionManager::ValidateWriteSet(O_TxnManager* txMan)
+bool OccTransactionManager::ValidateWriteSet(O_TxnManager* txMan, OccWriteSetValidateMode mode)
 {
     O_TxnAccess* accessMgr = txMan->m_accessMgr;
     bool ok = true;
     accessMgr->ForEachWriteEntry([&](const occ_sentinel& sent, O_Access* ac) {
-        if (ok && !QuickHeaderValidation(ac, sent, false, false)) {
+        if (ok && !QuickHeaderValidation(ac, sent, false, false, mode)) {
             ok = false;
         }
     });
