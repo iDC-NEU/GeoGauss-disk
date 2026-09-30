@@ -247,6 +247,7 @@ void E_NodeManager::SetLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId, u
     }
 
 EPOCH_COUNTER_INC(IncChangeSetTxnCounters, change_set_txn)
+EPOCH_COUNTER_DEC(DecChangeSetTxnCounters, change_set_txn)
 EPOCH_COUNTER_OP(GetChangeSetTxnCounters, change_set_txn, .load(std::memory_order_acquire), )
 
 uint64_t E_NodeManager::IncExecutingTxnCounters(uint64_t epochId, uint64_t nodeId)
@@ -296,6 +297,7 @@ bool E_NodeManager::DecExecutingTxnCounters(uint64_t epochId, uint64_t nodeId)
 EPOCH_COUNTER_OP(GetExecutingTxnCounters, executing_txn, .load(std::memory_order_acquire), )
 
 EPOCH_COUNTER_INC(IncLocalPackTxnCounters, local_pack_txn)
+EPOCH_COUNTER_DEC(DecLocalPackTxnCounters, local_pack_txn)
 EPOCH_COUNTER_OP(GetLocalPackTxnCounters, local_pack_txn, .load(std::memory_order_acquire), )
 
 uint64_t E_NodeManager::GetSealedPackTxnCounters(uint64_t epochId, uint64_t nodeId)

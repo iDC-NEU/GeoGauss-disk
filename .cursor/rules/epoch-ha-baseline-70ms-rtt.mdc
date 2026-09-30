@@ -35,7 +35,7 @@ Measured tpmTOTAL = 5776.86
 
 ## 与 epoch 的对比方式
 
-| 项目 | 一主一备 | epoch（stats-nogate） |
+| 项目 | 一主一备 | epoch（wait） |
 |------|----------|------------------------|
 | 写路径 | 单 primary | 双节点同时写 |
 | TPCC | 一条打主 | node0 + node2 各一条 |

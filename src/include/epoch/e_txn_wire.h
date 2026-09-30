@@ -15,6 +15,8 @@ static constexpr uint32_t EPOCH_MAX_WIRE_TXN_BYTES = 256 * 1024;
 static constexpr uint16_t EPOCH_WIRE_MAX_PK = 128;
 /* 空包 + 该 CSN 表示请求对端重发某 epoch 的缓存事务 */
 static constexpr uint64_t EPOCH_WIRE_TXN_REQUEST_CSN = UINT64_MAX;
+/* PA 激活：带一行，expected_csn = 协助区间终点，relid = session */
+static constexpr uint64_t EPOCH_WIRE_PA_ACTIVATE_CSN = UINT64_MAX - 1;
 
 struct E_WireRow {
     EpochOpType op_type{EPOCH_OP_READ};
@@ -66,7 +68,13 @@ static inline bool E_WireTxnIsHello(const E_WireTxn& txn)
 
 static inline bool E_WireTxnIsEpochEnd(const E_WireTxn& txn)
 {
-    return txn.rows.empty() && txn.epoch > 0 && txn.csn != EPOCH_WIRE_TXN_REQUEST_CSN;
+    return txn.rows.empty() && txn.epoch > 0 && txn.csn != EPOCH_WIRE_TXN_REQUEST_CSN &&
+           txn.csn != EPOCH_WIRE_PA_ACTIVATE_CSN;
+}
+
+static inline bool E_WireTxnIsPaActivate(const E_WireTxn& txn)
+{
+    return txn.csn == EPOCH_WIRE_PA_ACTIVATE_CSN && txn.epoch > 0;
 }
 
 static inline bool E_WireTxnIsTxnRequest(const E_WireTxn& txn)

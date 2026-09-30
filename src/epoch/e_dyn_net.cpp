@@ -291,8 +291,8 @@ bool EpochDynNetPublish(const std::string& payload)
     pkt.wire_payload = payload;
     pkt.from_node_id = static_cast<int32_t>(EpochGetNodeId());
 
-    /* PUB/SUB 广播：target 用 0 占位 */
-    net->SendMessage(pkt, 0, false);
+    /* target -1：广播。限速记在本节点上行，发出时走 PUB。 */
+    net->SendMessage(pkt, -1, false);
     EpochDynNetFlushOutgoing();
     return true;
 }
@@ -435,31 +435,10 @@ void EpochDynNetObserveEpochEnd(uint64_t epoch)
 
 void EpochDynNetMaybeCatchup(void)
 {
-    if (!EpochDynNetIsEnabled() || !g_epoch_dyn_net_catchup) {
-        return;
-    }
-
-    DnNetworkConfig cfg = DnRuntime::Instance().GetConfig();
-    if (!DnIsConfiguredSlow(cfg, cfg.local_node_id)) {
-        return;
-    }
-
-    DnRuntime& rt = DnRuntime::Instance();
-    DnNetworkModule* net = rt.Net();
-    if (net == nullptr) {
-        return;
-    }
-
-    uint64_t local_phys = E_NodeManager::GetPhysicalEpoch();
-    DnProposalStrategy strategy =
-        rt.ConsultProposal(static_cast<int32_t>(local_phys));
-
-    if (strategy.action != DnStrategyAction::JUMP || strategy.jump_delta <= 0) {
-        return;
-    }
-
-    (void)rt.ExecuteCatchupJump(strategy.target_epoch);
-    E_NodeManager::SetPhysicalEpoch(static_cast<uint64_t>(strategy.target_epoch));
+    /*
+     * DBR 在 e_pacer：只后移还没进发送队列的写集，并用原来的 epoch-end 关窗。
+     * 这里不再改 physical epoch，避免跳过的 epoch 没有 EOF。
+     */
 }
 
 void EpochDynNetMaybeEmitProxySnapshot(uint64_t epoch)

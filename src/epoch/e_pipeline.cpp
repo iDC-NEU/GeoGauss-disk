@@ -27,6 +27,7 @@
 #include "epoch/e_txn_wire.h"
 #include "epoch/e_wire_envelope.h"
 #include "epoch/e_send_queue.h"
+#include "epoch/e_pacer.h"
 #include "epoch/e_perf.h"
 #include "epoch/e_concurrent_map.h"
 
@@ -185,6 +186,19 @@ static void EpochPipelineRememberWireTxn(uint64_t epoch, const E_WireTxn& txn)
 {
     g_epoch_wire_txns.Modify(epoch, [&](std::vector<E_WireTxn>& txns, bool /*is_new*/) {
         txns.push_back(txn);
+    });
+}
+
+static void EpochPipelineForgetWireTxn(uint64_t epoch, uint64_t wire_key)
+{
+    g_epoch_wire_txns.Modify(epoch, [&](std::vector<E_WireTxn>& txns, bool /*is_new*/) {
+        for (size_t i = txns.size(); i > 0; --i) {
+            if (EpochPipelineWireTxnKey(txns[i - 1]) != wire_key) {
+                continue;
+            }
+            txns.erase(txns.begin() + static_cast<std::ptrdiff_t>(i - 1));
+            break;
+        }
     });
 }
 
@@ -1193,6 +1207,10 @@ bool EpochPipelinePackWorkerTick(uint32_t pack_id, uint32_t n_pack)
         return false;
     }
 
+    if (pack_id == 0) {
+        EpochPacerPackTick();
+    }
+
     bool progress = EpochPipelineDrainLocalQueueWindow();
 
     const uint64_t logical = E_NodeManager::GetLogicalEpoch();
@@ -1212,49 +1230,68 @@ bool EpochPipelinePackWorkerTick(uint32_t pack_id, uint32_t n_pack)
     return progress;
 }
 
+static void EpochPipelineFinishSendItem(EpochSendItem* item)
+{
+    E_WireTxn txn;
+    if (!E_WireDeserializeTxn(item->wire.data(), item->wire.size(), &txn)) {
+        if (!item->is_epoch_end) {
+            EpochSendNoteSent(item->wire.size());
+        }
+        return;
+    }
+
+    bool sent = EpochPipelineSendWire(item->wire, txn);
+    if (item->is_epoch_end && !sent) {
+        sent = EpochPipelineSendWire(item->wire, txn);
+    }
+    if (item->is_epoch_end) {
+        if (!sent) {
+            EpochRecvDiagLogEpochEndSend("FAIL", item->epoch, item->wire.size());
+            if (!EpochTxnQueuePush(item->epoch, item->wire.data(), static_cast<uint32_t>(item->wire.size()))) {
+                /* send 队列回灌：避免 epoch-end 丢失 */
+                (void)EpochSendEnqueue(item->epoch, true, item->wire);
+                ereport(WARNING,
+                    (errmsg("epoch send: epoch-end send failed and re-queue full for epoch %lu", item->epoch)));
+            }
+            return;
+        }
+        EpochRecvDiagLogEpochEndSend("OK", item->epoch, item->wire.size());
+        EpochPerfNoteEpochEndSend(item->wire.size());
+        EpochPipelineMarkSelfEpochEndSent(item->epoch);
+        return;
+    }
+
+    /* 离开发送队列：无论 ZMQ 是否收下，都不再算作未发出。 */
+    EpochSendNoteSent(item->wire.size());
+    if (sent) {
+        EpochNetNotePayloadSent(item->wire.size());
+        EpochPerfNoteWireTxnSend(txn, item->wire.size());
+    }
+}
+
 bool EpochPipelineSendWorkerTick(void)
 {
     if (!EpochPipelinePackSendActive()) {
         return false;
     }
 
+    EpochNetPollUplink();
+
     /* 独占 PUB：hello 也走 Send，避免与 txn/epoch-end 并发 socket */
     EpochNetMaybePublishHello();
+
+    /* EOF 先于还堆在队列里的旧数据出门，后移过的 epoch 不必等上行把写集爬完。 */
+    EpochSendItem eof_item;
+    if (EpochSendTryDequeueEpochEnd(&eof_item)) {
+        EpochPipelineFinishSendItem(&eof_item);
+        return true;
+    }
 
     EpochSendItem item;
     if (!EpochSendTryDequeue(&item)) {
         return false;
     }
-
-    E_WireTxn txn;
-    if (!E_WireDeserializeTxn(item.wire.data(), item.wire.size(), &txn)) {
-        return true;
-    }
-
-    bool sent = EpochPipelineSendWire(item.wire, txn);
-    if (item.is_epoch_end && !sent) {
-        sent = EpochPipelineSendWire(item.wire, txn);
-    }
-    if (item.is_epoch_end) {
-        if (!sent) {
-            EpochRecvDiagLogEpochEndSend("FAIL", item.epoch, item.wire.size());
-            if (!EpochTxnQueuePush(item.epoch, item.wire.data(), static_cast<uint32_t>(item.wire.size()))) {
-                /* send 队列回灌：避免 epoch-end 丢失 */
-                (void)EpochSendEnqueue(item.epoch, true, item.wire);
-                ereport(WARNING,
-                    (errmsg("epoch send: epoch-end send failed and re-queue full for epoch %lu", item.epoch)));
-            }
-            return true;
-        }
-        EpochRecvDiagLogEpochEndSend("OK", item.epoch, item.wire.size());
-        EpochPerfNoteEpochEndSend(item.wire.size());
-        EpochPipelineMarkSelfEpochEndSent(item.epoch);
-        return true;
-    }
-
-    if (sent) {
-        EpochPerfNoteWireTxnSend(txn, item.wire.size());
-    }
+    EpochPipelineFinishSendItem(&item);
     return true;
 }
 
@@ -1378,6 +1415,16 @@ static bool EpochPipelineHandleDrainedLocalWire(const char* buffer, uint32_t len
         EpochPipelineMarkSelfEpochEndSent(txn.epoch);
         return true;
     }
+    if (EpochPacerHoldLocal(txn, wire)) {
+        return true;
+    }
+    /*
+     * DBR 目的 epoch 还在关窗窗口外。先从本地提交队列取出，但不要写入 merge 环：
+     * merge 只消费 merge_epoch，未来行写满后 Submit 失败会把 pack 线程打退出。
+     */
+    if (txn.epoch > EpochPipelineSealAheadMaxEpoch() && EpochPacerParkLocal(txn.epoch, wire)) {
+        return true;
+    }
     EpochRemoteMergeEnqueue(txn);
     EpochWireDiagLogTxnSend(txn);
     if (EpochPipelinePackSendActive()) {
@@ -1412,14 +1459,22 @@ static bool EpochPipelineDrainLocalQueueForEpoch(uint64_t epoch)
 static bool EpochPipelineDrainLocalQueueWindow(void)
 {
     const uint64_t logical = E_NodeManager::GetLogicalEpoch();
-    const uint64_t seal_max = EpochPipelineSealAheadMaxEpoch();
+    uint64_t drain_end = EpochPipelineSealAheadMaxEpoch();
+    /*
+     * DBR 把新事务分到目的 epoch 后，该 epoch 可能还在 seal 窗口外面。
+     * 不把它们取出的话，本地队列会堆满并让提交失败。
+     */
+    uint64_t floor = EpochPacerAssignmentFloor();
+    if (floor > drain_end) {
+        drain_end = floor;
+    }
     bool progress = false;
     /* 先旧后新：更早 epoch 的 pack/epoch-end 优先出门 */
     uint64_t begin = logical;
     if (begin > 0) {
         begin = logical - 1;
     }
-    for (uint64_t epoch = begin; epoch <= seal_max; ++epoch) {
+    for (uint64_t epoch = begin; epoch <= drain_end; ++epoch) {
         progress = EpochPipelineDrainLocalQueueForEpoch(epoch) || progress;
     }
     return progress;
@@ -1430,13 +1485,13 @@ static bool EpochPipelineDrainLocalQueueWindow(void)
  * 必须先 Remember 再 Submit：async Claim 可能在 Submit 返回前 Finish，
  * 否则 FindWireTxn 失败 → ERROR（node3 epoch=96 wire_key=1315）。
  */
-static void EpochPipelineSubmitMergeWireTxn(const E_WireTxn& txn)
+static bool EpochPipelineTrySubmitMergeWireTxn(const E_WireTxn& txn)
 {
     uint64_t wire_key = EpochPipelineWireTxnKey(txn);
 
     /* 持久受理去重：成功 merge 后仍保留，直到 epoch clear */
     if (!EpochConcurrent::U64SetInsert(g_merge_accepted_wires, txn.epoch, wire_key)) {
-        return;
+        return true;
     }
 
     EpochPipelineRememberWireTxn(txn.epoch, txn);
@@ -1444,16 +1499,28 @@ static void EpochPipelineSubmitMergeWireTxn(const E_WireTxn& txn)
     bool is_local = (txn.server_id == EpochGetNodeId());
     if (!EpochMergePoolSubmit(txn, wire_key, is_local)) {
         EpochConcurrent::U64SetErase(g_merge_accepted_wires, txn.epoch, wire_key);
-        ereport(ERROR,
-            (errmsg("epoch: merge submit failed epoch=%lu wire_key=%lu (serialize/inline); "
-                    "increase epoch_merge_queue_capacity if async queue was full",
-                static_cast<unsigned long>(txn.epoch),
-                static_cast<unsigned long>(wire_key))));
+        EpochPipelineForgetWireTxn(txn.epoch, wire_key);
+        return false;
     }
+    return true;
 }
 
-static bool EpochPipelineHandleIncomingWire(const E_WireTxn& txn, size_t wire_bytes)
+static void EpochPipelineSubmitMergeWireTxn(const E_WireTxn& txn)
 {
+    if (EpochPipelineTrySubmitMergeWireTxn(txn)) {
+        return;
+    }
+    ereport(ERROR,
+        (errmsg("epoch: merge submit failed epoch=%lu (serialize/queue full); "
+                "increase epoch_merge_queue_capacity if async queue was full",
+            static_cast<unsigned long>(txn.epoch))));
+}
+
+static bool EpochPipelineHandleIncomingWire(const E_WireTxn& txn, size_t wire_bytes, const std::string& wire)
+{
+    if (EpochPacerOnIncoming(txn, wire)) {
+        return true;
+    }
     if (E_WireTxnIsTxnRequest(txn)) {
         EpochMarkPeerConnected(txn.server_id);
         return true;
@@ -1483,9 +1550,6 @@ static bool EpochPipelineHandleIncomingWire(const E_WireTxn& txn, size_t wire_by
             E_NodeManager::IsNodeReceiveCompleted(txn.epoch, txn.server_id) ? 1 : 0);
         EpochOnEpochEndWireReceived(txn);
         return true;
-    }
-    if (EpochDynNetIsProxySlowNode()) {
-        return false;
     }
     EpochMarkPeerConnected(txn.server_id);
     EpochDynNetObserveWireTxn(txn);
@@ -1518,7 +1582,7 @@ static bool EpochPipelineRecvIncomingOnce(void)
             if (!E_WireDeserializeTxn(wire.data(), wire.size(), &txn)) {
                 continue;
             }
-            (void)EpochPipelineHandleIncomingWire(txn, wire.size());
+            (void)EpochPipelineHandleIncomingWire(txn, wire.size(), wire);
         }
         return progress;
     }
@@ -1532,7 +1596,7 @@ static bool EpochPipelineRecvIncomingOnce(void)
         if (!E_WireDeserializeTxn(wire.data(), wire.size(), &txn)) {
             continue;
         }
-        (void)EpochPipelineHandleIncomingWire(txn, wire.size());
+        (void)EpochPipelineHandleIncomingWire(txn, wire.size(), wire);
     }
     return progress;
 }
@@ -2014,10 +2078,34 @@ void EpochPipelineInjectRemoteWireTxn(const E_WireTxn& txn)
 
 bool EpochPipelineSendWire(const std::string& wire, const E_WireTxn& txn)
 {
-    if (EpochDynNetProxyEnabled()) {
+    if (EpochPacerRouteSend(wire, txn)) {
+        return true;
+    }
+    if (EpochDynNetProxyEnabled() && !EpochPacerPaEnabled()) {
         return EpochDynNetPublishWireTxn(wire, txn);
     }
     return EpochNetPublish(wire);
+}
+
+bool EpochPipelineAdmitLocalWire(const E_WireTxn& txn, const std::string& wire)
+{
+    if (wire.empty()) {
+        return false;
+    }
+    if (!EpochPipelineTrySubmitMergeWireTxn(txn)) {
+        return false;
+    }
+    if (EpochPipelinePackSendActive()) {
+        if (!EpochSendEnqueue(txn.epoch, false, wire)) {
+            ereport(WARNING,
+                (errmsg("epoch pacer: send-enqueue failed epoch=%lu", txn.epoch)));
+        }
+        return true;
+    }
+    if (EpochPipelineSendWire(wire, txn)) {
+        EpochPerfNoteWireTxnSend(txn, wire.size());
+    }
+    return true;
 }
 
 bool EpochPipelinePublishWire(const std::string& wire, const E_WireTxn& txn)

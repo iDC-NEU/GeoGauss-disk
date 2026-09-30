@@ -10,6 +10,7 @@
 #include "epoch/e_merge_pool.h"
 #include "epoch/e_epoch_lifecycle.h"
 #include "epoch/e_statistician.h"
+#include "epoch/e_pacer.h"
 #include "epoch/e_perf.h"
 
 #include <unordered_map>
@@ -322,6 +323,12 @@ uint64_t EpochAssignTxnEpoch(void)
     /*
      * GeoGauss：直接用 physical 发号。physical 领先 logical 的上限由
      * EpochAdvancePhysicalOnce 的 gap_limit 背压保证；sync START gate 再约束执行时机。
+     * DBR 抬过分配下界后，新写集不再填回已经让出的 epoch。
      */
-    return E_NodeManager::GetPhysicalEpoch();
+    uint64_t epoch = E_NodeManager::GetPhysicalEpoch();
+    uint64_t floor = EpochPacerAssignmentFloor();
+    if (floor > epoch) {
+        epoch = floor;
+    }
+    return epoch;
 }

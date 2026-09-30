@@ -271,5 +271,5 @@ merge 置 complete 时顺带 feed apply，少一跳延迟。（已在 P1–P2 �
 | Pack×5 + Send×1 | `e_pack_worker_main` / `e_send_worker_main` + `e_send_queue`；`EpochPipelinePackWorkerTick` / `SendWorkerTick`；postmaster 拉起 |
 | Coord 不再 drain/seal | `EpochPipelinePackSendActive` 时 `AdvanceMainWorkerStages` 仅 DynNet GC |
 
-**验证**：`pack=25`、33t、`stats-nogate`；看 seal→merge / merge→apply / logical；日志应有 `epoch pack worker started` ×5、`epoch send worker started`、`epoch merge worker started`。  
+**验证**：`pack=25`、33t、`wait`；看 seal→merge / merge→apply / logical；日志应有 `epoch pack worker started` ×5、`epoch send worker started`、`epoch merge worker started`。  
 **用户全量链接**：`cd src/gausskernel && make -sj4 gaussdb` 后 `prep` + TPCC。

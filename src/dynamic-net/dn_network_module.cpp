@@ -107,7 +107,8 @@ bool DnNetworkModule::IsDroppable(const DnNetworkPacket &pkt) const
 
 void DnNetworkModule::SendMessage(const DnNetworkPacket &pkt, int target_node_id, bool is_reply)
 {
-    if (target_node_id < 0 && !is_reply) {
+    /* target_node_id < 0 是广播，仍然按本节点上行带宽排队。 */
+    if (target_node_id < -1 && !is_reply) {
         return;
     }
 

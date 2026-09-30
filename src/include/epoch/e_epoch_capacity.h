@@ -17,8 +17,13 @@ static constexpr uint32_t EPOCH_DEFAULT_CRDT_INSERTS_PER_SLOT = 2048;
 /* 未来 epoch 按格位预放；容量须覆盖 [merge_epoch, physical) 在途，与 apply 同档 */
 static constexpr uint32_t EPOCH_DEFAULT_MERGE_QUEUE_CAPACITY = 8192;
 static constexpr uint32_t EPOCH_DEFAULT_MERGE_DONE_CAPACITY = 8192;
-/* GeoGauss：apply 入环不许失败；默认加大，满则 ERROR（勿用 pending 重试） */
-static constexpr uint32_t EPOCH_DEFAULT_APPLY_QUEUE_CAPACITY = 8192;
+/*
+ * GeoGauss：apply 入环不许失败，满则 ERROR。
+ * 实际每列深度 = capacity / (epoch 槽数 × apply 线程数)。
+ * 32 槽 × 10 线程时，8192 只有深度 25。DBR 会把数百个写集堆进同一个 epoch，
+ * 81920 对应深度 256（单 epoch 可容纳 2560），盖住这种堆积。
+ */
+static constexpr uint32_t EPOCH_DEFAULT_APPLY_QUEUE_CAPACITY = 81920;
 static constexpr uint32_t EPOCH_DEFAULT_APPLY_DONE_CAPACITY = 8192;
 
 extern uint32_t EpochGetTxnQueueCapacity(void);

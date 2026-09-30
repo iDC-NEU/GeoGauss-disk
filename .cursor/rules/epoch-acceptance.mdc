@@ -1,11 +1,11 @@
 ---
-description: Epoch 多主验收（stats-nogate；P0 持平主备；P1 终端/库扩展；P2×3 主备；一致性）
+description: Epoch 多主验收（wait；P0 持平主备；P1 终端/库扩展；P2×3 主备；一致性）
 alwaysApply: true
 ---
 
 # Epoch 项目验收标准
 
-性能优化、架构改动、回归验证均以 **`EPOCH_PROFILE=stats-nogate`** 为**验收 profile**（默认 **`synchronous_commit=off`**）。
+性能优化、架构改动、回归验证均以 **`EPOCH_PROFILE=wait`** 为**验收 profile**（默认 **`synchronous_commit=off`**）。同参数的 `dbr` / `pa` / `het` 只多开对应开关，不作为 Wait 验收档。
 
 **对比系统**：同机器配置下的 **openGauss 一主一备**，网络 **RTT=70ms**（见 `epoch-ha-baseline-70ms-rtt.mdc`）。
 
@@ -17,7 +17,7 @@ alwaysApply: true
 ### 共同前提（每一级都要满足）
 
 1. **节点数据一致**：`verify_epoch_end_consistency.sh` 通过  
-2. 配置与网络：`stats-nogate`、RTT≈70ms  
+2. 配置与网络：`wait`、RTT≈70ms  
 3. **压测机尽量空闲**：共享机上有他人重负载时结果勿作基线（对照 MemAvailable / 高 CPU 进程）
 
 ### 性能三级目标
@@ -34,7 +34,7 @@ alwaysApply: true
 
 #### P0 现状（参考基线，勿与嘈杂轮次混淆）
 
-安静机、`stats-nogate`、warehouses=100、**33 terminals**、Session 窗：
+安静机、`wait`、warehouses=100、**33 terminals**、Session 窗：
 
 | 轮次 | commit_threads | 双端合计 tpmC | 备注 |
 |------|----------------|---------------|------|
@@ -78,16 +78,16 @@ P2: sum ≥ 3 × 46217.44 = 138652.32 ≈ 138653
 - 一主一备为**单点写主**一条 TPCC；epoch 为**双节点各一条**。用 **tpmC 之和** 对比。  
 - 旧 epoch 内部 gate-on 基线（`epoch-tpcc-baseline-70ms-rtt.mdc`）仅**研发对照**，不作通过门槛。
 
-## 1. Epoch profile：`stats-nogate`
+## 1. Epoch profile：`wait`
 
 ```bash
-export EPOCH_PROFILE=stats-nogate
+export EPOCH_PROFILE=wait
 ```
 
 对应 `configure_node.sh`：`epoch_sync_start_gate=off`、当前脚本默认 **`epoch_phys_logical_gap_limit=5`**、`physical_interval_ms=max(10, RTT)`（RTT=70 时为 70ms）、`synchronous_commit=off`、`epoch_commit_threads` / `epoch_merge_threads` 以 profile/覆盖为准，并开启诊断日志。
 
 ```bash
-export EPOCH_PROFILE=stats-nogate
+export EPOCH_PROFILE=wait
 export EPOCH_NETWORK_RTT_MS=70
 bash scripts/epoch_benchmark/prep_tpcc_cluster.sh
 ```
@@ -110,7 +110,7 @@ bash scripts/epoch_benchmark/prep_tpcc_cluster.sh
 
 ## 验证清单
 
-- [ ] `stats-nogate`：`start_gate=off`，**`synchronous_commit=off`**
+- [ ] `wait`：`start_gate=off`，**`synchronous_commit=off`**
 - [ ] RTT≈70ms，`epoch_physical_interval_ms=70`
 - [ ] **P0**：33 档双端合计 **≥ 46218**（已达标则回归时勿无故回退）
 - [ ] **P1-a**：50 terminals 相对 33 **有明显 tpmC 扩展** + 一致性

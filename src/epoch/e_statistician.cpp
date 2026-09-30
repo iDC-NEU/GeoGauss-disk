@@ -8,6 +8,7 @@
 #include "epoch/e_types.h"
 #include "epoch/e_net.h"
 #include "epoch/e_pipeline.h"
+#include "epoch/e_pacer.h"
 #include "epoch/e_txn_wire.h"
 #include "epoch/e_txn_queue.h"
 #include "epoch/e_txn_wire.h"
@@ -716,6 +717,8 @@ bool EpochTrySealEpoch(uint64_t epoch)
     }
 
     E_NodeManager::EnsureEpochSlot(epoch);
+    /* 先改记写集，再读 pack 计数，EOF 里不要包含已经挪走的事务。 */
+    EpochPacerBeforeSeal(epoch);
 
     uint32_t node_id = EpochGetNodeId();
     uint64_t packed = E_NodeManager::GetLocalPackTxnCounters(epoch, node_id);
@@ -750,6 +753,11 @@ bool EpochTrySealEpoch(uint64_t epoch)
 
     if (EpochSealBlockedByPeerLag(epoch, node_id)) {
         EpochRecvDiagLogSealBlock(epoch, "peer_lag");
+        return false;
+    }
+
+    if (EpochPacerBlocksSeal(epoch)) {
+        EpochRecvDiagLogSealBlock(epoch, "pacer_hold");
         return false;
     }
 

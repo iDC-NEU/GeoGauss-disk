@@ -261,10 +261,7 @@ bool EpochMergeQueueSubmit(uint64_t epoch,
 
     const uint32_t slot_idx = EpochMergeEpochSlotIndex(epoch);
     if (!EpochMergeEnsureEpochRow(slot_idx, epoch)) {
-        ereport(ERROR,
-            (errmsg("epoch merge queue submit: ensure row failed epoch=%lu (bound/inflight conflict); "
-                    "increase epoch_merge_queue_capacity",
-                static_cast<unsigned long>(epoch))));
+        return false;
     }
 
     const uint32_t depth = EpochMergeQueueDepth();
@@ -282,13 +279,7 @@ bool EpochMergeQueueSubmit(uint64_t epoch,
         }
     }
     if (chosen == nullptr) {
-        ereport(ERROR,
-            (errmsg("epoch merge queue full: epoch=%lu worker=%u depth=%u capacity=%u; "
-                    "increase epoch_merge_queue_capacity (no recv defer)",
-                static_cast<unsigned long>(epoch),
-                wid,
-                depth,
-                EpochGetMergeQueueCapacity())));
+        return false;
     }
 
     chosen->epoch = epoch;
