@@ -19,7 +19,7 @@ bool g_enable_occ_staging = false;
 
 bool OccStagingOverlayEnabled(void)
 {
-    return g_enable_occ_staging || g_enable_occ_delta;
+    return g_enable_occ_staging;
 }
 
 void OccStagingModuleInit(void)

@@ -1443,6 +1443,7 @@ void knl_u_epoch_init(knl_u_epoch_context* epoch_cxt)
 {
     Assert(epoch_cxt != NULL);
     epoch_cxt->txn_epoch = 0;
+    epoch_cxt->txn_start_us = 0;
     epoch_cxt->epoch_assigned = false;
     epoch_cxt->deferred_commit = false;
     epoch_cxt->epoch_exec_counted = false;

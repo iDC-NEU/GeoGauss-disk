@@ -68,6 +68,9 @@ bool E_WireSerializeTxn(const E_WireTxn& txn, std::string* out)
     if (EPOCH_WIRE_VERSION >= 6) {
         AppendU16(out, txn.route_wid);
     }
+    if (EPOCH_WIRE_VERSION >= 7) {
+        AppendU64(out, txn.origin_start_us);
+    }
     AppendU32(out, static_cast<uint32_t>(txn.rows.size()));
 
     for (const auto& row : txn.rows) {
@@ -122,8 +125,8 @@ bool E_WireDeserializeTxn(const char* data, size_t len, E_WireTxn* out)
         return false;
     }
     if (!ReadU32(p, end, &version) ||
-        (version != EPOCH_WIRE_VERSION && version != 5 && version != 4 && version != 3 && version != 2 &&
-            version != 1)) {
+        (version != EPOCH_WIRE_VERSION && version != 6 && version != 5 && version != 4 && version != 3 &&
+            version != 2 && version != 1)) {
         return false;
     }
     if (!ReadU64(p, end, &out->csn)) {
@@ -153,6 +156,12 @@ bool E_WireDeserializeTxn(const char* data, size_t len, E_WireTxn* out)
     out->route_wid = 0;
     if (version >= 6) {
         if (!ReadU16(p, end, &out->route_wid)) {
+            return false;
+        }
+    }
+    out->origin_start_us = 0;
+    if (version >= 7) {
+        if (!ReadU64(p, end, &out->origin_start_us)) {
             return false;
         }
     }

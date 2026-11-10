@@ -50,17 +50,8 @@ inline O_TxnManager *GetTxnManager()
     return u_sess->occ_cxt.txn_manager;
 }
 
-/* 开关：true = commit 写 heap 后镜像 delta，读路径优先查 delta 分片表 */
-extern bool g_enable_occ_delta;
-
 /* occ_enable_stats_log GUC：true 时每次 commit/abort 写 OCC_STATS；false 时每 1024 次采样 */
 extern bool g_occ_enable_stats_log;
-
-/* 简单 C 接口，方便测试或后续挂接到 GUC */
-inline void O_SetDeltaMode(bool enable_delta)
-{
-    g_enable_occ_delta = enable_delta;
-}
 
 /* 从 sentinel 安全解析 relid，避免使用失效 relation 指针或 arena 残留垃圾值 */
 static inline Oid OccResolveRelid(const occ_sentinel &sent)

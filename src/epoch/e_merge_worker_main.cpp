@@ -14,10 +14,13 @@
 #include "epoch/e_log_path.h"
 #include "epoch/e_merge_pool.h"
 #include "epoch/e_merge_shmem.h"
+#include "epoch/e_perf.h"
 #include "epoch/e_merge_profile.h"
 #include "epoch/e_node_manager.h"
 #include "epoch/e_pipeline.h"
+#include "epoch/e_pacer.h"
 #include "epoch/e_statistician.h"
+#include "epoch/e_stuck_trace.h"
 #include "epoch/e_txn_wire.h"
 #include "epoch/e_types.h"
 #include "knl/knl_instance.h"
@@ -66,81 +69,37 @@ static uint32_t EpochMergeWorkerNumWorkers(void)
     return static_cast<uint32_t>(n);
 }
 
-static bool EpochMergeWorkerExecuteTask(EpochMergeTaskSlot* task)
+/* 当前 worker 正在处理的写集，ERROR 恢复时用来补记（避免 merged 少一笔） */
+static thread_local bool g_merge_task_active = false;
+static thread_local uint64_t g_merge_task_epoch = 0;
+static thread_local uint64_t g_merge_task_wire_key = 0;
+
+/*
+ * 合并一笔写集。全部工作就两步：
+ *   ① CRDT 合并（冲突裁决、abort 记录、赢家入 apply 都在里面）
+ *   ② merged++（merged == declared 时 merge 游标才会前进）
+ */
+static void EpochMergeWorkerExecuteOne(const E_WireTxn& txn)
 {
-    EpochMergeProfileBeginWireTxn();
-    if (task->submit_us > 0) {
-        struct timeval tv;
-        gettimeofday(&tv, nullptr);
-        uint64_t now_us = static_cast<uint64_t>(tv.tv_sec) * 1000000ULL + static_cast<uint64_t>(tv.tv_usec);
-        if (now_us >= task->submit_us) {
-            EpochMergeProfileAddUs(EMP_QUEUE_WAIT, now_us - task->submit_us);
-        }
-    }
+    g_merge_task_active = true;
+    g_merge_task_epoch = txn.epoch;
+    g_merge_task_wire_key = txn.csn ^ (static_cast<uint64_t>(txn.server_id) << 48);
 
-    E_WireTxn txn;
-    instr_time deserialize_start;
-    INSTR_TIME_SET_CURRENT(deserialize_start);
-    bool deserialized = E_MergeTaskDeserialize(task->payload, task->payload_len, &txn);
-    instr_time deserialize_end;
-    INSTR_TIME_SET_CURRENT(deserialize_end);
-    INSTR_TIME_SUBTRACT(deserialize_end, deserialize_start);
-    EpochMergeProfileAddUs(EMP_DESERIALIZE, static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(deserialize_end)));
+    /* ① CRDT 合并（冲突裁决、abort 记录、赢家入 apply 都在里面完成） */
+    (void)EpochCrdtShmemMergeWireTxn(txn);
 
-    if (!deserialized) {
-        ereport(WARNING,
-            (errmsg("epoch merge worker: failed to deserialize wire txn epoch=%lu wire_key=%lu",
-                task->epoch,
-                task->wire_key)));
-        EpochMergeDoneSlot done;
-        done.epoch = task->epoch;
-        done.wire_key = task->wire_key;
-        done.csn = 0;
-        done.server_id = 0;
-        done.ok = 0;
-        done.txn_accepted = 0;
-        done.any_new_merged = 0;
-        done.pad = 0;
-        instr_time finish_start;
-        INSTR_TIME_SET_CURRENT(finish_start);
-        EpochMergeQueueFinishTask(task, &done);
-        EpochMergePoolInvokeDoneHook(&done);
-        instr_time finish_end;
-        INSTR_TIME_SET_CURRENT(finish_end);
-        INSTR_TIME_SUBTRACT(finish_end, finish_start);
-        EpochMergeProfileAddUs(EMP_QUEUE_FINISH, static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(finish_end)));
-        EpochMergeProfileEndWireTxn(task->epoch, 0, 0, false);
-        return false;
-    }
+    /* PA：被跳过片里判赢的事务，缓存起来等这片 merge 完再转发给慢节点 */
+    EpochPacerPaMaybeBufferMerged(txn);
 
-    E_CrdtMergeOutcome outcome = EpochCrdtShmemMergeWireTxn(txn);
-    bool ok = !outcome.resource_failure;
-    instr_time post_start;
-    INSTR_TIME_SET_CURRENT(post_start);
-    if (ok) {
-        EpochAbortCsnRecordMergeOutcome(txn.epoch, txn, outcome);
-        /* 赢家入 apply 环：仅在 Finish→done hook（OnAsyncMergeTaskDone），此处不投 */
-    } else {
-        EpochDiagLogMergeLoserAbortCsn(txn.epoch, txn.csn, txn.server_id, true, false);
-    }
-    instr_time post_end;
-    INSTR_TIME_SET_CURRENT(post_end);
-    INSTR_TIME_SUBTRACT(post_end, post_start);
-    EpochMergeProfileAddUs(EMP_POST_HOOKS, static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(post_end)));
+    /* ② 计一笔已合并；merged == declared 时 merge 游标才会前进 */
+    const uint64_t merged_now = E_NodeManager::IncWireMergeDoneCounters(txn.epoch, EpochGetNodeId());
+    EPOCH_DBG_FPRINTF("EPOCH_DBG merged_inc epoch=%lu merged=%lu node=%u csn=%lu\n",
+        static_cast<unsigned long>(txn.epoch),
+        static_cast<unsigned long>(merged_now),
+        txn.server_id,
+        static_cast<unsigned long>(txn.csn));
 
-    EpochMergeDoneSlot done;
-    EpochMergePoolPackDoneFromOutcome(&done, txn, task->wire_key, ok, outcome);
-
-    instr_time finish_start;
-    INSTR_TIME_SET_CURRENT(finish_start);
-    EpochMergeQueueFinishTask(task, &done);
-    EpochMergePoolInvokeDoneHook(&done);
-    instr_time finish_end;
-    INSTR_TIME_SET_CURRENT(finish_end);
-    INSTR_TIME_SUBTRACT(finish_end, finish_start);
-    EpochMergeProfileAddUs(EMP_QUEUE_FINISH, static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(finish_end)));
-    EpochMergeProfileEndWireTxn(txn.epoch, txn.csn, txn.server_id, ok && outcome.txn_accepted);
-    return true;
+    g_merge_task_active = false;
 }
 
 void EpochMergeWorkerMain(void)
@@ -176,9 +135,7 @@ void EpochMergeWorkerMain(void)
     EpochLogPathInit();
     EpochAbortCsnShmemInit();
     EpochCrdtShmemInit();
-    EpochMergeQueueShmemInit();
     /* merge_complete 后顺带 ApplyQueueSubmit，需 attach apply 环 */
-    EpochApplyQueueShmemInit();
 
     gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
     (void)gs_signal_unblock_sigusr2();
@@ -216,6 +173,13 @@ void EpochMergeWorkerMain(void)
         AtEOXact_SMgr();
         AtEOXact_Files();
         AtEOXact_HashTables(false);
+        /* ERROR 恢复：把 ERROR 前正在处理的 task 归还，保证 inflight 一定归零 */
+        if (g_merge_task_active) {
+            /* 这一笔没合并成功：仍要记一笔 merged，否则该片永远差一条、游标推不动 */
+            EpochPipelineRevokeAcceptedWire(g_merge_task_epoch, g_merge_task_wire_key);
+            (void)E_NodeManager::IncWireMergeDoneCounters(g_merge_task_epoch, EpochGetNodeId());
+            g_merge_task_active = false;
+        }
         (void)MemoryContextSwitchTo(worker_context);
         MemoryContextResetAndDeleteChildren(worker_context);
         RESUME_INTERRUPTS();
@@ -233,6 +197,12 @@ void EpochMergeWorkerMain(void)
     E_ApplyWarmup();
 
     t_thrd.epoch_worker_cxt.merge_worker_id = EpochMergeWorkerResolveId();
+    EpochMergeProfileSetWorker(t_thrd.epoch_worker_cxt.merge_worker_id);
+    {
+        char trace_name[16];
+        (void)snprintf(trace_name, sizeof(trace_name), "merge%d", t_thrd.epoch_worker_cxt.merge_worker_id);
+        EpochStuckTraceRegister(trace_name);
+    }
 
     pgstat_report_appname("epoch merge worker");
     pgstat_report_activity(STATE_IDLE, NULL);
@@ -259,11 +229,14 @@ void EpochMergeWorkerMain(void)
         const uint32_t wid = static_cast<uint32_t>(t_thrd.epoch_worker_cxt.merge_worker_id);
         const uint32_t n_workers = EpochMergeWorkerNumWorkers();
 
-        /* Claim 优先：对着 merge_epoch 执行；PullTick 只推进游标/Drain/关窗 */
-        EpochMergeTaskSlot* task = nullptr;
-        if (EpochMergeQueueTryClaim(wid, n_workers, &task)) {
+        /* 从 merge_epoch 那一格取一条；取到就合并，然后让 pipeline 检查能否推进游标 */
+        const uint64_t epoch = GetMergeEpoch();
+        E_WireTxn txn;
+        EpochPipelineLogMergeStall();
+        if (epoch > 0 && EpochMergeQueueTryDequeue(epoch, &txn)) {
+            EpochStuckTraceNote(EST_MERGE_CLAIM, wid, txn.epoch);
             pgstat_report_activity(STATE_RUNNING, NULL);
-            (void)EpochMergeWorkerExecuteTask(task);
+            EpochMergeWorkerExecuteOne(txn);
             (void)EpochPipelineMergeWorkerPullTick(wid, n_workers);
             pgstat_report_activity(STATE_IDLE, NULL);
             continue;

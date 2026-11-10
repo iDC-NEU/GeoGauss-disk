@@ -7,14 +7,14 @@ class E_NodeManager {
 public:
     static uint64_t GetPhysicalEpoch(void);
     static uint64_t AddPhysicalEpoch(void);
+    /* 仅当 physical 仍等于 expected 时才推进（CAS），成功返回 true */
+    static bool TryAddPhysicalEpoch(uint64_t expected);
     static void SetPhysicalEpoch(uint64_t value);
 
     static uint64_t GetLogicalEpoch(void);
     static uint64_t AddLogicalEpoch(void);
     static void SetLogicalEpoch(uint64_t value);
 
-    static void SetStoreShouldReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
-    static void SetStoreReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
     static void SetLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId, uint64_t value);
 
     static uint64_t IncChangeSetTxnCounters(uint64_t epochId, uint64_t nodeId);
@@ -25,6 +25,9 @@ public:
     /* 成功 dec 返回 true；slot 非当前或计数已为 0 返回 false（不调用 EnsureEpochSlot）。 */
     static bool DecExecutingTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetExecutingTxnCounters(uint64_t epochId, uint64_t nodeId);
+
+    /* 在 epochId 这一片上抢一个名额序号（1 起）；格子归属不符时返回 0 */
+    static uint32_t NextPackSlotSeq(uint64_t epochId);
 
     static uint64_t IncLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t DecLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId);
@@ -38,17 +41,11 @@ public:
     static uint64_t IncWriteAbortAfterSendTxnCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetWriteAbortAfterSendTxnCounters(uint64_t epochId, uint64_t nodeId);
 
-    static uint64_t UpdateStoreShouldReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t increment);
-    static uint64_t GetStoreShouldReceivedPackCounters(uint64_t epochId, uint64_t nodeId);
 
-    static uint64_t UpdateStoreReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t increment);
-    static uint64_t GetStoreReceivedPackCounters(uint64_t epochId, uint64_t nodeId);
 
-    static void SetNodeSendCompleted(uint64_t epochId, uint64_t nodeId, bool completed);
     static bool IsNodeSendCompleted(uint64_t epochId, uint64_t nodeId);
 
     static void SetNodeReceiveCompleted(uint64_t epochId, uint64_t nodeId, bool completed);
-    static bool IsNodeReceiveCompleted(uint64_t epochId, uint64_t nodeId);
 
     static uint64_t IncWireMergeDoneCounters(uint64_t epochId, uint64_t nodeId);
     static uint64_t GetWireMergeDoneCounters(uint64_t epochId, uint64_t nodeId);
@@ -69,6 +66,7 @@ public:
 private:
     static size_t GetIndex(uint64_t epochId, uint64_t nodeId);
     static uint32_t GetSlot(uint64_t epochId);
+
 };
 
 #endif /* OPENGAUSS_E_NODE_MANAGER_H */

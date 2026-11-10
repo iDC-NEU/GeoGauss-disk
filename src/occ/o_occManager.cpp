@@ -3,7 +3,6 @@
 //
 
 #include "occ/o_txn.h"
-#include "occ/o_delta_table.h"
 #include "occ/o_staging.h"
 #include "occ/occ_internal.h"
 #include "occ/occ_stats.h"
@@ -18,9 +17,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <vector>
-
-/* 默认不启用 delta 覆盖模式 */
-bool g_enable_occ_delta = false;
 
 namespace {
 
@@ -400,28 +396,6 @@ bool OccTransactionManager::QuickInsertCheck(O_Access* access, const occ_sentine
         }
     }
 
-    if (g_enable_occ_delta && !g_enable_occ_staging) {
-        O_DeltaEntry deltaEntry;
-        if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
-            if (deltaEntry.deleted) {
-                O_CloseRelationIfOpened(rel, relClosed);
-                return false;
-            }
-            HeapTuple copy = O_DeltaTable::Instance().LookupCopyTuple(rel, &sent.tuple_id);
-            if (copy == nullptr || copy->t_data == nullptr) {
-                if (copy != nullptr) {
-                    heap_freetuple(copy);
-                }
-                O_CloseRelationIfOpened(rel, relClosed);
-                return false;
-            }
-            bool ok = (access->m_csn == copy->t_data->m_rowCSN);
-            heap_freetuple(copy);
-            O_CloseRelationIfOpened(rel, relClosed);
-            return ok;
-        }
-    }
-
     if (!OccReadBufferTupleVersion(access, rel, sent, false, mode)) {
         O_CloseRelationIfOpened(rel, relClosed);
         return false;
@@ -480,28 +454,6 @@ bool OccTransactionManager::QuickVersionCheck(O_Access* access, const occ_sentin
             }
             bool ok = OccTupleVersionMatches(access, staged->t_data, checkLatest);
             heap_freetuple(staged);
-            O_CloseRelationIfOpened(rel, relClosed);
-            return ok;
-        }
-    }
-
-    if (g_enable_occ_delta && !g_enable_occ_staging) {
-        O_DeltaEntry deltaEntry;
-        if (O_DeltaTable::Instance().Lookup(rel, &sent.tuple_id, deltaEntry)) {
-            if (deltaEntry.deleted) {
-                O_CloseRelationIfOpened(rel, relClosed);
-                return false;
-            }
-            HeapTuple copy = O_DeltaTable::Instance().LookupCopyTuple(rel, &sent.tuple_id);
-            if (copy == nullptr || copy->t_data == nullptr) {
-                if (copy != nullptr) {
-                    heap_freetuple(copy);
-                }
-                O_CloseRelationIfOpened(rel, relClosed);
-                return false;
-            }
-            bool ok = OccTupleVersionMatches(access, copy->t_data, checkLatest);
-            heap_freetuple(copy);
             O_CloseRelationIfOpened(rel, relClosed);
             return ok;
         }

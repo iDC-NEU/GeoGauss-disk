@@ -5,31 +5,24 @@
 
 #include "storage/lock/lwlock.h"
 
-/*
- * 本地 pack 出站缓冲：按 epoch%N 分环（N=WorkQueueSlotCount，与 CRDT 同）。
- * Push(epoch, …)；Drain 用 PopAny 轮询各环。
- */
-struct EpochTxnEpochRing {
-    uint64_t bound_epoch;
-    uint32_t head;
-    uint32_t tail;
-    uint32_t count;
-};
+#include "epoch/e_types.h"   /* EPOCH_MAX_NODES */
 
-struct EpochTxnQueueHeader {
-    LWLock* lock;
-    uint32_t slot_count;
-    uint32_t slots_per_epoch;
-    uint32_t total_capacity;
-};
+
 
 extern Size EpochTxnQueueShmemSize(uint32_t capacity);
 extern void EpochTxnQueueShmemInit(uint32_t capacity);
-extern bool EpochTxnQueuePush(uint64_t epoch, const char* data, uint32_t len);
-/* 从指定 epoch 环弹出；空则 false */
-extern bool EpochTxnQueuePop(uint64_t epoch, char* data, uint32_t max_len, uint32_t* out_len);
-/* 轮询非空环弹出（DrainLocalQueue） */
-extern bool EpochTxnQueuePopAny(char* data, uint32_t max_len, uint32_t* out_len, uint64_t* out_epoch);
+/*
+ * 发送队列按 peer 拆分：每个对端一份独立的 epoch 环形队列。
+ *
+ * 目的是让"某个对端慢"只阻塞它自己那条发送线程，不影响其它对端
+ * （原来只有一份队列 + 单线程串行发送，慢 peer 会把整条流水线拖停）。
+ */
+extern bool EpochTxnQueuePush(uint32_t peer, uint64_t epoch, const char* data, uint32_t len);
+/* 从指定 peer、指定 epoch 的环弹出；空则 false */
+extern bool EpochTxnQueuePop(uint32_t peer, uint64_t epoch, char* data, uint32_t max_len,
+    uint32_t* out_len, uint32_t* out_index);
+/* 所有 peer 合计 / 单个 peer */
 extern uint32_t EpochTxnQueueCount(void);
+extern uint32_t EpochTxnQueueCountPeer(uint32_t peer);
 
 #endif /* OPENGAUSS_E_TXN_QUEUE_H */

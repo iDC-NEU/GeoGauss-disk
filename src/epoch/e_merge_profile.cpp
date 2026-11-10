@@ -4,11 +4,14 @@
 #include "epoch/e_config.h"
 #include "epoch/e_log_path.h"
 #include "epoch/e_node_manager.h"
+#include "epoch/e_stuck_trace.h"
+#include "epoch/e_types.h"
 
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <sys/time.h>
 
 static const char* EpochMergeProfilePhaseName(EpochMergeProfilePhase phase)
 {
@@ -228,4 +231,119 @@ void EpochMergeProfileEndWireTxn(uint64_t epoch, uint64_t csn, uint32_t server_i
         g_merge_profile_agg_us[i].fetch_add(g_merge_profile_sample.us[i], std::memory_order_relaxed);
     }
     EpochMergeProfileMaybeEmitAggregate(txn_count);
+}
+
+/*
+ * ---------------- 卡死定位：merge worker 当前 task / 阶段 ----------------
+ * 所有 epoch 线程同进程，用进程内原子量即可；不强求 profile 开关。
+ */
+struct EpochMergeWorkerProgress {
+    std::atomic<int> active;
+    std::atomic<int> phase;
+    std::atomic<uint64_t> epoch;
+    std::atomic<uint64_t> wire_key;
+    std::atomic<uint64_t> task_start_us;
+    std::atomic<uint64_t> phase_start_us;
+};
+
+static EpochMergeWorkerProgress g_merge_progress[EPOCH_MAX_MERGE_WORKERS];
+static thread_local int g_merge_worker_id = -1;
+static std::atomic<uint64_t> g_merge_stuck_last_report_us{0};
+
+static uint64_t EpochMergeProfileWallUs(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return static_cast<uint64_t>(tv.tv_sec) * 1000000ULL + static_cast<uint64_t>(tv.tv_usec);
+}
+
+void EpochMergeProfileSetWorker(int worker_id)
+{
+    if (worker_id < 0 || worker_id >= static_cast<int>(EPOCH_MAX_MERGE_WORKERS)) {
+        return;
+    }
+    g_merge_worker_id = worker_id;
+    g_merge_progress[worker_id].phase.store(-1, std::memory_order_relaxed);
+    g_merge_progress[worker_id].active.store(0, std::memory_order_relaxed);
+}
+
+void EpochMergeProfileNoteTask(uint64_t epoch, uint64_t wire_key)
+{
+    if (g_merge_worker_id < 0) {
+        return;
+    }
+    EpochMergeWorkerProgress& p = g_merge_progress[g_merge_worker_id];
+    uint64_t now = EpochMergeProfileWallUs();
+    p.epoch.store(epoch, std::memory_order_relaxed);
+    p.wire_key.store(wire_key, std::memory_order_relaxed);
+    p.task_start_us.store(now, std::memory_order_relaxed);
+    p.phase_start_us.store(now, std::memory_order_relaxed);
+    p.phase.store(static_cast<int>(EMP_DESERIALIZE), std::memory_order_relaxed);
+    p.active.store(1, std::memory_order_release);
+}
+
+void EpochMergeProfileNotePhase(EpochMergeProfilePhase phase)
+{
+    if (g_merge_worker_id < 0) {
+        return;
+    }
+    EpochMergeWorkerProgress& p = g_merge_progress[g_merge_worker_id];
+    p.phase_start_us.store(EpochMergeProfileWallUs(), std::memory_order_relaxed);
+    p.phase.store(static_cast<int>(phase), std::memory_order_release);
+}
+
+void EpochMergeProfileNoteTxnDone(void)
+{
+    if (g_merge_worker_id < 0) {
+        return;
+    }
+    EpochMergeWorkerProgress& p = g_merge_progress[g_merge_worker_id];
+    p.phase.store(-1, std::memory_order_relaxed);
+    p.active.store(0, std::memory_order_release);
+}
+
+void EpochMergeProfileMaybeReportStuck(void)
+{
+    uint64_t now = EpochMergeProfileWallUs();
+    uint64_t last = g_merge_stuck_last_report_us.load(std::memory_order_relaxed);
+    if (now < last || now - last < 5000000ULL) {
+        return;
+    }
+    if (!g_merge_stuck_last_report_us.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        return;
+    }
+
+    bool any_stuck = false;
+    for (uint32_t w = 0; w < EPOCH_MAX_MERGE_WORKERS; ++w) {
+        EpochMergeWorkerProgress& p = g_merge_progress[w];
+        if (p.active.load(std::memory_order_acquire) == 0) {
+            continue;
+        }
+        int phase = p.phase.load(std::memory_order_relaxed);
+        uint64_t task_start = p.task_start_us.load(std::memory_order_relaxed);
+        uint64_t phase_start = p.phase_start_us.load(std::memory_order_relaxed);
+        uint64_t task_ms = (now > task_start) ? (now - task_start) / 1000ULL : 0;
+        if (task_ms < 2000ULL) {
+            continue;
+        }
+        uint64_t phase_ms = (now > phase_start) ? (now - phase_start) / 1000ULL : 0;
+        const char* phase_name = (phase >= 0 && phase < EMP_PHASE_COUNT)
+            ? EpochMergeProfilePhaseName(static_cast<EpochMergeProfilePhase>(phase))
+            : "idle";
+        fprintf(stderr,
+            "MERGE_STUCK node=%u wid=%u epoch=%lu wire_key=%lu phase=%s task_ms=%lu phase_ms=%lu\n",
+            EpochGetNodeId(),
+            w,
+            static_cast<unsigned long>(p.epoch.load(std::memory_order_relaxed)),
+            static_cast<unsigned long>(p.wire_key.load(std::memory_order_relaxed)),
+            phase_name,
+            static_cast<unsigned long>(task_ms),
+            static_cast<unsigned long>(phase_ms));
+        fflush(stderr);
+        any_stuck = true;
+    }
+    if (any_stuck) {
+        /* 一次落盘全线程飞行记录，等价「逐行打印」现场 */
+        EpochStuckTraceDump("merge_task_stuck", false);
+    }
 }

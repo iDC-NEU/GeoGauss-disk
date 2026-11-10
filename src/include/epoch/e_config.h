@@ -32,12 +32,13 @@ extern int g_epoch_node_id;
 extern int g_epoch_total_nodes;
 extern int g_epoch_cache_slots;
 extern int g_epoch_physical_txns_per_epoch;
+/* 客户端终端数（TPCC terminals）：时间片离开计数达到它才塞收尾包 */
+extern int g_epoch_terminals;
 extern int g_epoch_delay_slots;
-extern int g_epoch_phys_logical_gap_limit;
 extern int g_epoch_merge_threads;
 extern int g_epoch_commit_threads;
 extern int g_epoch_tip_flush_threads;
-extern int g_epoch_pack_threads;
+extern int g_epoch_send_threads;
 /* apply 单步耗时超过该阈值（毫秒）时写 APPLY_LOCK_TRACE 到 pg_log；0=关闭 */
 extern int g_epoch_apply_lock_trace_ms;
 
@@ -65,6 +66,13 @@ extern int g_epoch_dyn_net_lag_tolerance;
 extern int g_epoch_dyn_net_queue_tolerance;
 extern int g_epoch_dyn_net_catchup_k;
 extern int g_epoch_dyn_net_rtt_ms;
+
+/* DBR 触发阈值：上行速率达到配置带宽的百分之多少即判为拥塞 */
+extern int g_epoch_dbr_threshold_pct;
+
+/* DBR 拥塞时的处理方式：drop（丢弃，省带宽）| defer（延后，保数据） */
+extern char* g_epoch_dbr_mode;
+extern int g_epoch_dbr_admit_per_epoch;
 extern char* g_epoch_dyn_net_slow_nodes;
 extern double g_epoch_dyn_net_upload_bps;
 extern double g_epoch_dyn_net_download_bps;
@@ -80,8 +88,8 @@ extern int g_epoch_dyn_net_bw_mode;
 extern void EpochConfigInit(void);
 extern uint32_t EpochGetCacheSlots(void);
 extern uint32_t EpochGetTotalNodes(void);
+/* 终端总数（至少 1） */
+extern uint32_t EpochGetTerminals(void);
 extern uint32_t EpochGetNodeId(void);
-extern uint64_t EpochGetPhysLogicalGapLimit(void);
-extern bool EpochIsPhysLogicalGapDisabled(void);
 
 #endif /* OPENGAUSS_E_CONFIG_H */

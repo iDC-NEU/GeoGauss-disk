@@ -20,6 +20,20 @@ void EpochApplyStatsNoteAbort(OccAbortReason reason)
     EpochPerfNoteApplyAbortTxn();
 }
 
+/*
+ * 一次性把某时间片的 merge 输家计入 abort（一个 csn 一个事务）。
+ * 在 apply 游标推进时调用，保证 abort 与 commit 同口径：
+ * 只统计已经走到 apply 的时间片，还压在发送/合并队列里的不算。
+ */
+void EpochApplyStatsNoteAbortN(uint64_t n)
+{
+    if (n == 0) {
+        return;
+    }
+    O_OccStatsRecordAbort(OCC_ABORT_REMOTE_MERGE);
+    EpochPerfAddApplyAbortTxn(n);
+}
+
 void EpochApplyStatsNoteFinalize(uint64_t epoch, uint32_t local_node, OccAbortReason reason)
 {
     (void)epoch;

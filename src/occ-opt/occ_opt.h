@@ -7,7 +7,6 @@
 //   o_staging_flush       Deferred write-back with pluggable callbacks
 //   o_background_flusher  Periodic / threshold-triggered flush scheduler
 //   o_staging_api         Unified facade for future occ/ integration
-//   o_delta_table         Legacy wrapper (include/occ/o_delta_table.h)
 //
 
 #ifndef OCC_OPT_OCC_OPT_H

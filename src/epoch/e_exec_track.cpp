@@ -58,7 +58,6 @@ void EpochTrackExecutingInc(uint64_t epoch, const char* reason)
         return;
     }
     u_sess->epoch_cxt.epoch_exec_counted = true;
-    EpochRecvDiagLogExecChange(+1, reason, epoch);
 }
 
 void EpochReleaseTxnExecuting(const char* reason)
@@ -73,7 +72,6 @@ void EpochReleaseTxnExecuting(const char* reason)
         log_reason = "exec_dec_miss";
     }
     u_sess->epoch_cxt.epoch_exec_counted = false;
-    EpochRecvDiagLogExecChange(-1, log_reason, epoch);
 }
 
 void EpochMaybeLogTxnProgress(const char* tag, const char* detail)
@@ -81,5 +79,4 @@ void EpochMaybeLogTxnProgress(const char* tag, const char* detail)
     if (!u_sess->epoch_cxt.epoch_exec_counted || u_sess->epoch_cxt.deferred_commit) {
         return;
     }
-    EpochRecvDiagLogTxnProgress(tag, detail);
 }

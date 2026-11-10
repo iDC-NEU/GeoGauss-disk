@@ -1,94 +1,42 @@
 #ifndef OPENGAUSS_E_APPLY_SHMEM_H
 #define OPENGAUSS_E_APPLY_SHMEM_H
 
-#include <atomic>
 #include <cstdint>
 
 #include "epoch/e_txn_wire.h"
-#include "epoch/e_types.h"
-#include "storage/spin.h"
-
-static constexpr uint32_t EPOCH_APPLY_SLOT_FREE = 0;
-static constexpr uint32_t EPOCH_APPLY_SLOT_READY = 1;
-static constexpr uint32_t EPOCH_APPLY_SLOT_CLAIMED = 2;
-
-static constexpr uint32_t EPOCH_APPLY_FLAG_IS_LOCAL = 0x01U;
-static constexpr uint32_t EPOCH_APPLY_FLAG_IS_FINALIZE = 0x02U;
-static constexpr uint32_t EPOCH_APPLY_FLAG_COUNT_COMMITTED = 0x04U;
-/* payload 为原始 wire：apply 须在 merge_complete 后 BuildApplyTxn */
-static constexpr uint32_t EPOCH_APPLY_FLAG_NEED_CRDT_BUILD = 0x08U;
 
 /*
- * GeoGauss 式：[epoch_slot][worker_id] 私有格（与 Merge 同构）。
- * Submit → cells[epoch%slots][route_worker]；TryClaim 只扫 apply_epoch 行上本 worker 列。
+ * apply 的全部职责：
+ *
+ *   1. 接收线程/merge 线程把赢家写集放进它所属 epoch 的并发队列；
+ *   2. apply 线程从 apply_epoch 那一格取一条出来；
+ *   3. csn 在 abort 集合里 → 跳过并计 abort；
+ *      否则按 csn 去重后计一次 commit，并执行写回；
+ *   4. 该格队列取空 → apply_epoch CAS +1。
+ *
+ * 没有任务槽、没有 done 环、没有 inflight 记账、没有 payload 序列化。
  */
-struct EpochApplyEpochSlotMeta {
-    std::atomic<uint64_t> bound_epoch;
-    std::atomic<uint32_t> inflight;
-    slock_t bind_lock;
-};
 
-struct EpochApplyTaskSlot {
-    std::atomic<uint32_t> state;
-    uint64_t epoch;
-    uint64_t wire_key;
-    uint32_t local_node;
-    uint32_t flags;
-    uint32_t preferred_worker;
-    uint32_t payload_len;
-    uint64_t submit_us;
-    char payload[EPOCH_MAX_WIRE_TXN_BYTES];
-};
+/* 入队：生产者可以是接收线程或 merge 线程 */
+extern bool EpochApplyQueueEnqueueTxn(uint64_t epoch, const E_WireTxn& txn);
 
-struct EpochApplyDoneSlot {
-    uint64_t epoch;
-    uint64_t wire_key;
-    uint8_t ok;
-    uint8_t pad[7];
-};
+/* 从指定 epoch 那一格取一条；返回 false 表示该格已空 */
+extern bool EpochApplyQueueTryDequeue(uint64_t epoch, E_WireTxn* out);
 
-struct EpochApplyQueueHeader {
-    std::atomic<uint32_t> inflight;
-    std::atomic<uint32_t> shutdown;
-    std::atomic<uint64_t> apply_epoch;
-    uint32_t slot_count;
-    uint32_t worker_count;
-    uint32_t depth;
-    uint32_t tasks_per_slot; /* worker_count * depth */
-    uint32_t task_capacity;
-};
-
-struct EpochApplyQueue {
-    EpochApplyQueueHeader header;
-    char blob[1];
-};
-
-extern Size EpochApplyQueueShmemSize(void);
-extern void EpochApplyQueueShmemInit(void);
-extern bool EpochApplyQueueSubmit(uint64_t epoch,
-    uint64_t wire_key,
-    uint32_t local_node,
-    uint32_t flags,
-    const char* payload,
-    uint32_t payload_len,
-    uint32_t route_worker,
-    uint32_t n_workers);
-extern bool EpochApplyQueueTryClaim(uint32_t worker_id, uint32_t n_workers, EpochApplyTaskSlot** out);
-extern void EpochApplyQueueFinishTask(EpochApplyTaskSlot* task, bool ok);
-/* 二维队列：恒 false；完成在 Finish 内联 hook */
-extern bool EpochApplyQueuePopDone(EpochApplyDoneSlot* out);
-extern uint32_t EpochApplyQueueInflight(void);
-extern uint32_t EpochApplyQueueInflightForEpoch(uint64_t epoch);
-extern uint32_t EpochApplyQueueGetTasksPerSlot(void);
-extern uint32_t EpochApplyQueueGetDepth(void);
-extern uint32_t EpochApplyQueueGetWorkerCount(void);
+/* 游标：下一个要写回的时间片 */
 extern uint64_t EpochApplyQueueGetApplyEpoch(void);
 extern void EpochApplyQueueSetApplyEpoch(uint64_t epoch);
+
+/* 把游标从 completed_epoch 推进到 completed_epoch+1（CAS，并发安全） */
 extern bool EpochApplyQueueTryAdvanceApplyEpoch(uint64_t completed_epoch);
+
 extern void EpochApplyQueueRequestShutdown(void);
 extern bool EpochApplyQueueShutdownRequested(void);
-extern void EpochApplyQueueResetCoordinatorState(void);
-/* 由 EpochApplyPoolSetTaskDoneHook 注册；FinishTask 同进程内联 */
-extern void EpochApplyQueueSetFinishHook(void (*hook)(uint64_t epoch, uint64_t wire_key, bool ok));
+
+/* csn 去重：同一事务的多行只让第一次返回 true（用于 commit 计数） */
+extern bool EpochApplyCsnSeenFirst(uint64_t epoch, uint64_t csn);
+
+extern void EpochApplyQueueInit(void);
+extern void EpochApplyQueueReset(void);
 
 #endif /* OPENGAUSS_E_APPLY_SHMEM_H */

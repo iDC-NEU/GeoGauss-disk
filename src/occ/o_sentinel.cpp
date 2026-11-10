@@ -4,7 +4,6 @@
 
 #include "occ/o_txn.h"
 #include "occ/occ_mem.h"
-#include "occ/o_delta_table.h"
 #include "occ/o_staging.h"
 #include "occ/occ_internal.h"
 
@@ -106,25 +105,6 @@ HeapTuple occ_sentinel::GetData(HeapTuple heap_tuple, Buffer buffer)
         }
     }
 
-    if (g_enable_occ_delta && !g_enable_occ_staging)
-    {
-        O_DeltaEntry deltaEntry;
-        if (O_DeltaTable::Instance().Lookup(relation, tid, deltaEntry))
-        {
-            if (deltaEntry.deleted || deltaEntry.tuple == nullptr)
-            {
-                return nullptr;
-            }
-            HeapTuple src = deltaEntry.tuple;
-            heap_tuple->t_len = src->t_len;
-            heap_tuple->t_bucketId = src->t_bucketId;
-            heap_tuple->t_self = src->t_self;
-            heap_tuple->t_tableOid = src->t_tableOid;
-            heap_tuple->t_data = src->t_data;
-            return heap_tuple;
-        }
-    }
-
     O_heap_hot_search_buffer(tid, relation, buffer, heap_tuple, snapshot);
 
     return heap_tuple;
@@ -147,25 +127,6 @@ HeapTuple occ_sentinel::GetData(HeapTuple heap_tuple)
                 return nullptr;
             }
             return copy;
-        }
-    }
-
-    if (g_enable_occ_delta && !g_enable_occ_staging)
-    {
-        O_DeltaEntry deltaEntry;
-        if (O_DeltaTable::Instance().Lookup(relation, tid, deltaEntry))
-        {
-            if (deltaEntry.deleted || deltaEntry.tuple == nullptr)
-            {
-                return nullptr;
-            }
-            HeapTuple src = deltaEntry.tuple;
-            heap_tuple->t_len = src->t_len;
-            heap_tuple->t_bucketId = src->t_bucketId;
-            heap_tuple->t_self = src->t_self;
-            heap_tuple->t_tableOid = src->t_tableOid;
-            heap_tuple->t_data = src->t_data;
-            return heap_tuple;
         }
     }
 

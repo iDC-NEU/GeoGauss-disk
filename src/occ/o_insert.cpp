@@ -10,9 +10,16 @@
 
 #include "catalog/index.h"
 
+/*
+ * 多主模式下 backend 只收集写集，不落堆。
+ *
+ * 每一笔写事务的 heap_insert/update/delete 都推迟到 epoch apply 线程执行
+ * （真正写回数据的地方只有 apply）。若这里返回 false，backend 会自己写堆，
+ * 而 apply 又写一遍同一批行 —— 实测表现为大量 duplicate key、客户端全部 abort。
+ */
 bool OccSyncDeferHeapWrite(void)
 {
-    return OccDiskAccessHooksEnabled() && EpochIsSyncBackgroundWorkerCommit();
+    return OccDiskAccessHooksEnabled() && g_enable_epoch_multimaster && EpochGetTotalNodes() > 1;
 }
 
 bool OccSyncDeferInsertHeapWrite(void)

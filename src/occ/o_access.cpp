@@ -5,7 +5,6 @@
 #include "occ/o_txn.h"
 #include "occ/o_heapam.h"
 #include "occ/o_executor.h"
-#include "occ/o_delta_table.h"
 #include "occ/o_staging.h"
 #include "occ/occ_internal.h"
 
@@ -31,25 +30,6 @@ static Relation O_OpenAccessRelation(O_Access *access, bool *needClose)
 
     *needClose = true;
     return heap_open(relid, RowExclusiveLock);
-}
-
-static void O_MirrorToDelta(O_Access *access, HeapTuple tuple, uint64_t csn, bool deleted)
-{
-    if (!g_enable_occ_delta || g_enable_occ_staging || access == nullptr) {
-        return;
-    }
-
-    O_DeltaTable &delta = O_DeltaTable::Instance();
-    if (deleted) {
-        delta.MarkDeleted(access->m_origSentinel.relation, &access->m_origSentinel.tuple_id, csn);
-        return;
-    }
-
-    if (tuple != nullptr && tuple->t_data != nullptr) {
-        tuple->t_data->m_rowCSN = csn;
-        tuple->t_data->is_latest = true;
-        delta.Upsert(access->m_origSentinel.relation, &access->m_origSentinel.tuple_id, tuple, csn);
-    }
 }
 
 static bool O_StageAccessCommit(O_Access *access, Relation rel, ItemPointer tid, uint64_t csn)
@@ -140,7 +120,6 @@ void O_Access::WriteGlobalChanges(uint64_t csn, const occ_sentinel &key)
         } else {
             O_heap_update(rel, &m_origSentinel.tuple_id, newVersion, cid, csn, nullptr, nullptr);
         }
-        O_MirrorToDelta(this, newVersion, csn, false);
         break;
     }
     case DEL: {
@@ -149,7 +128,6 @@ void O_Access::WriteGlobalChanges(uint64_t csn, const occ_sentinel &key)
             cid = GetCurrentCommandId(false);
         }
         O_heap_delete(rel, &m_origSentinel.tuple_id, cid, csn);
-        O_MirrorToDelta(this, nullptr, csn, true);
         break;
     }
     case INS: {
@@ -159,7 +137,6 @@ void O_Access::WriteGlobalChanges(uint64_t csn, const occ_sentinel &key)
             insTuple->t_data->is_latest = true;
         }
         O_heap_commit_insert_csn(rel, &m_origSentinel.tuple_id, csn);
-        O_MirrorToDelta(this, insTuple, csn, false);
         break;
     }
     default:

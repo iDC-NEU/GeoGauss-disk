@@ -97,10 +97,6 @@ bool E_CrdtMerger::MergeRowInternal(const E_WireRow& row, uint64_t csn, uint32_t
         int& tick = g_pk_fail_tick[row.relid];
         if (++tick % 20 == 1) {
             Oid localRelid = E_ResolveLocalRelid(row);
-            EpochRecvDiagLogMergePkFail(row.relid,
-                static_cast<uint32_t>(localRelid),
-                row.relname.empty() ? nullptr : row.relname.c_str(),
-                row.op_type);
         }
         if (accepted != nullptr) {
             *accepted = false;

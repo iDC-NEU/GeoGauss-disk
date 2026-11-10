@@ -14,6 +14,7 @@
 #include "epoch/e_node_manager.h"
 #include "epoch/e_pipeline.h"
 #include "epoch/e_statistician.h"
+#include "epoch/e_stuck_trace.h"
 #include "epoch/e_perf.h"
 #include "epoch/e_epoch_lifecycle.h"
 
@@ -31,9 +32,6 @@
 #include "occ/o_staging.h"
 #include "gssignal/gs_signal.h"
 
-static void EpochWorkerQuickDie(SIGNAL_ARGS);
-static void EpochWorkerSigHup(SIGNAL_ARGS);
-static void EpochWorkerShutdown(SIGNAL_ARGS);
 
 /*
  * GeoGauss: MOT epoch 线程入口 MOT::CreateSessionContext() 绑定 store。
@@ -86,7 +84,39 @@ void EpochWorkerInitApplySession(void)
 
 static constexpr long EPOCH_WORKER_PIPELINE_IDLE_US = 200;
 
-void EpochWorkerMain(void)
+static void EpochCoordQuickDie(SIGNAL_ARGS);
+static void EpochCoordSigHup(SIGNAL_ARGS);
+static void EpochCoordShutdown(SIGNAL_ARGS);
+
+static void EpochCoordSigHup(SIGNAL_ARGS)
+{
+    t_thrd.epoch_worker_cxt.got_SIGHUP = true;
+}
+
+static void EpochCoordShutdown(SIGNAL_ARGS)
+{
+    t_thrd.epoch_worker_cxt.shutdown_requested = true;
+}
+
+static void EpochCoordQuickDie(SIGNAL_ARGS)
+{
+    gs_signal_setmask(&t_thrd.libpq_cxt.BlockSig, NULL);
+    on_exit_reset();
+    _exit(2);
+}
+
+/*
+ * epoch 协调进程（EPOCHWORKER 角色）。
+ *
+ * 职责只有一件：在具备 backend 会话上下文的进程里拉起 epoch 流水线的
+ * recv / merge / apply / logical / physical / state 六个线程，然后常驻待命。
+ *
+ * 为什么必须是进程而不是 postmaster 里的线程：这些子线程要写堆表、要访问
+ * u_sess，必须继承 InitProcessAndShareMemory() 建立的会话环境。
+ *
+ * 它不参与发送，也不参与合并 —— 数据面全部由各自的工作线程承担。
+ */
+void EpochCoordWorkerMain(void)
 {
     sigjmp_buf local_sigjmp_buf;
     MemoryContext worker_context;
@@ -96,15 +126,15 @@ void EpochWorkerMain(void)
     t_thrd.role = EPOCHWORKER;
     t_thrd.proc_cxt.MyProcPid = gs_thread_self();
     t_thrd.proc_cxt.MyStartTime = time(NULL);
-    t_thrd.proc_cxt.MyProgName = "EpochWorker";
+    t_thrd.proc_cxt.MyProgName = "EpochCoordWorker";
 
-    init_ps_display("epoch worker process", "", "", "");
+    init_ps_display("epoch coord worker process", "", "", "");
     SetProcessingMode(InitProcessing);
 
-    (void)gspqsignal(SIGHUP, EpochWorkerSigHup);
-    (void)gspqsignal(SIGINT, EpochWorkerShutdown);
-    (void)gspqsignal(SIGTERM, EpochWorkerShutdown);
-    (void)gspqsignal(SIGQUIT, EpochWorkerQuickDie);
+    (void)gspqsignal(SIGHUP, EpochCoordSigHup);
+    (void)gspqsignal(SIGINT, EpochCoordShutdown);
+    (void)gspqsignal(SIGTERM, EpochCoordShutdown);
+    (void)gspqsignal(SIGQUIT, EpochCoordQuickDie);
     (void)gspqsignal(SIGPIPE, SIG_IGN);
     (void)gspqsignal(SIGUSR1, SIG_IGN);
     (void)gspqsignal(SIGUSR2, SIG_IGN);
@@ -121,16 +151,8 @@ void EpochWorkerMain(void)
     gs_signal_setmask(&t_thrd.libpq_cxt.UnBlockSig, NULL);
     (void)gs_signal_unblock_sigusr2();
 
-    if (!t_thrd.mem_cxt.mask_password_mem_cxt) {
-        t_thrd.mem_cxt.mask_password_mem_cxt = AllocSetContextCreate(t_thrd.top_mem_cxt,
-            "MaskPasswordCtx",
-            ALLOCSET_DEFAULT_MINSIZE,
-            ALLOCSET_DEFAULT_INITSIZE,
-            ALLOCSET_DEFAULT_MAXSIZE);
-    }
-
     worker_context = AllocSetContextCreate(t_thrd.top_mem_cxt,
-                                           "epoch worker",
+                                           "epoch coord worker",
                                            ALLOCSET_DEFAULT_MINSIZE,
                                            ALLOCSET_DEFAULT_INITSIZE,
                                            ALLOCSET_DEFAULT_MAXSIZE);
@@ -148,7 +170,8 @@ void EpochWorkerMain(void)
         AbortBufferIO();
         UnlockBuffers();
         if (t_thrd.utils_cxt.CurrentResourceOwner != nullptr) {
-            ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
+            ResourceOwnerRelease(t_thrd.utils_cxt.CurrentResourceOwner,
+                RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
         }
         AtEOXact_Buffers(false);
         AtEOXact_SMgr();
@@ -163,20 +186,15 @@ void EpochWorkerMain(void)
     t_thrd.log_cxt.PG_exception_stack = &local_sigjmp_buf;
     SetProcessingMode(NormalProcessing);
 
-    Assert(t_thrd.utils_cxt.CurrentResourceOwner == NULL);
     t_thrd.utils_cxt.CurrentResourceOwner =
-        ResourceOwnerCreate(NULL, "epoch worker", THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
+        ResourceOwnerCreate(NULL, "epoch coord worker", THREAD_GET_MEM_CXT_GROUP(MEMORY_CONTEXT_STORAGE));
 
     EpochWorkerInitApplySession();
-    E_ApplyWarmup();
 
-    pgstat_report_appname("epoch worker");
+    pgstat_report_appname("epoch coord worker");
     pgstat_report_activity(STATE_IDLE, NULL);
 
-    /*
-     * Pack 活跃：本线程只做管理 Init/Shutdown，不跑 seal/发包/merge/apply。
-     * 无 Pack：本线程兼数据面（PollSendSeal）。
-     */
+    /* 拉起流水线；之后只待命 */
     EpochPipelineBootstrapOwner();
 
     for (;;) {
@@ -188,57 +206,7 @@ void EpochWorkerMain(void)
             EpochPipelineShutdown();
             proc_exit(0);
         }
-
-        if (EpochPipelinePackSendActive()) {
-            /* 管理线程：仅待命，数据面已拆到 Pack/Send/Merge/Apply */
-            pgstat_report_activity(STATE_IDLE, NULL);
-            pg_usleep(EPOCH_WORKER_PIPELINE_IDLE_US);
-            continue;
-        }
-
-        pgstat_report_activity(STATE_RUNNING, NULL);
-
-        bool progress = EpochPipelinePollSendSeal();
-
         pgstat_report_activity(STATE_IDLE, NULL);
-        if (!progress) {
-            bool merge_done = false;
-            bool apply_done = false;
-            EpochPipelineReadStageFlagsForDiag(E_NodeManager::GetLogicalEpoch(),
-                nullptr,
-                nullptr,
-                nullptr,
-                &merge_done,
-                &apply_done);
-            if (merge_done && !apply_done) {
-                uint64_t apply_ep = EpochApplyPoolGetApplyEpoch();
-                if (apply_ep == 0) {
-                    apply_ep = E_NodeManager::GetLogicalEpoch();
-                }
-                if (EpochApplyQueueInflightForEpoch(apply_ep) == 0) {
-                    EpochLifecycleNoteApplyStarveTick(apply_ep);
-                }
-                pg_usleep(50L);
-            } else {
-                pg_usleep(EPOCH_WORKER_PIPELINE_IDLE_US);
-            }
-        }
+        pg_usleep(EPOCH_WORKER_PIPELINE_IDLE_US);
     }
-}
-
-static void EpochWorkerQuickDie(SIGNAL_ARGS)
-{
-    gs_signal_setmask(&t_thrd.libpq_cxt.BlockSig, NULL);
-    on_exit_reset();
-    _exit(2);
-}
-
-static void EpochWorkerSigHup(SIGNAL_ARGS)
-{
-    t_thrd.epoch_worker_cxt.got_SIGHUP = true;
-}
-
-static void EpochWorkerShutdown(SIGNAL_ARGS)
-{
-    t_thrd.epoch_worker_cxt.shutdown_requested = true;
 }

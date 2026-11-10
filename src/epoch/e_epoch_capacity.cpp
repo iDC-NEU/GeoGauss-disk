@@ -58,5 +58,12 @@ uint32_t EpochGetApplyDoneCapacity(void)
 
 uint32_t EpochGetWorkQueueSlotCount(void)
 {
+    /*
+     * 就是那个“epoch % N”里的 N，全系统只有一个 N，直接用 CRDT 的组数。
+     *
+     * 它以前还会顺带决定合并/写回队列里那张 12KB×格 的任务表有多大，
+     * 所以一调大就白占几百 MB；那张表已经删掉（两个队列实际用的都是进程内队列），
+     * 现在这个 N 想开多大都只影响散列落点，不占内存。
+     */
     return EpochGetCrdtSlotCount();
 }

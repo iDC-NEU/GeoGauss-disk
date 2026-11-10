@@ -495,16 +495,13 @@ static void StartAutovacuumWorker(void);
 static void StartUndoWorker(void);
 static void StartApplyWorker(void);
 //HCJ ADDBY: epoch worker 需 backend 子槽位，与 logical apply worker 一致
-static void StartEpochWorker(void);
 static void StartEpochApplyWorkers(void);
 static void StopEpochApplyWorkers(void);
 static bool IsEpochApplyWorkerPid(ThreadId pid, int* slot_index);
 static void StartEpochMergeWorkers(void);
 static void StopEpochMergeWorkers(void);
 static bool IsEpochMergeWorkerPid(ThreadId pid, int* slot_index);
-static void StartEpochPackWorkers(void);
-static void StopEpochPackWorkers(void);
-static bool IsEpochPackWorkerPid(ThreadId pid, int* slot_index);
+static void StartEpochWorker(void);
 static void StartEpochSendWorkers(void);
 static void StopEpochSendWorkers(void);
 static bool IsEpochSendWorkerPid(ThreadId pid);
@@ -8059,7 +8056,6 @@ static void reaper(SIGNAL_ARGS)
             g_instance.pid_cxt.EpochWorkerPID = 0;
             StopEpochApplyWorkers();
             StopEpochMergeWorkers();
-            StopEpochPackWorkers();
             StopEpochSendWorkers();
             StopEpochTipFlushWorkers();
 
@@ -8088,18 +8084,6 @@ static void reaper(SIGNAL_ARGS)
 
                 if (!EXIT_STATUS_0(exitstatus)) {
                     LogChildExit(LOG, _("epoch merge worker process"), pid, exitstatus);
-                }
-                continue;
-            }
-        }
-
-        {
-            int pack_slot = -1;
-            if (IsEpochPackWorkerPid(pid, &pack_slot)) {
-                g_instance.pid_cxt.EpochPackWorkerPIDs[pack_slot] = 0;
-
-                if (!EXIT_STATUS_0(exitstatus)) {
-                    LogChildExit(LOG, _("epoch pack worker process"), pid, exitstatus);
                 }
                 continue;
             }
@@ -8336,8 +8320,6 @@ static const char* GetProcName(ThreadId pid)
         return "epoch apply worker process";
     else if (IsEpochMergeWorkerPid(pid, NULL))
         return "epoch merge worker process";
-    else if (IsEpochPackWorkerPid(pid, NULL))
-        return "epoch pack worker process";
     else if (IsEpochSendWorkerPid(pid))
         return "epoch send worker process";
     else if (IsEpochTipFlushWorkerPid(pid, NULL))
@@ -11461,7 +11443,7 @@ static void StartUndoWorker(void)
 /* epochcoord = 管理 Init/Shutdown；Pack 活跃时不做 seal/发包 */
 static bool EpochPackModeActive(void)
 {
-    return g_enable_epoch_multimaster && g_epoch_pack_threads >= 1;
+    return g_enable_epoch_multimaster && g_epoch_send_threads >= 1;
 }
 
 static bool EpochSubsystemAlive(void)
@@ -11472,7 +11454,7 @@ static bool EpochSubsystemAlive(void)
 static void StartEpochDataPlaneWorkers(void)
 {
     if (EpochPackModeActive()) {
-        StartEpochPackWorkers();
+        StartEpochWorker();
         StartEpochSendWorkers();
     }
     StartEpochApplyWorkers();
@@ -11487,53 +11469,12 @@ static void StartEpochSubsystem(void)
     }
     if (!EpochSubsystemAlive()) {
         /* 先起 epochcoord（Bootstrap），再起数据面工人 */
-        StartEpochWorker();
         StartEpochDataPlaneWorkers();
     } else {
         StartEpochDataPlaneWorkers();
     }
 }
 
-static void StartEpochWorker(void)
-{
-    Backend* bn = NULL;
-
-    if (canAcceptConnections(false) != CAC_OK) {
-        return;
-    }
-
-    int slot = AssignPostmasterChildSlot();
-    if (slot < 1) {
-        ereport(LOG, (errmsg("no free slots for epoch worker")));
-        return;
-    }
-
-    bn = AssignFreeBackEnd(slot);
-    if (bn == NULL) {
-        (void)ReleasePostmasterChildSlot(slot);
-        ereport(LOG, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
-        return;
-    }
-
-    t_thrd.proc_cxt.MyCancelKey = PostmasterRandom();
-    bn->cancel_key = t_thrd.proc_cxt.MyCancelKey;
-    bn->child_slot = t_thrd.proc_cxt.MyPMChildSlot = slot;
-    bn->role = EPOCHWORKER;
-    bn->pid = initialize_util_thread(EPOCHWORKER, bn);
-    t_thrd.proc_cxt.MyPMChildSlot = 0;
-
-    if (bn->pid > 0) {
-        g_instance.pid_cxt.EpochWorkerPID = bn->pid;
-        bn->is_autovacuum = false;
-        DLInitElem(&bn->elem, bn);
-        DLAddHead(g_instance.backend_list, &bn->elem);
-        return;
-    }
-
-    (void)ReleasePostmasterChildSlot(bn->child_slot);
-    bn->pid = 0;
-    bn->role = (knl_thread_role)0;
-}
 
 static bool IsEpochApplyWorkerPid(ThreadId pid, int* slot_index)
 {
@@ -11701,89 +11642,6 @@ static void StartEpochMergeWorkers(void)
     }
 }
 
-static bool IsEpochPackWorkerPid(ThreadId pid, int* slot_index)
-{
-    for (int i = 0; i < (int)EPOCH_MAX_PACK_WORKERS; ++i) {
-        if (g_instance.pid_cxt.EpochPackWorkerPIDs[i] == pid) {
-            if (slot_index != nullptr) {
-                *slot_index = i;
-            }
-            return true;
-        }
-    }
-    return false;
-}
-
-static void StopEpochPackWorkers(void)
-{
-    for (int i = 0; i < (int)EPOCH_MAX_PACK_WORKERS; ++i) {
-        if (g_instance.pid_cxt.EpochPackWorkerPIDs[i] != 0) {
-            signal_child(g_instance.pid_cxt.EpochPackWorkerPIDs[i], SIGTERM);
-        }
-    }
-}
-
-static void StartEpochPackWorker(int slot_index)
-{
-    Backend* bn = NULL;
-
-    if (canAcceptConnections(false) != CAC_OK) {
-        return;
-    }
-    if (slot_index < 0 || slot_index >= (int)EPOCH_MAX_PACK_WORKERS) {
-        return;
-    }
-    if (g_instance.pid_cxt.EpochPackWorkerPIDs[slot_index] != 0) {
-        return;
-    }
-
-    int pm_slot = AssignPostmasterChildSlot();
-    if (pm_slot < 1) {
-        ereport(LOG, (errmsg("no free slots for epoch pack worker %d", slot_index)));
-        return;
-    }
-
-    bn = AssignFreeBackEnd(pm_slot);
-    if (bn == NULL) {
-        (void)ReleasePostmasterChildSlot(pm_slot);
-        ereport(LOG, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
-        return;
-    }
-
-    t_thrd.proc_cxt.MyCancelKey = PostmasterRandom();
-    bn->cancel_key = t_thrd.proc_cxt.MyCancelKey;
-    bn->child_slot = t_thrd.proc_cxt.MyPMChildSlot = pm_slot;
-    bn->role = EPOCHPACKWORKER;
-    bn->pid = initialize_util_thread(EPOCHPACKWORKER, bn);
-    t_thrd.proc_cxt.MyPMChildSlot = 0;
-
-    if (bn->pid > 0) {
-        g_instance.pid_cxt.EpochPackWorkerPIDs[slot_index] = bn->pid;
-        bn->is_autovacuum = false;
-        DLInitElem(&bn->elem, bn);
-        DLAddHead(g_instance.backend_list, &bn->elem);
-        return;
-    }
-
-    (void)ReleasePostmasterChildSlot(bn->child_slot);
-    bn->pid = 0;
-    bn->role = (knl_thread_role)0;
-}
-
-static void StartEpochPackWorkers(void)
-{
-    if (!g_enable_epoch_multimaster || g_epoch_pack_threads < 1) {
-        return;
-    }
-    int want = g_epoch_pack_threads;
-    if (want > (int)EPOCH_MAX_PACK_WORKERS) {
-        want = (int)EPOCH_MAX_PACK_WORKERS;
-    }
-    for (int i = 0; i < want; ++i) {
-        StartEpochPackWorker(i);
-    }
-}
-
 static bool IsEpochSendWorkerPid(ThreadId pid)
 {
     return g_instance.pid_cxt.EpochSendWorkerPID != 0 && g_instance.pid_cxt.EpochSendWorkerPID == pid;
@@ -11796,11 +11654,52 @@ static void StopEpochSendWorkers(void)
     }
 }
 
+static void StartEpochWorker(void)
+{
+    Backend* bn = NULL;
+
+    if (canAcceptConnections(false) != CAC_OK) {
+        return;
+    }
+
+    int slot = AssignPostmasterChildSlot();
+    if (slot < 1) {
+        ereport(LOG, (errmsg("no free slots for epoch coord worker")));
+        return;
+    }
+
+    bn = AssignFreeBackEnd(slot);
+    if (bn == NULL) {
+        (void)ReleasePostmasterChildSlot(slot);
+        ereport(LOG, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+        return;
+    }
+
+    t_thrd.proc_cxt.MyCancelKey = PostmasterRandom();
+    bn->cancel_key = t_thrd.proc_cxt.MyCancelKey;
+    bn->child_slot = t_thrd.proc_cxt.MyPMChildSlot = slot;
+    bn->role = EPOCHWORKER;
+    bn->pid = initialize_util_thread(EPOCHWORKER, bn);
+    t_thrd.proc_cxt.MyPMChildSlot = 0;
+
+    if (bn->pid > 0) {
+        g_instance.pid_cxt.EpochWorkerPID = bn->pid;
+        bn->is_autovacuum = false;
+        DLInitElem(&bn->elem, bn);
+        DLAddHead(g_instance.backend_list, &bn->elem);
+        return;
+    }
+
+    (void)ReleasePostmasterChildSlot(bn->child_slot);
+    bn->pid = 0;
+    bn->role = (knl_thread_role)0;
+}
+
 static void StartEpochSendWorkers(void)
 {
     Backend* bn = NULL;
 
-    if (!g_enable_epoch_multimaster || g_epoch_pack_threads < 1) {
+    if (!g_enable_epoch_multimaster || g_epoch_send_threads < 1) {
         return;
     }
     if (canAcceptConnections(false) != CAC_OK) {
@@ -14967,9 +14866,10 @@ int GaussDbThreadMain(knl_thread_arg* arg)
         } break;
 
         //HCJ ADDBY: 磁盘 epoch apply 需库级会话，走 InitProcessAndShareMemory 而非 auxiliary
+
         case EPOCHWORKER: {
             InitProcessAndShareMemory();
-            EpochWorkerMain();
+            EpochCoordWorkerMain();
             proc_exit(0);
         } break;
 
@@ -14982,12 +14882,6 @@ int GaussDbThreadMain(knl_thread_arg* arg)
         case EPOCHMERGEWORKER: {
             InitProcessAndShareMemory();
             EpochMergeWorkerMain();
-            proc_exit(0);
-        } break;
-
-        case EPOCHPACKWORKER: {
-            InitProcessAndShareMemory();
-            EpochPackWorkerMain();
             proc_exit(0);
         } break;
 

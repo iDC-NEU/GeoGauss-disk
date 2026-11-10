@@ -26,8 +26,13 @@ bool g_enable_epoch_multimaster = false;
 bool g_epoch_skip_apply = false;
 /* 分析：只 apply 本地 wire；远端 MarkApplied 跳过（见 e_config.h） */
 bool g_epoch_apply_local_only = false;
-/* Phase 1：本地 tip 进 staging 哈希表（见 e_config.h） */
-bool g_epoch_local_tip_staging = true;
+/*
+ * Phase 1：本地 tip 进 staging 哈希表（见 e_config.h）。
+ * 32GB 机器上 tip staging（编译期容量 524288）在 64 并发下会因
+ * inplace 失败率高（实测 66%）而只进不出，最终写满导致事务全部挂起，
+ * 因此默认关闭，apply 直接更新堆。
+ */
+bool g_epoch_local_tip_staging = false;
 
 bool g_epoch_sync_start_gate = true;
 bool g_epoch_recv_diag = false;
@@ -39,12 +44,13 @@ int g_epoch_node_id = 0;
 int g_epoch_total_nodes = EPOCH_BENCHMARK_TOTAL_NODES;
 int g_epoch_cache_slots = EPOCH_DEFAULT_CACHE_SLOTS;
 int g_epoch_physical_txns_per_epoch = 0;
+/* 客户端终端数（TPCC 的 terminals）。时间片“离开计数”达到它才塞收尾包 */
+int g_epoch_terminals = 64;
 int g_epoch_delay_slots = EPOCH_DEFAULT_DELAY;
-int g_epoch_phys_logical_gap_limit = 5;
 int g_epoch_merge_threads = 2;
 int g_epoch_commit_threads = 2;
 int g_epoch_tip_flush_threads = 1;
-int g_epoch_pack_threads = 5;
+int g_epoch_send_threads = 1;
 int g_epoch_apply_lock_trace_ms = 0;
 int g_epoch_txn_queue_capacity = EPOCH_DEFAULT_TXN_QUEUE_CAPACITY;
 int g_epoch_abort_csn_per_epoch = EPOCH_DEFAULT_ABORT_CSN_PER_EPOCH;
@@ -67,6 +73,9 @@ int g_epoch_dyn_net_lag_tolerance = 5;
 int g_epoch_dyn_net_queue_tolerance = 20;
 int g_epoch_dyn_net_catchup_k = 3;
 int g_epoch_dyn_net_rtt_ms = 200;
+int g_epoch_dbr_threshold_pct = 95;
+char* g_epoch_dbr_mode = NULL;
+int g_epoch_dbr_admit_per_epoch = 8;
 char* g_epoch_dyn_net_slow_nodes = NULL;
 double g_epoch_dyn_net_upload_bps = 0;
 double g_epoch_dyn_net_download_bps = 0;
@@ -98,10 +107,23 @@ static const struct config_enum_entry epoch_dyn_net_bw_mode_options[] = {
 
 uint32_t EpochGetCacheSlots(void)
 {
-    if (g_epoch_cache_slots <= 0) {
-        return EPOCH_DEFAULT_CACHE_SLOTS;
+    /*
+     * 全系统只有一个 N：直接跟发送队列/合并/写回用同一个值。
+     *
+     * 以前这里读独立的 epoch_cache_slots（配置里是 512），而队列是 2048，
+     * 于是 physical=515 时队列落在 515 格、计数器落在 3 格（515%512），
+     * epoch 3 的计数被污染，永远差 1 条合不完，最后把格子撑爆。
+     * 统一之后不可能再出现这种漂移。
+     */
+    return EPOCH_TXN_EPOCH_COUNT;
+}
+
+uint32_t EpochGetTerminals(void)
+{
+    if (g_epoch_terminals <= 0) {
+        return 1;
     }
-    return static_cast<uint32_t>(g_epoch_cache_slots);
+    return static_cast<uint32_t>(g_epoch_terminals);
 }
 
 uint32_t EpochGetTotalNodes(void)
@@ -124,31 +146,6 @@ uint32_t EpochGetNodeId(void)
         return EPOCH_MAX_NODE_ID;
     }
     return static_cast<uint32_t>(g_epoch_node_id);
-}
-
-uint64_t EpochGetPhysLogicalGapLimit(void)
-{
-    if (g_epoch_phys_logical_gap_limit <= 0) {
-        return UINT64_MAX;
-    }
-    uint64_t limit = static_cast<uint64_t>(g_epoch_phys_logical_gap_limit);
-    if (limit < 2) {
-        limit = 2;
-    }
-    uint32_t delay = static_cast<uint32_t>(g_epoch_delay_slots);
-    if (delay == 0) {
-        delay = EPOCH_DEFAULT_DELAY;
-    }
-    /* logical 推进要求 physical > logical + delay */
-    if (limit < static_cast<uint64_t>(delay) + 1) {
-        limit = static_cast<uint64_t>(delay) + 1;
-    }
-    return limit;
-}
-
-bool EpochIsPhysLogicalGapDisabled(void)
-{
-    return g_epoch_phys_logical_gap_limit <= 0;
 }
 
 void EpochConfigInit(void)
@@ -238,7 +235,7 @@ void EpochRegisterGucs(void)
                             &g_epoch_cache_slots,
                             EPOCH_DEFAULT_CACHE_SLOTS,
                             8,
-                            8192,
+                            EPOCH_DEFAULT_CACHE_SLOTS,   /* 上限必须跟默认值一致，否则启动即断言失败 */
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
@@ -259,6 +256,20 @@ void EpochRegisterGucs(void)
                             NULL,
                             NULL);
 
+    DefineCustomIntVariable("epoch_terminals",
+                            "Number of client terminals; an epoch is closed for sending once this many "
+                            "terminals have moved past it.",
+                            NULL,
+                            &g_epoch_terminals,
+                            64,
+                            1,
+                            65536,
+                            PGC_POSTMASTER,
+                            GUC_NO_RESET_ALL,
+                            NULL,
+                            NULL,
+                            NULL);
+
     DefineCustomIntVariable("epoch_delay_slots",
                             "Logical epoch delay behind physical epoch.",
                             NULL,
@@ -266,20 +277,6 @@ void EpochRegisterGucs(void)
                             EPOCH_DEFAULT_DELAY,
                             0,
                             32,
-                            PGC_POSTMASTER,
-                            GUC_NO_RESET_ALL,
-                            NULL,
-                            NULL,
-                            NULL);
-
-    DefineCustomIntVariable("epoch_phys_logical_gap_limit",
-                            "Max slots physical epoch may lead logical epoch (backpressure). "
-                            "0 disables physical backpressure.",
-                            NULL,
-                            &g_epoch_phys_logical_gap_limit,
-                            5,
-                            0,
-                            8192,
                             PGC_POSTMASTER,
                             GUC_NO_RESET_ALL,
                             NULL,
@@ -326,10 +323,10 @@ void EpochRegisterGucs(void)
                             NULL);
 
     DefineCustomIntVariable("epoch_pack_threads",
-                            "Pack worker count (TxnQueue drain → merge enqueue + send queue; Pack#0 seals).",
+                            "Send worker count (drain TxnQueue -> publish + local loopback; only worker#0 sends).",
                             NULL,
-                            &g_epoch_pack_threads,
-                            5,
+                            &g_epoch_send_threads,
+                            1,
                             1,
                             64,
                             PGC_POSTMASTER,
@@ -640,6 +637,19 @@ void EpochRegisterGucs(void)
                             NULL,
                             NULL);
 
+    DefineCustomIntVariable("epoch_dbr_admit_per_epoch",
+                            "Max local write sets a congested straggler keeps sending per epoch; the rest are deferred by DBR.",
+                            NULL,
+                            &g_epoch_dbr_admit_per_epoch,
+                            8,
+                            0,
+                            100000,
+                            PGC_POSTMASTER,
+                            GUC_NO_RESET_ALL,
+                            NULL,
+                            NULL,
+                            NULL);
+
     DefineCustomIntVariable("epoch_dyn_net_rtt_ms",
                             "Estimated RTT (ms) for epoch observer compensation.",
                             NULL,
@@ -653,6 +663,25 @@ void EpochRegisterGucs(void)
                             NULL,
                             NULL);
 
+    DefineCustomStringVariable("epoch_dbr_mode",
+                               "DBR 拥塞时：drop=丢弃写集（省带宽）| defer=延后到后续片（保数据）",
+                               NULL,
+                               &g_epoch_dbr_mode,
+                               "drop",
+                               PGC_SIGHUP,
+                               0,
+                               NULL, NULL, NULL),
+
+    DefineCustomIntVariable("epoch_dbr_threshold_pct",
+                            "DBR: 上行速率达到配置带宽的百分比阈值时判为拥塞（1~100）",
+                            NULL,
+                            &g_epoch_dbr_threshold_pct,
+                            95,
+                            1,
+                            100,
+                            PGC_SIGHUP,
+                            0,
+                            NULL, NULL, NULL),
     DefineCustomStringVariable("epoch_dyn_net_slow_nodes",
                                "Comma-separated slow node ids (e.g. 0).",
                                NULL,

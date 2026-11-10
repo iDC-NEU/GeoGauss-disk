@@ -1,6 +1,6 @@
 # 设计草案：GeoGauss 式「自拉流水线」落在现有 epoch shmem
 
-**状态**：2026-07-15 — **二维私有队列 + 共享 `merge_epoch` 游标**（对齐 `apply_epoch`）  
+**状态**：2026-05-15 — **二维私有队列 + 共享 `merge_epoch` 游标**（对齐 `apply_epoch`）  
 **队列**：Merge/Apply shmem 均为 `[epoch%slots][route_worker]`；无全局锁  
 **merge 游标**：Claim / 关窗 / Feed 只针对 `merge_epoch`；complete 且 `merge_epoch+1 < physical` 时 `++`（**不**按 logical 做下限：logical 推进已蕴含 merge/apply 完成）  
 **recv**：`g_remote_merge_queues[route_wid % n_merge]`；Drain 只入队 `[merge_epoch, physical)`  

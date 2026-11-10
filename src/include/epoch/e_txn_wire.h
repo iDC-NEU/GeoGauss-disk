@@ -8,15 +8,32 @@
 #include "epoch/e_types.h"
 
 static constexpr uint64_t EPOCH_WIRE_MAGIC = 0xE0C0CAFEULL;
-static constexpr uint32_t EPOCH_WIRE_VERSION = 6;
+static constexpr uint32_t EPOCH_WIRE_VERSION = 7;
 static constexpr uint64_t EPOCH_MERGE_TASK_MAGIC = 0xE0C0CAF2ULL;
 static constexpr uint32_t EPOCH_MERGE_TASK_VERSION = 2;
-static constexpr uint32_t EPOCH_MAX_WIRE_TXN_BYTES = 256 * 1024;
+/*
+ * 单笔事务序列化后的最大字节数（发送队列 / merge 任务 / apply 任务三处定长缓冲共用）。
+ * TPCC 实测最大写集：Delivery 改 10 行 × 740B ≈ 8.1KB → 12KB 留 1.5 倍余量。
+ * 之所以定长：这些缓冲在【共享内存】里，需要 O(1) 算术寻址；变长需要分配器且易碎片。
+ */
+static constexpr uint32_t EPOCH_MAX_WIRE_TXN_BYTES = 12 * 1024;
 static constexpr uint16_t EPOCH_WIRE_MAX_PK = 128;
 /* 空包 + 该 CSN 表示请求对端重发某 epoch 的缓存事务 */
 static constexpr uint64_t EPOCH_WIRE_TXN_REQUEST_CSN = UINT64_MAX;
 /* PA 激活：带一行，expected_csn = 协助区间终点，relid = session */
 static constexpr uint64_t EPOCH_WIRE_PA_ACTIVATE_CSN = UINT64_MAX - 1;
+/* PA：慢节点下行拥塞状态广播（on/off 两个 csn 值区分） */
+static constexpr uint64_t EPOCH_WIRE_PA_STATE_ON_CSN = UINT64_MAX - 5;
+static constexpr uint64_t EPOCH_WIRE_PA_STATE_OFF_CSN = UINT64_MAX - 6;
+/* PA：代理对某一片的转发决策（epoch 字段带片号，csn 区分 skip/direct） */
+static constexpr uint64_t EPOCH_WIRE_PA_EPOCH_SKIP_CSN = UINT64_MAX - 7;
+static constexpr uint64_t EPOCH_WIRE_PA_EPOCH_DIRECT_CSN = UINT64_MAX - 8;
+/* 拉模式：本端缺某 peer 的 epoch-end 时，请对方重发该 epoch 的 EOF（EOF 可能被丢弃） */
+static constexpr uint64_t EPOCH_WIRE_EOF_REQUEST_CSN = UINT64_MAX - 2;
+/* 快节点把自己的 physical epoch 通告给慢节点（内容放在 txn.epoch 里） */
+static constexpr uint64_t EPOCH_WIRE_PHYS_NOTIFY_CSN = UINT64_MAX - 3;
+/* EOF 确认：携带"我连续收到的你的 EOF 到第几片"（内容在 txn.epoch 里） */
+static constexpr uint64_t EPOCH_WIRE_EOF_ACK_CSN = UINT64_MAX - 9;
 
 struct E_WireRow {
     EpochOpType op_type{EPOCH_OP_READ};
@@ -43,6 +60,11 @@ struct E_WireTxn {
     uint64_t csn{0};
     uint64_t epoch{0};
     uint32_t server_id{0};
+    /*
+     * 发起节点的事务起点（微秒，gettimeofday 口径，v7 起随 wire 传输）。
+     * 仅用于发起节点本机统计：事务开始 → 本节点 apply 写回完成。
+     */
+    uint64_t origin_start_us{0};
     EpochTxnState txn_state{EPOCH_TXN_COMMIT};
     /* TPCC w_id；0=未知，路由 fallback 到 wire_key % N */
     uint16_t route_wid{0};
@@ -66,10 +88,46 @@ static inline bool E_WireTxnIsHello(const E_WireTxn& txn)
     return txn.rows.empty() && txn.epoch == 0 && txn.csn != EPOCH_WIRE_TXN_REQUEST_CSN;
 }
 
+/* 拉取式 EOF 重传：某节点请求重发指定片的收尾包 */
+/* EOF 确认消息 */
+static inline bool E_WireTxnIsEofAck(const E_WireTxn& txn)
+{
+    return txn.csn == EPOCH_WIRE_EOF_ACK_CSN;
+}
+
 static inline bool E_WireTxnIsEpochEnd(const E_WireTxn& txn)
 {
     return txn.rows.empty() && txn.epoch > 0 && txn.csn != EPOCH_WIRE_TXN_REQUEST_CSN &&
-           txn.csn != EPOCH_WIRE_PA_ACTIVATE_CSN;
+           txn.csn != EPOCH_WIRE_PA_ACTIVATE_CSN && txn.csn != EPOCH_WIRE_EOF_REQUEST_CSN &&
+           txn.csn != EPOCH_WIRE_PHYS_NOTIFY_CSN && txn.csn != EPOCH_WIRE_EOF_ACK_CSN;
+}
+
+/* PA 状态广播：返回 true 时 *congested 给出状态 */
+static inline bool E_WireTxnIsPaState(const E_WireTxn& txn, bool* congested)
+{
+    if (txn.csn == EPOCH_WIRE_PA_STATE_ON_CSN) {
+        if (congested != nullptr) { *congested = true; }
+        return true;
+    }
+    if (txn.csn == EPOCH_WIRE_PA_STATE_OFF_CSN) {
+        if (congested != nullptr) { *congested = false; }
+        return true;
+    }
+    return false;
+}
+
+/* PA 每片决策：返回 true 时 *skip 给出结论，txn.epoch 即片号 */
+static inline bool E_WireTxnIsPaEpochDecision(const E_WireTxn& txn, bool* skip)
+{
+    if (txn.csn == EPOCH_WIRE_PA_EPOCH_SKIP_CSN) {
+        if (skip != nullptr) { *skip = true; }
+        return true;
+    }
+    if (txn.csn == EPOCH_WIRE_PA_EPOCH_DIRECT_CSN) {
+        if (skip != nullptr) { *skip = false; }
+        return true;
+    }
+    return false;
 }
 
 static inline bool E_WireTxnIsPaActivate(const E_WireTxn& txn)

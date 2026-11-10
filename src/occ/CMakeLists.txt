@@ -2,7 +2,7 @@
 
 AUX_SOURCE_DIRECTORY(${CMAKE_CURRENT_SOURCE_DIR} TGT_occ_SRC)
 
-# Include sources under occ-opt (optimized OCC helpers such as delta table).
+# Include sources under occ-opt (version staging hash table).
 AUX_SOURCE_DIRECTORY(${CMAKE_CURRENT_SOURCE_DIR}/../occ-opt TGT_occ_SRC)
 
 set(TGT_occ_INC

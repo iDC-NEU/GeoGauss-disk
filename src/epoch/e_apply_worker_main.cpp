@@ -1,4 +1,6 @@
 #include "postgres.h"
+
+#include "epoch/e_perf.h"
 #include "knl/knl_variable.h"
 
 #include <signal.h>
@@ -9,6 +11,7 @@
 #include "epoch/e_abort_csn.h"
 #include "epoch/e_apply.h"
 #include "epoch/e_apply_shmem.h"
+#include "epoch/e_merge_shmem.h"
 #include "epoch/e_apply_stats.h"
 #include "epoch/e_apply_profile.h"
 #include "epoch/e_config.h"
@@ -16,7 +19,10 @@
 #include "epoch/e_log_path.h"
 #include "epoch/e_node_manager.h"
 #include "epoch/e_pipeline.h"
+#include "epoch/e_apply_pool.h"
+#include "epoch/e_merge_pool.h"
 #include "epoch/e_statistician.h"
+#include "epoch/e_stuck_trace.h"
 #include "epoch/e_tip_staging_shmem.h"
 #include "epoch/e_pk_staging_shmem.h"
 #include "epoch/e_txn_wire.h"
@@ -66,68 +72,24 @@ static uint32_t EpochApplyWorkerNumWorkers(void)
     }
     return static_cast<uint32_t>(n);
 }
-
-static bool EpochApplyWorkerExecuteTask(EpochApplyTaskSlot* task)
+/*
+ * 写回一笔事务：
+ *   csn 在 abort 集合里 → 只计 abort，不写回；
+ *   否则按 csn 去重后计一次 commit（同一事务的多行只算一笔），再写回。
+ */
+static bool EpochApplyWorkerExecuteOne(const E_WireTxn& txn)
 {
-    if (g_epoch_skip_apply) {
+    if (EpochAbortCsnContains(txn.epoch, txn.csn, txn.server_id)) {
+        EpochApplyStatsNoteAbortN(1);
+        return true;
+    }
+
+    if (EpochApplyCsnSeenFirst(txn.epoch, txn.csn)) {
         EpochApplyStatsNoteCommit();
-        E_NodeManager::IncCommittedTxnCounters(task->epoch, task->local_node);
-        return true;
     }
 
-    EpochApplyProfileBeginWireTxn();
-    if (task->submit_us > 0) {
-        struct timeval tv;
-        gettimeofday(&tv, nullptr);
-        uint64_t now_us = static_cast<uint64_t>(tv.tv_sec) * 1000000ULL + static_cast<uint64_t>(tv.tv_usec);
-        if (now_us >= task->submit_us) {
-            EpochApplyProfileAddUs(EAP_QUEUE_WAIT, now_us - task->submit_us);
-        }
-    }
-
-    E_WireTxn source_txn;
-    instr_time deserialize_start;
-    INSTR_TIME_SET_CURRENT(deserialize_start);
-    bool deserialized = E_WireDeserializeTxn(task->payload, task->payload_len, &source_txn);
-    instr_time deserialize_end;
-    INSTR_TIME_SET_CURRENT(deserialize_end);
-    INSTR_TIME_SUBTRACT(deserialize_end, deserialize_start);
-    EpochApplyProfileAddUs(EAP_DESERIALIZE, static_cast<uint64_t>(INSTR_TIME_GET_MICROSEC(deserialize_end)));
-
-    if (!deserialized) {
-        ereport(WARNING,
-            (errmsg("epoch apply worker: failed to deserialize wire txn epoch=%lu wire_key=%lu",
-                task->epoch,
-                task->wire_key)));
-        return false;
-    }
-
-    /*
-     * 入环 payload 已是赢家原始 wire。insert→heap/pk staging，update/delete→tip staging；
-     * 不再从 CRDT BuildApplyTxn 重建写集。
-     */
-    if (EpochAbortCsnContains(task->epoch, source_txn.csn, source_txn.server_id)) {
-        /* 输家不应入环；丢弃槽位，勿 IncCommitted（否则 committed>expected 卡死） */
-        EpochApplyStatsNoteAbort(OCC_ABORT_REMOTE_MERGE);
-        return true;
-    }
-
-    uint64_t row_count = source_txn.rows.size();
-    const char* apply_tag = (task->flags & EPOCH_APPLY_FLAG_IS_LOCAL) != 0 ? "APPLY_LOCAL" : "APPLY_REMOTE";
-    EpochRecvDiagLogWireRelSummary(apply_tag,
-        task->epoch,
-        source_txn.csn,
-        source_txn.server_id,
-        source_txn.rows);
-
-    bool apply_ok = E_ApplyWireTxnCore(source_txn, (task->flags & EPOCH_APPLY_FLAG_IS_LOCAL) != 0);
-    EpochRecvDiagOnApply(task->epoch, row_count, apply_ok);
-    if (!apply_ok) {
-        return false;
-    }
-    EpochApplyStatsNoteCommit();
-    E_NodeManager::IncCommittedTxnCounters(task->epoch, task->local_node);
-    return true;
+    const bool is_local = (txn.server_id == EpochGetNodeId());
+    return E_ApplyWireTxnCore(txn, is_local);
 }
 
 void EpochApplyWorkerMain(void)
@@ -161,7 +123,6 @@ void EpochApplyWorkerMain(void)
     InitProcess();
 #endif
     EpochLogPathInit();
-    EpochApplyQueueShmemInit();
     EpochCrdtShmemInit();
     EpochTipStagingShmemInit();
     EpochPkStagingShmemInit();
@@ -219,6 +180,11 @@ void EpochApplyWorkerMain(void)
     E_ApplyWarmup();
 
     t_thrd.epoch_worker_cxt.apply_worker_id = EpochApplyWorkerResolveId();
+    {
+        char trace_name[16];
+        (void)snprintf(trace_name, sizeof(trace_name), "apply%d", t_thrd.epoch_worker_cxt.apply_worker_id);
+        EpochStuckTraceRegister(trace_name);
+    }
 
     pgstat_report_appname("epoch apply worker");
     pgstat_report_activity(STATE_IDLE, NULL);
@@ -242,25 +208,29 @@ void EpochApplyWorkerMain(void)
             proc_exit(0);
         }
 
-        EpochApplyTaskSlot* task = nullptr;
-        if (!EpochApplyQueueTryClaim(static_cast<uint32_t>(t_thrd.epoch_worker_cxt.apply_worker_id),
-                EpochApplyWorkerNumWorkers(),
-                &task)) {
+        const uint64_t apply_ep = EpochApplyQueueGetApplyEpoch();
+        const uint64_t merge_ep = GetMergeEpoch();
+
+        /* apply 不能追上 merge：merge 还没处理完的时间片，写回数据还不存在 */
+        if (apply_ep == 0 || merge_ep == 0 || apply_ep >= merge_ep) {
             pgstat_report_activity(STATE_IDLE, NULL);
             pg_usleep(200L);
             continue;
         }
 
-        /* 硬门闩：apply(E) 须 merge_complete(E)；未关窗则退回 READY */
-        if (!EpochPipelineEpochMergeComplete(task->epoch)) {
-            task->state.store(EPOCH_APPLY_SLOT_READY, std::memory_order_release);
-            pg_usleep(200L);
+        E_WireTxn txn;
+        if (!EpochApplyQueueTryDequeue(apply_ep, &txn)) {
+            /* 该格已取空 → 推进 apply 游标（CAS，多线程只会推进一次） */
+            if (EpochApplyQueueTryAdvanceApplyEpoch(apply_ep)) {
+                EpochPerfNoteEpochApplied(apply_ep);   /* 结算这一片的“封口→写回完成”延迟 */
+            }
             continue;
         }
 
         pgstat_report_activity(STATE_RUNNING, NULL);
-        bool ok = EpochApplyWorkerExecuteTask(task);
-        EpochApplyQueueFinishTask(task, ok);
+        EpochStuckTraceNote(EST_APPLY_CLAIM, static_cast<uint32_t>(txn.epoch), txn.csn);
+        (void)EpochApplyWorkerExecuteOne(txn);
+        EpochStuckTraceNote(EST_APPLY_DONE, 1, txn.epoch);
         pgstat_report_activity(STATE_IDLE, NULL);
     }
 }

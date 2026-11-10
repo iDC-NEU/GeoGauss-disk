@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "epoch/e_recv_ledger.h"
 #include "epoch/e_epoch_lifecycle.h"
 #include "epoch/e_config.h"
 #include "epoch/e_log_path.h"
@@ -68,7 +69,7 @@ static uint64_t EpochLifecyclePeerReceivedTotal(uint64_t epoch)
         if (peer == self) {
             continue;
         }
-        total += E_NodeManager::GetStoreReceivedPackCounters(epoch, peer);
+        total += EpochRecvReceivedCount(epoch, peer);
     }
     return total;
 }

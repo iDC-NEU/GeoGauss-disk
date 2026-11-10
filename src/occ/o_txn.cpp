@@ -115,7 +115,7 @@ HeapTuple O_TxnManager::RowLookup(const AccessType type, occ_sentinel const &ori
          * 纯读且写集未命中：不拷贝进 hash，避免 Payment 等「先 UPDATE 再 SELECT」
          * 对无关行重复 IndexFetchTuple + heap_copytuple（off-CPU 主要热点）。
          */
-        if (type == AccessType::RD && !g_enable_occ_delta) {
+        if (type == AccessType::RD) {
             if (scan != nullptr) {
                 Tuple tuple = IndexFetchTuple(scan, nullptr);
                 return (HeapTuple)tuple;

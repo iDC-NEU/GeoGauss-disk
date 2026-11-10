@@ -4,7 +4,12 @@
 #include <cstdint>
 
 /* 环形缓存槽位数；须大于 physical-logical 最大滞后，避免计数覆盖 */
-static constexpr uint32_t EPOCH_DEFAULT_CACHE_SLOTS = 8192;
+/*
+ * 共享内存计数器的槽位数，必须与队列格数 EPOCH_TXN_EPOCH_COUNT 一致：
+ * 否则 epoch 与 epoch+槽数 落进同一格，旧时间片的计数被新片顶掉，
+ * merged 读出来变 0，那片就永远合不完（实测 epoch 888 卡死）。
+ */
+static constexpr uint32_t EPOCH_DEFAULT_CACHE_SLOTS = 10000;
 static constexpr uint32_t EPOCH_MAX_NODES = 16;
 static constexpr uint32_t EPOCH_MAX_NODE_ID = EPOCH_MAX_NODES - 1;
 /* BuildMergedTxn 落盘标记：区别于本节点原始 wire，允许合并结果在本地 apply */
@@ -17,9 +22,7 @@ static constexpr uint32_t EPOCH_DEFAULT_DELAY = 0;
 static constexpr uint32_t EPOCH_TXN_QUEUE_CAPACITY = 8192;
 static constexpr uint32_t EPOCH_MAX_APPLY_WORKERS = 64;
 static constexpr uint32_t EPOCH_MAX_MERGE_WORKERS = 64;
-static constexpr uint32_t EPOCH_MAX_PACK_WORKERS = 64;
-/* Send×1：独占 ZMQ PUB，与 GeoGauss 一致 */
-static constexpr uint32_t EPOCH_MAX_SEND_WORKERS = 1;
+static constexpr uint32_t EPOCH_MAX_SEND_WORKERS = 64;
 /* tip flush：由 GUC epoch_tip_flush_threads 控制，上限见此常量 */
 static constexpr uint32_t EPOCH_MAX_TIP_FLUSH_WORKERS = 16;
 /* e_perf gate 种类数（与 EpochPerfGateKind 一致） */

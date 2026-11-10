@@ -11,6 +11,8 @@
  */
 extern void EpochApplyStatsNoteCommit(void);
 extern void EpochApplyStatsNoteAbort(OccAbortReason reason);
+/* 按条数一次性记 abort（时间片推进时把该片的 merge 输家计入） */
+extern void EpochApplyStatsNoteAbortN(uint64_t n);
 /* merge 输家 / abort_csn：abort 统计 + epoch committed +1 */
 extern void EpochApplyStatsNoteFinalize(uint64_t epoch, uint32_t local_node, OccAbortReason reason);
 /* 只读等 wire txn 落账：仅 committed +1，不计 abort */

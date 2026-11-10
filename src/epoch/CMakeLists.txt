@@ -19,7 +19,7 @@ set(epoch_DEF_OPTIONS ${MACRO_OPTIONS})
 set(epoch_LINK_OPTIONS ${BIN_LINK_OPTIONS})
 
 # HCJ ADDBY: optional ZMQ from GeoGauss build output
-set(EPOCH_ZMQ_ROOT "/home/hcj2003/GeoGauss/dest" CACHE PATH "Root path of libzmq install")
+set(EPOCH_ZMQ_ROOT "/data/geogauss/zmqroot" CACHE PATH "Root path of libzmq install")
 if(EXISTS "${EPOCH_ZMQ_ROOT}/lib/libzmq.so")
     list(APPEND TGT_epoch_INC ${EPOCH_ZMQ_ROOT}/include)
     list(APPEND epoch_DEF_OPTIONS -DEPOCH_USE_ZMQ=1)

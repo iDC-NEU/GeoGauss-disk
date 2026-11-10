@@ -23,3 +23,12 @@ objfiles.txt
 
 /build/script/version.cfg
 /cmake_buildopengauss_debug.tar.gz
+
+# 本地临时文件与大文件（不推送到 GitHub）
+*.lz4
+*.bak
+*.bak.*
+build.log*
+lex.backup
+scripts/epoch_benchmark/_agent_edits.json
+Pacer__Straggler_Tolerant_Replication_for_Epoch_Based_Geo_Distributed_OLTP_Databases (2).pdf

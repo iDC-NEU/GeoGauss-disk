@@ -1,6 +1,11 @@
 #include "postgres.h"
 
+#include <mutex>
+#include <cstdarg>
+
+#include "epoch/e_recv_ledger.h"
 #include "epoch/e_perf.h"
+#include "epoch/e_epoch_capacity.h"
 #include "epoch/e_config.h"
 #include "epoch/e_log_path.h"
 #include "epoch/e_shmem.h"
@@ -12,6 +17,7 @@
 #include "miscadmin.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -420,11 +426,22 @@ void EpochPerfNoteApplyCommitTxn(void)
 
 void EpochPerfNoteApplyAbortTxn(void)
 {
-    if (!g_enable_epoch_multimaster) {
+    EpochPerfAddApplyAbortTxn(1);
+}
+
+/*
+ * 一次加 n 笔 abort（时间片推进时把该片的全部 merge 输家一起计入）。
+ * 用 fetch_add 而不是循环 Bump：并发写回线程同时调用也不会少算。
+ */
+void EpochPerfAddApplyAbortTxn(uint64_t n)
+{
+    if (!g_enable_epoch_multimaster || n == 0) {
         return;
     }
     EpochSharedState::EpochPerfCounters* perf = EpochPerfCounters();
-    EpochPerfBump(perf != nullptr ? &perf->apply_abort_txn : nullptr);
+    if (perf != nullptr) {
+        perf->apply_abort_txn.fetch_add(n, std::memory_order_relaxed);
+    }
 }
 
 void EpochPerfNoteMergeHeapAbort(void)
@@ -459,17 +476,143 @@ static void EpochPerfAppendLine(FILE* fp, const char* line)
     fputc('\n', fp);
 }
 
+/*
+ * 按 epoch 粒度的粗延迟统计（论文里只需要量级，不追求单事务精确值）。
+ *
+ *   seal 时刻：physical 从 e 推进到 e+1 的那一刻（e 这一片的事务全部产生完毕）
+ *   apply 时刻：apply 游标从 e 推进到 e+1 的那一刻（e 这一片写回完成）
+ *   延迟 = apply - seal，即"一片从封口到写回完成"的时间
+ *
+ * 统计范围：第 10 ~ 110 片（避开启动抖动，也不受后期积压/收尾影响）。
+ */
+static std::atomic<uint64_t> g_epoch_seal_us[EPOCH_TXN_EPOCH_COUNT];
+
+/*
+ * 延迟统计区间：**去掉首尾各 10 片**
+ *   - 跳过前 10 片（启动抖动：客户端刚连、jTPCC ramp-up）
+ *   - 动态排除最近 10 片（收尾：客户端停止、最后几片可能填不满）
+ */
+static constexpr uint64_t EPOCH_LAT_SKIP_HEAD = 10;
+static constexpr uint64_t EPOCH_LAT_SKIP_TAIL = 10;
+
+/* 最近 10 片的延迟（用于排除收尾），以及它们的和 */
+static std::mutex g_lat_tail_mu;
+static uint64_t g_lat_tail[EPOCH_LAT_SKIP_TAIL] = {0};
+static uint64_t g_lat_tail_sum_us = 0;
+static uint64_t g_lat_tail_pos = 0;
+static std::atomic<uint64_t> g_epoch_lat_sum_us{0};
+static std::atomic<uint64_t> g_epoch_lat_cnt{0};
+
+static inline uint64_t EpochNowUs(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return static_cast<uint64_t>(tv.tv_sec) * 1000000ULL + static_cast<uint64_t>(tv.tv_usec);
+}
+
+void EpochPerfNoteEpochSeal(uint64_t epoch)
+{
+    if (epoch == 0) {
+        return;
+    }
+    g_epoch_seal_us[EpochSlotOf(epoch)].store(EpochNowUs(), std::memory_order_relaxed);
+}
+
+void EpochPerfNoteEpochApplied(uint64_t epoch)
+{
+    if (epoch == 0) {
+        return;
+    }
+    const uint64_t seal = g_epoch_seal_us[EpochSlotOf(epoch)].load(std::memory_order_relaxed);
+    if (seal == 0) {
+        return;
+    }
+    const uint64_t now = EpochNowUs();
+    if (now <= seal) {
+        return;
+    }
+    if (epoch <= EPOCH_LAT_SKIP_HEAD) {
+        return;                        /* 去掉头部 10 片（启动抖动） */
+    }
+
+    const uint64_t lat_us = now - seal;
+    g_epoch_lat_sum_us.fetch_add(lat_us, std::memory_order_relaxed);
+    g_epoch_lat_cnt.fetch_add(1, std::memory_order_relaxed);
+
+    /* 记录最近 10 片，算平均时扣掉（去掉尾部） */
+    {
+        std::lock_guard<std::mutex> lk(g_lat_tail_mu);
+        const uint32_t idx = static_cast<uint32_t>(g_lat_tail_pos % EPOCH_LAT_SKIP_TAIL);
+        g_lat_tail_sum_us = g_lat_tail_sum_us - g_lat_tail[idx] + lat_us;
+        g_lat_tail[idx] = lat_us;
+        ++g_lat_tail_pos;
+    }
+}
+
+/* 快照闸门因超时放行的次数（一致性让路指标） */
+static std::atomic<uint64_t> g_snap_timeout_cnt{0};
+
+void EpochPerfNoteSnapTimeout(void)
+{
+    g_snap_timeout_cnt.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t EpochPerfSnapTimeoutCount(void)
+{
+    return g_snap_timeout_cnt.load(std::memory_order_relaxed);
+}
+
+/* 第 10~110 片的平均延迟（微秒）：封口 → 写回完成 */
+uint64_t EpochPerfEpochLatAvgUs(void)
+{
+    const uint64_t cnt = g_epoch_lat_cnt.load(std::memory_order_relaxed);
+    if (cnt == 0) {
+        return 0;
+    }
+    uint64_t sum = g_epoch_lat_sum_us.load(std::memory_order_relaxed);
+
+    /* 去掉尾部：把最近 10 片（不足 10 片时按实有）从分子分母里扣掉 */
+    uint64_t tail_sum = 0;
+    uint64_t tail_cnt = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_lat_tail_mu);
+        tail_cnt = (g_lat_tail_pos < EPOCH_LAT_SKIP_TAIL) ? g_lat_tail_pos : EPOCH_LAT_SKIP_TAIL;
+        tail_sum = g_lat_tail_sum_us;
+    }
+    if (cnt <= tail_cnt) {
+        return (sum / cnt);
+    }
+    return ((sum - tail_sum) / (cnt - tail_cnt));
+}
 void EpochPerfMaybeReport(void)
 {
     if (!EpochPerfIsEnabled()) {
         return;
     }
 
+    /*
+     * 落盘条件：每推进 50 个时间片，或者距上次已满 1 秒。
+     *
+     * 只按时间片推进计数（原来唯一条件）时，60 秒的压测只有十来条快照，
+     * 最后一条可能停在压测结束前好几秒；而 collect 是在压测结束后才读的，
+     * 采样点越稀，60 秒窗口的误差越大。补一条“每秒至少一次”之后，
+     * 冻结时刻与压测结束时刻的偏差不超过 1 秒。
+     */
     uint64_t physical = E_NodeManager::GetPhysicalEpoch();
-    if (g_last_perf_report_physical != 0 && physical <= g_last_perf_report_physical + 49) {
+    static uint64_t last_report_us = 0;
+    struct timeval perf_tv;
+    gettimeofday(&perf_tv, nullptr);
+    const uint64_t perf_now_us = static_cast<uint64_t>(perf_tv.tv_sec) * 1000000ULL +
+                                 static_cast<uint64_t>(perf_tv.tv_usec);
+    const bool by_physical = (g_last_perf_report_physical != 0 &&
+                              physical > g_last_perf_report_physical + 49);
+    const bool by_time = (last_report_us == 0 ||
+                          (perf_now_us - last_report_us) >= 1000000ULL);
+    if (!by_physical && !by_time) {
         return;
     }
     g_last_perf_report_physical = physical;
+    last_report_us = perf_now_us;
 
     EpochSharedState::EpochPerfCounters* perf = EpochPerfCounters();
     if (perf == nullptr) {
@@ -657,8 +800,8 @@ void EpochPerfMaybeReport(void)
         uint64_t peer_rcv = 0;
         for (uint64_t epoch = (logical > 8 ? logical - 8 : 1); epoch <= logical; ++epoch) {
             peer_pack += E_NodeManager::GetLocalPackTxnCounters(epoch, peer);
-            peer_should += E_NodeManager::GetStoreShouldReceivedPackCounters(epoch, peer);
-            peer_rcv += E_NodeManager::GetStoreReceivedPackCounters(epoch, peer);
+            peer_should += EpochRecvDeclaredCount(epoch, peer);
+            peer_rcv += EpochRecvReceivedCount(epoch, peer);
         }
         rc = snprintf_s(buf,
             sizeof(buf),
@@ -675,4 +818,46 @@ void EpochPerfMaybeReport(void)
 
     EpochPerfAppendLine(fp, "");
     fclose(fp);
+}
+
+const char* EpochDbgTs(void)
+{
+    static thread_local char buf[32];
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    struct tm tm_buf;
+    (void)localtime_r(&tv.tv_sec, &tm_buf);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+        tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec,
+        static_cast<int>(tv.tv_usec / 1000));
+    return buf;
+}
+
+/*
+ * 诊断输出：写到数据目录下的独立文件，不进 pg_log。
+ *
+ * prep 的 reset data 会清空 pg_log，靠它做卡点定位时日志经常已经没了；
+ * 独立文件放在数据目录根下，跨轮次保留。
+ */
+static FILE* g_diag_fp = nullptr;
+static std::mutex g_diag_mu;
+
+void EpochDiagWrite(const char* fmt, ...)
+{
+    std::lock_guard<std::mutex> lock(g_diag_mu);
+    if (g_diag_fp == nullptr) {
+        char path[MAXPGPATH];
+        if (EpochFormatLogPath(path, sizeof(path), "epoch_diag")) {
+            g_diag_fp = fopen(path, "a");
+        }
+        if (g_diag_fp == nullptr) {
+            return;
+        }
+    }
+    fprintf(g_diag_fp, "[%s] ", EpochDbgTs());
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(g_diag_fp, fmt, ap);
+    va_end(ap);
+    fflush(g_diag_fp);
 }

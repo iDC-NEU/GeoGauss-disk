@@ -1,9 +1,11 @@
 #include "postgres.h"
 
 #include "epoch/e_node_manager.h"
+#include "epoch/e_concurrent_map.h"
 
 #include "epoch/e_config.h"
 #include "epoch/e_abort_csn.h"
+#include "epoch/e_recv_ledger.h"
 #include "epoch/e_shmem.h"
 #include "epoch/e_statistician.h"
 
@@ -29,14 +31,31 @@ static void ClearEpochSlotCells(EpochSharedState* state, uint32_t slot)
         state->counters.sealed_pack_txn[slot][node].store(0, std::memory_order_relaxed);
         state->counters.abort_txn[slot][node].store(0, std::memory_order_relaxed);
         state->counters.write_abort_after_send_txn[slot][node].store(0, std::memory_order_relaxed);
-        state->counters.store_should_receive_pack[slot][node].store(0, std::memory_order_relaxed);
-        state->counters.store_received_pack[slot][node].store(0, std::memory_order_relaxed);
         state->counters.wire_merge_done[slot][node].store(0, std::memory_order_relaxed);
         state->counters.merged_txn[slot][node].store(0, std::memory_order_relaxed);
         state->counters.committed_txn[slot][node].store(0, std::memory_order_relaxed);
         state->counters.node_send_completed[slot][node].store(false, std::memory_order_relaxed);
         state->counters.node_receive_completed[slot][node].store(false, std::memory_order_relaxed);
     }
+}
+
+/*
+ * 抢名额序号：多个 backend 进程并发，靠 fetch_add 保证每个号只发一次。
+ * 调用前必须 EnsureEpochSlot，保证 slot 绑定的是这个 epoch；
+ * 若已被别的时间片占用（环形复用），返回 0 让调用方放弃。
+ */
+uint32_t E_NodeManager::NextPackSlotSeq(uint64_t epochId)
+{
+    EpochSharedState* state = EpochState();
+    if (state == nullptr || epochId == 0) {
+        return 0;
+    }
+    EnsureEpochSlot(epochId);
+    const uint32_t slot = GetSlot(epochId);
+    if (!EpochSlotIsCurrent(state, epochId, slot)) {
+        return 0;
+    }
+    return state->counters.pack_slot_seq[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
 }
 
 void E_NodeManager::EnsureEpochSlot(uint64_t epochId)
@@ -54,7 +73,6 @@ void E_NodeManager::EnsureEpochSlot(uint64_t epochId)
         if (tagged == 0) {
             if (state->counters.slot_epoch[slot].compare_exchange_weak(
                     tagged, epochId, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                EpochRestorePastEpochPeerFlags(epochId);
                 return;
             }
             continue;
@@ -68,7 +86,6 @@ void E_NodeManager::EnsureEpochSlot(uint64_t epochId)
             ClearEpochSlotCells(state, slot);
             state->counters.slot_epoch[slot].store(epochId, std::memory_order_release);
             EpochAbortCsnClear(epochId);
-            EpochRestorePastEpochPeerFlags(epochId);
             return;
         }
     }
@@ -100,6 +117,16 @@ uint64_t E_NodeManager::GetPhysicalEpoch(void)
         return 1;
     }
     return state->physical_epoch.load(std::memory_order_acquire);
+}
+
+bool E_NodeManager::TryAddPhysicalEpoch(uint64_t expected)
+{
+    EpochSharedState* state = EpochState();
+    if (state == nullptr || expected == 0) {
+        return false;
+    }
+    return state->physical_epoch.compare_exchange_strong(expected, expected + 1,
+        std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 uint64_t E_NodeManager::AddPhysicalEpoch(void)
@@ -147,35 +174,7 @@ void E_NodeManager::SetLogicalEpoch(uint64_t value)
     state->logical_epoch.store(value, std::memory_order_release);
 }
 
-void E_NodeManager::SetStoreShouldReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t value)
-{
-    EnsureEpochSlot(epochId);
-    EpochSharedState* state = EpochState();
-    if (state == nullptr) {
-        return;
-    }
-    uint32_t slot = GetSlot(epochId);
-    uint32_t node = static_cast<uint32_t>(nodeId);
-    if (node >= EPOCH_MAX_NODES) {
-        node = EPOCH_MAX_NODE_ID;
-    }
-    state->counters.store_should_receive_pack[slot][node].store(value, std::memory_order_release);
-}
 
-void E_NodeManager::SetStoreReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t value)
-{
-    EnsureEpochSlot(epochId);
-    EpochSharedState* state = EpochState();
-    if (state == nullptr) {
-        return;
-    }
-    uint32_t slot = GetSlot(epochId);
-    uint32_t node = static_cast<uint32_t>(nodeId);
-    if (node >= EPOCH_MAX_NODES) {
-        node = EPOCH_MAX_NODE_ID;
-    }
-    state->counters.store_received_pack[slot][node].store(value, std::memory_order_release);
-}
 
 void E_NodeManager::SetLocalPackTxnCounters(uint64_t epochId, uint64_t nodeId, uint64_t value)
 {
@@ -335,114 +334,44 @@ EPOCH_COUNTER_OP(GetAbortTxnCounters, abort_txn, .load(std::memory_order_acquire
 EPOCH_COUNTER_INC(IncWriteAbortAfterSendTxnCounters, write_abort_after_send_txn)
 EPOCH_COUNTER_OP(GetWriteAbortAfterSendTxnCounters, write_abort_after_send_txn, .load(std::memory_order_acquire), )
 
-uint64_t E_NodeManager::UpdateStoreShouldReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t increment)
-{
-    EnsureEpochSlot(epochId);
-    EpochSharedState* state = EpochState();
-    if (state == nullptr) {
-        return 0;
-    }
-    uint32_t slot = GetSlot(epochId);
-    uint32_t node = static_cast<uint32_t>(nodeId);
-    if (node >= EPOCH_MAX_NODES) {
-        node = EPOCH_MAX_NODE_ID;
-    }
-    return state->counters.store_should_receive_pack[slot][node].fetch_add(increment, std::memory_order_acq_rel) +
-           increment;
-}
 
-EPOCH_COUNTER_OP(GetStoreShouldReceivedPackCounters, store_should_receive_pack, .load(std::memory_order_acquire), )
 
-uint64_t E_NodeManager::UpdateStoreReceivedPackCounters(uint64_t epochId, uint64_t nodeId, uint64_t increment)
-{
-    EnsureEpochSlot(epochId);
-    EpochSharedState* state = EpochState();
-    if (state == nullptr) {
-        return 0;
-    }
-    uint32_t slot = GetSlot(epochId);
-    uint32_t node = static_cast<uint32_t>(nodeId);
-    if (node >= EPOCH_MAX_NODES) {
-        node = EPOCH_MAX_NODE_ID;
-    }
-    return state->counters.store_received_pack[slot][node].fetch_add(increment, std::memory_order_acq_rel) + increment;
-}
 
-EPOCH_COUNTER_OP(GetStoreReceivedPackCounters, store_received_pack, .load(std::memory_order_acquire), )
 
-void E_NodeManager::SetNodeSendCompleted(uint64_t epochId, uint64_t nodeId, bool completed)
-{
-    EnsureEpochSlot(epochId);
-    EpochSharedState* state = EpochState();
-    if (state == nullptr) {
-        return;
-    }
-    uint32_t slot = GetSlot(epochId);
-    uint32_t node = static_cast<uint32_t>(nodeId);
-    if (node >= EPOCH_MAX_NODES) {
-        node = EPOCH_MAX_NODE_ID;
-    }
-    state->counters.node_send_completed[slot][node].store(completed, std::memory_order_release);
-}
 
 bool E_NodeManager::IsNodeSendCompleted(uint64_t epochId, uint64_t nodeId)
 {
+    if (epochId == 0) {
+        return false;
+    }
     EpochSharedState* state = EpochState();
     if (state == nullptr) {
         return false;
     }
-    uint32_t slot = GetSlot(epochId);
-    if (!EpochSlotIsCurrent(state, epochId, slot)) {
+    if (nodeId == static_cast<uint64_t>(EpochGetNodeId())) {
         /*
-         * ClearEpochSlot 后 slot_epoch=0；logical 已越过该 epoch 表示当时 send/recv 已齐。
-         * 否则 IsNodeReceiveCompleted(1) 在 logical=5000+ 时恒 false，TXN_REQ 会死盯 epoch=1。
+         * 本端：physical 已经越过该时间片 ⇒ 它不再收新事务（封口语义）。
+         * 单调游标，不会被后续时间片覆盖。
          */
-        if (epochId < GetLogicalEpoch()) {
-            return true;
-        }
-        return false;
+        return state->physical_epoch.load(std::memory_order_acquire) > epochId;
     }
-    uint32_t node = static_cast<uint32_t>(nodeId);
-    if (node >= EPOCH_MAX_NODES) {
-        node = EPOCH_MAX_NODE_ID;
-    }
-    return state->counters.node_send_completed[slot][node].load(std::memory_order_acquire);
+    /* 对端：该时间片的收尾包是否已收到 */
+    return EpochRecvHasEof(epochId, static_cast<uint32_t>(nodeId));
 }
 
+/*
+ * 已废弃：收齐与否不再存布尔，一律由接收账本即时判定（已声明 且 已收==应收）。
+ * 保留空实现仅为兼容旧调用点，写入被忽略。
+ */
 void E_NodeManager::SetNodeReceiveCompleted(uint64_t epochId, uint64_t nodeId, bool completed)
 {
-    EnsureEpochSlot(epochId);
-    EpochSharedState* state = EpochState();
-    if (state == nullptr) {
-        return;
-    }
-    uint32_t slot = GetSlot(epochId);
-    uint32_t node = static_cast<uint32_t>(nodeId);
-    if (node >= EPOCH_MAX_NODES) {
-        node = EPOCH_MAX_NODE_ID;
-    }
-    state->counters.node_receive_completed[slot][node].store(completed, std::memory_order_release);
+    (void)epochId;
+    (void)nodeId;
+    (void)completed;
 }
 
-bool E_NodeManager::IsNodeReceiveCompleted(uint64_t epochId, uint64_t nodeId)
-{
-    EpochSharedState* state = EpochState();
-    if (state == nullptr) {
-        return false;
-    }
-    uint32_t slot = GetSlot(epochId);
-    if (!EpochSlotIsCurrent(state, epochId, slot)) {
-        if (epochId < GetLogicalEpoch()) {
-            return true;
-        }
-        return false;
-    }
-    uint32_t node = static_cast<uint32_t>(nodeId);
-    if (node >= EPOCH_MAX_NODES) {
-        node = EPOCH_MAX_NODE_ID;
-    }
-    return state->counters.node_receive_completed[slot][node].load(std::memory_order_acquire);
-}
+
+
 
 uint64_t E_NodeManager::IncWireMergeDoneCounters(uint64_t epochId, uint64_t nodeId)
 {
@@ -450,6 +379,13 @@ uint64_t E_NodeManager::IncWireMergeDoneCounters(uint64_t epochId, uint64_t node
     if (state == nullptr) {
         return 0;
     }
+    /*
+     * 必须先认领这一格，否则 slot_epoch[slot] 还是 0，
+     * IsCurrent 检查会失败、返回 0 —— 每片的第一笔就被漏计，
+     * merged 永远比 declared 少 1，那片永远判不完成（实测卡在 893）。
+     */
+    EnsureEpochSlot(epochId);
+
     uint32_t slot = GetSlot(epochId);
     if (!EpochSlotIsCurrent(state, epochId, slot)) {
         return 0;
@@ -460,6 +396,9 @@ uint64_t E_NodeManager::IncWireMergeDoneCounters(uint64_t epochId, uint64_t node
     }
     return state->counters.wire_merge_done[slot][node].fetch_add(1, std::memory_order_acq_rel) + 1;
 }
+
+
+
 
 EPOCH_COUNTER_OP(GetWireMergeDoneCounters, wire_merge_done, .load(std::memory_order_acquire), )
 EPOCH_COUNTER_INC(IncMergedTxnCounters, merged_txn)
@@ -496,6 +435,7 @@ void E_NodeManager::ClearEpochSlot(uint64_t epochId)
     }
     uint32_t slot = GetSlot(epochId);
     ClearEpochSlotCells(state, slot);
+    state->counters.pack_slot_seq[slot].store(0, std::memory_order_release);
     state->counters.slot_epoch[slot].store(0, std::memory_order_release);
     EpochAbortCsnClear(epochId);
 }

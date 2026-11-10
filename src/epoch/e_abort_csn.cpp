@@ -106,6 +106,23 @@ void EpochAbortCsnShmemInit(void)
     }
 }
 
+/*
+ * 统计某时间片被判输的事务数（abort csn 的条数）。
+ * 一个 csn 代表一个事务，所以这个数就是该时间片的 merge abort 事务数。
+ * 调用方必须在 EpochAbortCsnClear 之前取（apply 推进时取，清理在其后）。
+ */
+uint64_t EpochAbortCsnCount(uint64_t epochId)
+{
+    if (g_epochAbortCsnBank == nullptr) {
+        return 0;
+    }
+    EpochAbortCsnSlotHeader* slot_hdr = EpochAbortCsnSlotHeaderAt(EpochAbortSlotIndex(epochId));
+    if (slot_hdr == nullptr) {
+        return 0;
+    }
+    return static_cast<uint64_t>(slot_hdr->count.load(std::memory_order_acquire));
+}
+
 void EpochAbortCsnClear(uint64_t epochId)
 {
     if (g_epochAbortCsnBank == nullptr) {
@@ -114,20 +131,25 @@ void EpochAbortCsnClear(uint64_t epochId)
     EpochAbortCsnResetSlot(EpochAbortSlotIndex(epochId));
 }
 
-void EpochAbortCsnInsert(uint64_t epochId, uint64_t csn, uint32_t serverId)
+/*
+ * 把一个事务标记为输家。
+ * 返回 true 表示本次是新插入（之前没有），调用方据此只统计一次，
+ * 避免同一笔事务因重复投递等原因被重复计入失败率。
+ */
+bool EpochAbortCsnInsert(uint64_t epochId, uint64_t csn, uint32_t serverId)
 {
     if (csn == 0 || g_epochAbortCsnBank == nullptr) {
-        return;
+        return false;
     }
     if (EpochAbortCsnContains(epochId, csn, serverId)) {
-        return;
+        return false;
     }
 
     E_NodeManager::EnsureEpochSlot(epochId);
     uint32_t slot_idx = EpochAbortSlotIndex(epochId);
     EpochAbortCsnSlotHeader* slot_hdr = EpochAbortCsnSlotHeaderAt(slot_idx);
     if (slot_hdr == nullptr) {
-        return;
+        return false;
     }
 
     SpinLockAcquire(&slot_hdr->lock);
@@ -140,13 +162,14 @@ void EpochAbortCsnInsert(uint64_t epochId, uint64_t csn, uint32_t serverId)
                 csn,
                 serverId,
                 g_epochAbortCsnBank->entries_per_slot)));
-        return;
+        return false;
     }
     EpochAbortCsnEntry* entries = EpochAbortCsnSlotEntries(slot_hdr);
     entries[idx].csn = csn;
     entries[idx].server_id = serverId;
     slot_hdr->count.store(idx + 1, std::memory_order_release);
     SpinLockRelease(&slot_hdr->lock);
+    return true;
 }
 
 bool EpochAbortCsnContains(uint64_t epochId, uint64_t csn, uint32_t serverId)
@@ -181,16 +204,4 @@ bool EpochAbortCsnContains(uint64_t epochId, uint64_t csn, uint32_t serverId)
     }
     SpinLockRelease(&slot_hdr->lock);
     return false;
-}
-
-void EpochAbortCsnRecordMergeOutcome(uint64_t epochId, const E_WireTxn& txn, const E_CrdtMergeOutcome& outcome)
-{
-    for (const auto& aborted : outcome.aborted_txns) {
-        EpochAbortCsnInsert(epochId, aborted.first, aborted.second);
-    }
-    if (!outcome.txn_accepted) {
-        EpochAbortCsnInsert(epochId, txn.csn, txn.server_id);
-        bool in_abort = EpochAbortCsnContains(epochId, txn.csn, txn.server_id);
-        EpochDiagLogMergeLoserAbortCsn(epochId, txn.csn, txn.server_id, false, in_abort);
-    }
 }

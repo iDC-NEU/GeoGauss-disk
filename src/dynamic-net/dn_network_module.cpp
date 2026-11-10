@@ -162,6 +162,15 @@ std::vector<DnOutgoingPacket> DnNetworkModule::PopReadyOutgoingPackets()
     std::vector<DnOutgoingPacket> ready;
     long long now = NowMs();
 
+    {
+        static uint64_t dbg_txq = 0;
+        if ((++dbg_txq % 500) == 0) {
+            fprintf(stderr, "EPOCH_DBG dn_txq data=%zu ctrl=%zu now=%lld head_data_rel=%lld\n",
+                    m_dataQueue.size(), m_controlQueue.size(), now,
+                    m_dataQueue.empty() ? -1LL : m_dataQueue.front().release_time_ms);
+        }
+    }
+
     auto pop_from = [&](std::deque<DnOutgoingPacket> &q) {
         while (!q.empty() && q.front().release_time_ms <= now) {
             ready.push_back(std::move(q.front()));

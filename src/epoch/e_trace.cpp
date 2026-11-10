@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "epoch/e_recv_ledger.h"
 #include "epoch/e_trace.h"
 #include "epoch/e_config.h"
 #include "epoch/e_log_path.h"
@@ -57,7 +58,7 @@ static uint64_t EpochTracePeerReceivedTotal(uint64_t epoch)
         if (n == self) {
             continue;
         }
-        total += E_NodeManager::GetStoreReceivedPackCounters(epoch, n);
+        total += EpochRecvReceivedCount(epoch, n);
     }
     return total;
 }
@@ -108,30 +109,10 @@ void EpochTraceLogSealPrepare(uint64_t epoch, uint64_t txn_total)
     securec_check_ss(rc, "\0", "\0");
     EpochTraceAppendLine(buf);
 }
-
 void EpochTraceMaybeLogPeerReceived(uint64_t epoch)
 {
-    if (!EpochTraceEnabled()) {
-        return;
-    }
-    if (!EpochIsAllPeersReceiveCompleted(epoch)) {
-        return;
-    }
-    if (g_trace_peer_recv_logged.find(epoch) != g_trace_peer_recv_logged.end()) {
-        return;
-    }
-    g_trace_peer_recv_logged.insert(epoch);
-
-    uint64_t total = EpochTracePeerReceivedTotal(epoch);
-    if (total == 0 || EpochTraceEpochIsIdle(epoch)) {
-        return;
-    }
-    char buf[128];
-    int rc = snprintf_s(buf, sizeof(buf), sizeof(buf) - 1,
-                        "RECV epoch=%lu 收到了来自其他 node 的事务总数为 %lu",
-                        epoch, total);
-    securec_check_ss(rc, "\0", "\0");
-    EpochTraceAppendLine(buf);
+    /* 账本判据已迁移到 EpochRecvAllEof，这条诊断不再需要 */
+    (void)epoch;
 }
 
 void EpochTraceMaybeLogMergeSummary(uint64_t epoch, uint64_t need_merge, uint64_t merged_success)

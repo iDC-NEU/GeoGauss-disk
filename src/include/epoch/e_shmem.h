@@ -4,6 +4,8 @@
 #include <atomic>
 #include <cstdint>
 
+#include "storage/spin.h"
+
 #include "epoch/e_types.h"
 
 /*
@@ -13,6 +15,14 @@
 struct EpochCounterBank {
     /* 槽位当前绑定的 epoch 号，防止 logical 落后时同槽被更高 epoch 覆盖 */
     std::atomic<uint64_t> slot_epoch[EPOCH_DEFAULT_CACHE_SLOTS];
+    /*
+     * 本时间片已发出的名额序号（backend 并发抢号）。
+     *   取到 < 24   → 写集入队
+     *   取到 == 24  → 由它塞收尾包并推进 physical
+     *   取到 > 24   → 这一片满了，本事务放弃入队（计入 abort）
+     * 这样每片最多 24 条写集 + 1 个收尾包，容量固定，不需要定时推进。
+     */
+    std::atomic<uint32_t> pack_slot_seq[EPOCH_DEFAULT_CACHE_SLOTS];
     /* GeoGauss LoadChangeSet：OCC 写事务 pack 时与 local_pack 同步 +1，用于 should_send */
     std::atomic<uint64_t> change_set_txn[EPOCH_DEFAULT_CACHE_SLOTS][EPOCH_MAX_NODES];
     /* 本 epoch 内正在执行 SQL、尚未完成读写集采集的事务数（首次 OCC 访问 +1，pack/只读 commit/abort -1） */
@@ -25,8 +35,6 @@ struct EpochCounterBank {
     std::atomic<uint64_t> abort_txn[EPOCH_DEFAULT_CACHE_SLOTS][EPOCH_MAX_NODES];
     /* GeoGauss write_abort_after_send_txn_num：已 pack 后因 merge/abort 退出 */
     std::atomic<uint64_t> write_abort_after_send_txn[EPOCH_DEFAULT_CACHE_SLOTS][EPOCH_MAX_NODES];
-    std::atomic<uint64_t> store_should_receive_pack[EPOCH_DEFAULT_CACHE_SLOTS][EPOCH_MAX_NODES];
-    std::atomic<uint64_t> store_received_pack[EPOCH_DEFAULT_CACHE_SLOTS][EPOCH_MAX_NODES];
     /* GeoGauss remote_merged_txn_counters：每笔 wire txn merge 处理完成 +1（与 FFW merged_txn 无关） */
     std::atomic<uint64_t> wire_merge_done[EPOCH_DEFAULT_CACHE_SLOTS][EPOCH_MAX_NODES];
     /* FFW 写集净赢家计数（apply 对账用） */
@@ -44,6 +52,17 @@ struct EpochSharedState {
     std::atomic<uint64_t> next_commit_csn;
     std::atomic<uint64_t> physical_epoch;
     std::atomic<uint64_t> logical_epoch;
+    /*
+     * 发送游标：本节点“收尾包已经发到哪个时间片”（连续推进，从 1 开始）。
+     * send_epoch > E 就表示 E 的全部写集和收尾包都已发出。
+     * 用它替代原来按 epoch % 512 存的“本端已发完”布尔——布尔会被后面的
+     * 时间片覆盖，游标不会。
+     */
+    /*
+     * 每个 peer 一个发送游标：该 peer 的队列已经连续发到哪个时间片。
+     * EpochGetSendEpoch() 返回所有 peer 的最小值，语义仍是"这一片已发给所有人"。
+     */
+    std::atomic<uint64_t> send_epoch_peer[EPOCH_MAX_NODES];
     /* 本节点 backend assign 累计；达 epoch_physical_txns_per_epoch 后推进 local physical */
     std::atomic<uint64_t> physical_txn_since_advance;
     EpochCounterBank counters;
@@ -91,9 +110,33 @@ struct EpochSharedState {
      * prune 取全表非 0 最小值作为安全上界。
      */
     std::atomic<uint64_t> backend_read_frontier[EPOCH_FRONTIER_SLOTS];
+
+    /*
+     * 时间片“离开计数”：每个格子记一个时间片，计数器记有多少个终端
+     * 已经离开它（即不会再往它里面放事务）。计到终端总数，就把收尾包塞进
+     * 该时间片的发送队列。
+     *
+     * 用 epoch 做格子标签：环形复用，遇到新时间片就把格子重置（持锁做，避免并发）。
+     */
+    struct EpochDepartSlot {
+        slock_t lock;
+        uint64_t epoch;
+        uint32_t count;
+        /* 该时间片的收尾包是否已经塞过：只允许塞一次，避免重复塞导致对端反复处理 */
+        bool eof_pushed;
+    } depart_slots[1024];
 };
 
 extern Size EpochShmemSize(void);
+
+/* 某终端已离开某时间片（分配到了更新的时间片）：计数到终端总数就塞收尾包 */
+
+/* 发送游标（所有 peer 的最小值）：这一片是否已发给全部对端 */
+uint64_t EpochGetSendEpoch(void);
+/* 单个 peer 的发送游标 */
+uint64_t EpochGetSendEpochPeer(uint32_t peer);
+/* 某个 peer 的某时间片收尾包已发出后调用；只允许连续推进 */
+void EpochAdvanceSendEpoch(uint32_t peer, uint64_t epoch);
 extern void EpochShmemInit(void);
 extern EpochSharedState* EpochGetSharedState(void);
 extern uint64_t EpochGetNextCommitCsn(void);

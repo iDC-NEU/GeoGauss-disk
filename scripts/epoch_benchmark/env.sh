@@ -59,9 +59,9 @@ export EPOCH_BENCHMARKSQL="${EPOCH_BENCH_ROOT}/benchmarksql-5.0-epoch/run"
 #   id=1  node1  202.199.13.149   本机 hcj2003
 #   id=2  node2  202.199.13.61    远程 zwx
 #   id=3  node3  219.216.64.216   远程 hcj2003（当前默认不测）
-export EPOCH_NODE1_IP="${EPOCH_NODE1_IP:-202.199.13.149}"
-export EPOCH_NODE2_IP="${EPOCH_NODE2_IP:-202.199.13.61}"
-export EPOCH_NODE3_IP="${EPOCH_NODE3_IP:-219.216.64.216}"
+export EPOCH_NODE1_IP="${EPOCH_NODE1_IP:-172.16.1.11}"
+export EPOCH_NODE2_IP="${EPOCH_NODE2_IP:-172.16.1.12}"
+export EPOCH_NODE3_IP="${EPOCH_NODE3_IP:-172.16.1.13}"
 export EPOCH_TOTAL_NODES=3
 export EPOCH_PEER_HOSTS="${EPOCH_NODE1_IP},${EPOCH_NODE2_IP},${EPOCH_NODE3_IP}"
 
@@ -69,7 +69,8 @@ export EPOCH_PEER_HOSTS="${EPOCH_NODE1_IP},${EPOCH_NODE2_IP},${EPOCH_NODE3_IP}"
 # 当前：node1 + node2，跳过 node3（node3 IP 暂不可用）。
 # 旧组合 node1 + node3：export EPOCH_SKIP_NODE=2
 # 三节点都测：export EPOCH_SKIP_NODE=0
-export EPOCH_SKIP_NODE=3
+# 当前：三节点全参与
+export EPOCH_SKIP_NODE=0
 
 # 下面几行是文件里的生效值。prep / configure 会用这里的值，覆盖终端里已经 export 的同名变量。
 # 对 wait / dbr / pa / het 都生效。RTT 和带宽由 apply_netem.sh 用 tc 写到网卡上。
@@ -79,11 +80,11 @@ export EPOCH_SKIP_NODE=3
 # EPOCH_DYN_NET_BW_MODE：unlimit | uplimit | downlimit | bilimit
 # EPOCH_DYN_NET_BW_MBPS：慢节点带宽（Mbps）。unlimit 时不使用。
 # dbr 会打开 epoch_dyn_net_catchup，pa 打开 epoch_dyn_net_proxy，het 两个都开。
-export EPOCH_PROFILE=wait
-export EPOCH_DYN_NET_SLOW_NODES=1
-export EPOCH_NETWORK_RTT_MS=100
-export EPOCH_DYN_NET_BW_MODE=unlimit
-export EPOCH_DYN_NET_BW_MBPS=100
+export EPOCH_PROFILE="${EPOCH_PROFILE:-wait}"
+export EPOCH_DYN_NET_SLOW_NODES="${EPOCH_DYN_NET_SLOW_NODES-0}"
+export EPOCH_NETWORK_RTT_MS="${EPOCH_NETWORK_RTT_MS:-100}"
+export EPOCH_DYN_NET_BW_MODE="${EPOCH_DYN_NET_BW_MODE:-uplimit}"
+export EPOCH_DYN_NET_BW_MBPS="${EPOCH_DYN_NET_BW_MBPS:-10}"
 
 epoch_node_is_skipped() {
     local node_id="$1"
@@ -166,8 +167,8 @@ export EPOCH_ZMQ_PORT_BASE="${EPOCH_ZMQ_PORT_BASE:-25600}"
 # node1 / node3：hcj2003；node2：zwx（gs_initdb 超级用户随 OS 用户）
 export EPOCH_SUPER_USER="${EPOCH_SUPER_USER:-hcj2003}"
 export EPOCH_SUPER_PASSWORD="${EPOCH_SUPER_PASSWORD:-Gauss@123.}"
-export EPOCH_NODE2_SUPER_USER="${EPOCH_NODE2_SUPER_USER:-zwx}"
-export EPOCH_NODE2_SUPER_PASSWORD="${EPOCH_NODE2_SUPER_PASSWORD:-Test@123}"
+export EPOCH_NODE2_SUPER_USER="${EPOCH_NODE2_SUPER_USER:-hcj2003}"
+export EPOCH_NODE2_SUPER_PASSWORD="${EPOCH_NODE2_SUPER_PASSWORD:-Gauss@123}"
 # node2 的 sudo 密码，apply_netem.sh 在配置/启动测试时用它改 tc
 export EPOCH_NODE2_SUDO_PASSWORD="${EPOCH_NODE2_SUDO_PASSWORD:-zwx}"
 export EPOCH_TPCC_USER=bot
@@ -205,10 +206,14 @@ fi
 
 export EPOCH_REMOTE_USER="${EPOCH_REMOTE_USER:-hcj2003}"
 export EPOCH_REMOTE_HOME="${EPOCH_REMOTE_HOME:-/home/hcj2003}"
-export EPOCH_NODE3_BENCH_ROOT="${EPOCH_NODE3_BENCH_ROOT:-${EPOCH_REMOTE_HOME}/2025-9}"
-export EPOCH_NODE2_REMOTE_USER="${EPOCH_NODE2_REMOTE_USER:-zwx}"
-export EPOCH_NODE2_REMOTE_HOME="${EPOCH_NODE2_REMOTE_HOME:-/home/zwx}"
-export EPOCH_NODE2_BENCH_ROOT="${EPOCH_NODE2_BENCH_ROOT:-${EPOCH_NODE2_REMOTE_HOME}/2025-9}"
+export EPOCH_NODE3_BENCH_ROOT="${EPOCH_NODE3_BENCH_ROOT:-/mnt/data/geogauss}"
+export EPOCH_NODE2_REMOTE_USER="${EPOCH_NODE2_REMOTE_USER:-hcj2003}"
+export EPOCH_NODE2_REMOTE_HOME="${EPOCH_NODE2_REMOTE_HOME:-/home/hcj2003}"
+
+export EPOCH_NODE2_BENCH_ROOT="${EPOCH_NODE2_BENCH_ROOT:-/data/geogauss}"
+#export EPOCH_NODE2_REMOTE_USER="${EPOCH_NODE2_REMOTE_USER:-zwx}"
+#export EPOCH_NODE2_REMOTE_HOME="${EPOCH_NODE2_REMOTE_HOME:-/home/zwx}"
+#export EPOCH_NODE2_BENCH_ROOT="${EPOCH_NODE2_BENCH_ROOT:-${EPOCH_NODE2_REMOTE_HOME}/2025-9}"
 
 export BUILD_JOBS=40
 export OPENGAUSS_SRC="${EPOCH_BENCH_ROOT}/openGauss-server"

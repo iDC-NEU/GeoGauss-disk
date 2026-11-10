@@ -5,18 +5,17 @@
   │
   ├─ 分配 commit epoch = physical epoch
   │     dbr 且慢节点上行已 latch 时 = max(physical, 分配下界)
-  ├─ 预留本物理周期事务槽（每周期最多 50 个）
+  ├─ 预留本物理周期事务槽（每周期 50 个）
   ├─ 把此时的 logical epoch 记成 read_frontier
   │     本事务只读 m_status ≤ 这个值的版本
   └─ executing++
         防止 worker 把还在执行的 epoch 当成空窗 seal
-        start_gate=off，这里不阻塞
   │
   ▼
 OCC 本地执行（写集留在 backend，不写 heap）
   │
   ├─ 读
-  │     └─ 先查 EpochTipStaging（键 = relid + root TID）
+  │     └─ 先查 EpochTipStaging（键 = relid + TID(pageid + offset)）
   │           ├─ 命中且未删除 → 用这份最新版本
   │           ├─ 命中且已删除 → 这行不存在
   │           └─ 未命中 → 回退 heap / 版本链，仍受 read_frontier 限制
@@ -36,7 +35,7 @@ PRE_COMMIT（有写集、对端已连通）
   ├─ 分配 CSN（本节点单调递增，源节点 id 不变）
   ├─ 序列化后放入 EpochTxnQueue
   ├─ 该 epoch 的 change_set +1、local_pack +1
-  ├─ 释放 executing 和 OCC 锁
+  ├─ 释放 executing 和 (todo OCC 锁)
   └─ backend 不再落 heap，交给后面的 apply
   │
   ▼

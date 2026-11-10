@@ -58,10 +58,11 @@ public:
                          long long arrival_at_nic_ms);
     std::vector<DnIncomingPacket> PopReadyIncomingPackets();
 
+    long long NowMs() const;
+
 private:
     bool IsHighPriority(const DnNetworkPacket &pkt) const;
     bool IsDroppable(const DnNetworkPacket &pkt) const;
-    long long NowMs() const;
     size_t PacketSize(const DnNetworkPacket &pkt) const;
 
     int m_nodeId;

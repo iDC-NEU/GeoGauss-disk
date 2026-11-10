@@ -183,8 +183,6 @@ void EpochDynNetInit(void)
         }
         uint64_t ep = static_cast<uint64_t>(epoch);
         uint64_t origin = static_cast<uint64_t>(origin_node_id);
-        uint64_t self = static_cast<uint64_t>(EpochGetNodeId());
-        E_NodeManager::UpdateStoreReceivedPackCounters(ep, origin, txn_count);
     });
 
     rt.SetDispatchSideEffectFn([](const DnIncomingPacket& in, const DnDispatchResult& dr) {
@@ -253,15 +251,18 @@ void EpochDynNetEnqueueIncoming(const std::string& payload, int from_node, size_
         pkt.from_node_id = from_node;
     }
 
-    long long now_ms = 0;
-    struct timeval tv;
-    if (gettimeofday(&tv, nullptr) == 0) {
-        now_ms = static_cast<long long>(tv.tv_sec) * 1000LL + tv.tv_usec / 1000;
-    }
+    long long now_ms = net->NowMs();
 
     int latency = g_epoch_dyn_net_rtt_ms / 2;
     if (from_node >= 0 && from_node < static_cast<int>(EpochGetTotalNodes())) {
         latency = g_epoch_dyn_net_rtt_ms;
+    }
+    {
+        static uint64_t dbg_rx = 0;
+        if ((++dbg_rx % 100) == 0) {
+            fprintf(stderr, "EPOCH_DBG dn_enq from=%d size=%zu kind=%d latency=%d\n",
+                    from_node, raw_bytes, static_cast<int>(pkt.kind), latency);
+        }
     }
     net->EnqueueIncoming(pkt, from_node, raw_bytes, now_ms + latency);
 }
@@ -290,6 +291,13 @@ bool EpochDynNetPublish(const std::string& payload)
     pkt.kind = DnMsgKind::WIRE_PAYLOAD;
     pkt.wire_payload = payload;
     pkt.from_node_id = static_cast<int32_t>(EpochGetNodeId());
+
+    {
+        static uint64_t dbg_pub = 0;
+        if ((++dbg_pub % 200) == 0) {
+            fprintf(stderr, "EPOCH_DBG dn_pub size=%zu\n", payload.size());
+        }
+    }
 
     /* target -1：广播。限速记在本节点上行，发出时走 PUB。 */
     net->SendMessage(pkt, -1, false);

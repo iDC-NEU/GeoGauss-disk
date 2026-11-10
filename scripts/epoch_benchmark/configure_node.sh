@@ -158,7 +158,10 @@ done
 #   single-node-baseline — epoch_total_nodes=1、无 peer_hosts，start_gate=on；仅 node1 压测对比用
 # 可选覆盖：EPOCH_PHYS_LOGICAL_GAP_LIMIT, EPOCH_PHYSICAL_TXNS_PER_EPOCH, EPOCH_SYNC_START_GATE
 # GeoGauss 模块开关（默认 off）：
-#   EPOCH_ENABLE_GEOGAUSS_OPT=on  — 同时打开 occ staging 和 dynamic-net
+#   EPOCH_ENABLE_GEOGAUSS_OPT=on  — 打开 dynamic-net（dbr/pa/het 的实验基础）
+#   EPOCH_ENABLE_OCC_STAGING=on   — 单独打开 occ staging（版本延迟写回），默认 off。
+#                                   Phase 1 的本地 tip staging 已由 g_epoch_local_tip_staging
+#                                   承担，二者不叠加；geogauss_opt 不再联动打开。
 EPOCH_PROFILE="${EPOCH_PROFILE:-benchmark}"
 if [ "${EPOCH_PROFILE}" = "stats-nogate" ]; then
     echo "WARN: EPOCH_PROFILE=stats-nogate 已改名为 wait" >&2
@@ -174,7 +177,7 @@ EPOCH_PHYS_LOGICAL_GAP_LIMIT="${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}"
 EPOCH_SYNC_START_GATE="${EPOCH_SYNC_START_GATE:-}"
 
 geogauss_opt_val="off"
-occ_staging_val="off"
+occ_staging_val="${EPOCH_ENABLE_OCC_STAGING:-off}"
 epoch_dyn_net_val="off"
 epoch_dyn_net_catchup_val="off"
 epoch_dyn_net_proxy_val="off"
@@ -183,7 +186,8 @@ epoch_dyn_net_slow_nodes_val="''"
 case "${EPOCH_ENABLE_GEOGAUSS_OPT}" in
     on|yes|1|true|TRUE)
         geogauss_opt_val="on"
-        occ_staging_val="on"
+        # occ_staging 不再随 geogauss_opt 联动（Phase 1 tip staging 已覆盖其职责），
+        # 需要时用 EPOCH_ENABLE_OCC_STAGING=on 单独开启。
         epoch_dyn_net_val="on"
         epoch_dyn_net_catchup_val="${EPOCH_DYN_NET_CATCHUP:-off}"
         epoch_dyn_net_proxy_val="${EPOCH_DYN_NET_PROXY:-off}"
@@ -442,7 +446,9 @@ set_conf epoch_sync_start_gate "${sync_start_gate_val}"
 set_conf epoch_merge_threads "${merge_threads_val}"
 set_conf epoch_commit_threads "${commit_threads_val}"
 set_conf epoch_tip_flush_threads "${tip_flush_threads_val}"
-set_conf epoch_pack_threads "5"
+# 发送必须串行：单打包线程 = 单消费者，收尾包一定排在队尾，
+# “取到收尾包时已发多少条”即声明条数，不产生任何并发分叉。
+set_conf epoch_pack_threads "1"
 set_conf epoch_txn_queue_capacity "8192"
 set_conf epoch_abort_csn_per_epoch "65536"
 set_conf epoch_crdt_slot_count "32"

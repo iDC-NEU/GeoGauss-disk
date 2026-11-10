@@ -1,154 +1,96 @@
 #include "postgres.h"
 
+#include "miscadmin.h"
+
 #include "epoch/e_pacer.h"
 
+#include "epoch/e_abort_csn.h"
 #include "epoch/e_config.h"
+#include "epoch/e_epoch_capacity.h"
 #include "epoch/e_crdt_merge_logic.h"
-#include "epoch/e_merge_pool.h"
 #include "epoch/e_net.h"
 #include "epoch/e_node_manager.h"
 #include "epoch/e_pipeline.h"
-#include "epoch/e_send_queue.h"
+#include "epoch/e_perf.h"
 #include "epoch/e_statistician.h"
 #include "epoch/e_txn_wire.h"
 
+#include "neu_concurrency_tools/concurrentqueue.h"
+
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <atomic>
-#include <ctime>
+#include <unordered_map>
 #include <map>
 #include <mutex>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
-static constexpr int EPOCH_PACER_PERSIST_TICKS = 5;
-static constexpr int64_t EPOCH_PACER_PERSIST_US = 5000;
-/* 测试还在提交时不把后移写集放回。提交停一段时间且缓冲已空，再按目的 epoch 发出。 */
-static constexpr int64_t EPOCH_PACER_IDLE_RELEASE_US = 5000000;
-static constexpr int EPOCH_PACER_MAX_MOVES = 4;
-static constexpr uint64_t EPOCH_PACER_MAX_DELTA = 64;
-/* 协助窗口要盖住接下来这一段 epoch，并在用完之前续上，避免退回对慢节点的广播。 */
-static constexpr uint64_t EPOCH_PACER_PA_WINDOW = 64;
-static constexpr uint64_t EPOCH_PACER_PA_REFRESH_LEAD = 16;
-static constexpr size_t EPOCH_PACER_MAX_MOVE_PER_TICK = 4096;
-
-struct EpochPacerPending {
-    std::string wire;
-    int moves = 0;
-};
-
-struct EpochPacerSession {
-    bool active = false;
-    uint32_t slow_id = 0;
-    uint32_t proxy_id = 0;
-    uint32_t session_id = 0;
-    uint64_t epoch_from = 0;
-    uint64_t epoch_to = 0;
-};
-
-static std::mutex g_pacer_mu;
-/* 刚扣住、计数仍在原 epoch 上。关窗前会改记走。 */
-static std::map<uint64_t, std::vector<EpochPacerPending>> g_pacer_pending;
-/* 已经改记到目的 epoch，计数在目的 epoch 上。轮到该 epoch 关窗时再决定发送或继续后移。 */
-static std::map<uint64_t, std::vector<EpochPacerPending>> g_pacer_scheduled;
-static int64_t g_pacer_kernel_since_us = 0;
-static std::atomic<bool> g_pacer_latched{false};
-static std::atomic<uint64_t> g_pacer_floor{0};
-static std::atomic<int64_t> g_pacer_last_new_us{0};
-
-static int64_t EpochPacerMonoUs(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<int64_t>(ts.tv_sec) * 1000000 + static_cast<int64_t>(ts.tv_nsec) / 1000;
-}
-
-static bool EpochPacerEpochSealed(uint64_t epoch)
-{
-    uint32_t self = EpochGetNodeId();
-    return E_NodeManager::GetSealedPackTxnCounters(epoch, self) > 0 ||
-           E_NodeManager::IsNodeSendCompleted(epoch, self);
-}
-
-static bool EpochPacerIdInSlowList(uint32_t node);
-static uint64_t EpochPacerComputeTarget(uint64_t base);
-
-static bool EpochPacerIsSlowSelf(void)
-{
-    return EpochPacerIdInSlowList(EpochGetNodeId());
-}
-
-static void EpochPacerNoteNewTxn(void)
-{
-    g_pacer_last_new_us.store(EpochPacerMonoUs(), std::memory_order_release);
-}
-
-/* 实验的 epoch 周期是 max(10ms, RTT)，不用写死的 10ms。 */
-static int EpochPacerEpochMs(void)
-{
-    int rtt = g_epoch_dyn_net_rtt_ms > 0 ? g_epoch_dyn_net_rtt_ms : 100;
-    return rtt < 10 ? 10 : rtt;
-}
-
 /*
- * 只有慢节点会 latch。连续 5ms unsent 偏高才置位。
- * 置位后，测试还在产生新事务时保持，避免一停发 unsent 掉下来就把积压倒回当前 epoch。
- * 新事务停了且缓冲已空，视为链路不再被测试灌满，交给关窗把目的 epoch 的写集发出去。
+ * ============================================================================
+ * Pacer：DBR（发送端拥塞丢弃）+ PA（慢节点下行代理转发）
+ * ============================================================================
+ *
+ * DBR 只做一件事，在发送线程里逐条判断：
+ *   非收尾包且在对应 peer 方向上拥塞  → 丢弃（不入 ZMQ）
+ *   收尾包                            → 必须发送
+ * 判据是本机上行是否已经跑满（EpochNetUplinkCongested：/proc/net/dev 采样
+ * 到的发送速率 >= 配置上行带宽的 90%）。不看 ZMQ 队列——加闸门后队列基本不满。
+ *
+ * 丢弃是安全的：对端的 declared 计数在收到 EOF 时冻结为"实际收到的条数"
+ * （见 e_recv_ledger.cpp: EpochRecvNoteEof），所以少发的写集不会被期待。
+ *
+ * PA 部分保留完整实现，供后续三副本下行受限的实验使用。
  */
-static bool EpochPacerCongestionLatched(void)
-{
-    if (!EpochPacerIsSlowSelf()) {
-        return false;
-    }
-    bool kernel = EpochNetUplinkCongested();
-    int64_t now = EpochPacerMonoUs();
-    if (kernel) {
-        if (g_pacer_kernel_since_us == 0) {
-            g_pacer_kernel_since_us = now;
-        }
-        if (now - g_pacer_kernel_since_us >= EPOCH_PACER_PERSIST_US) {
-            g_pacer_latched.store(true, std::memory_order_release);
-        }
-        return g_pacer_latched.load(std::memory_order_acquire);
-    }
-    g_pacer_kernel_since_us = 0;
-    if (!g_pacer_latched.load(std::memory_order_acquire)) {
-        return false;
-    }
-    int64_t last_new = g_pacer_last_new_us.load(std::memory_order_acquire);
-    if (last_new != 0 && now - last_new < EPOCH_PACER_IDLE_RELEASE_US) {
-        return true;
-    }
-    g_pacer_latched.store(false, std::memory_order_release);
-    g_pacer_floor.store(0, std::memory_order_release);
-    return false;
-}
 
-static std::mutex g_pacer_session_mu;
-static EpochPacerSession g_pacer_session;
-static uint32_t g_pacer_next_session = 1;
 static bool g_pacer_logged = false;
-static bool g_pacer_pa_short_logged = false;
-
-bool EpochPacerDbrEnabled(void)
-{
-    return g_enable_epoch_multimaster && EpochGetTotalNodes() > 1 && g_epoch_dyn_net_catchup;
-}
 
 bool EpochPacerPaEnabled(void)
 {
     return g_enable_epoch_multimaster && EpochGetTotalNodes() > 1 && g_epoch_dyn_net_proxy;
 }
 
-uint64_t EpochPacerAssignmentFloor(void)
+bool EpochPacerDbrEnabled(void)
 {
-    if (!g_pacer_latched.load(std::memory_order_acquire) || !EpochPacerIsSlowSelf()) {
-        return 0;
+    if (!g_enable_epoch_multimaster || EpochGetTotalNodes() <= 1 || !g_epoch_dyn_net_catchup) {
+        return false;
     }
-    /* 随 logical/peer 前滑，新事务落到当前目的 epoch，不再钉死在第一次算出的号上。 */
-    uint64_t target = EpochPacerComputeTarget(0);
-    g_pacer_floor.store(target, std::memory_order_release);
-    return target;
+    /*
+     * 只有慢节点才启用 DBR。
+     * 快节点的上行没有受限，本来就不会拥塞；若也允许丢弃，只会在瞬时抖动时
+     * 白白丢数据，还把"谁该丢"的语义搞乱。
+     */
+    return EpochPacerIsSlowSelf();
+}
+
+bool EpochPacerIsSlowSelf(void)
+{
+    const char* s = g_epoch_dyn_net_slow_nodes;
+    if (s == nullptr || s[0] == '\0') {
+        return false;
+    }
+    const uint32_t self = EpochGetNodeId();
+    int cur = 0;
+    bool in_num = false;
+    for (const char* p = s;; ++p) {
+        if (*p >= '0' && *p <= '9') {
+            cur = cur * 10 + (*p - '0');
+            in_num = true;
+            continue;
+        }
+        if (in_num && static_cast<uint32_t>(cur) == self) {
+            return true;
+        }
+        cur = 0;
+        in_num = false;
+        if (*p == '\0') {
+            break;
+        }
+    }
+    return false;
 }
 
 static bool EpochPacerIdInSlowList(uint32_t node)
@@ -177,672 +119,578 @@ static bool EpochPacerIdInSlowList(uint32_t node)
     return false;
 }
 
-static uint64_t EpochPacerMaxPeerEpoch(void)
+/*
+ * 最小 DBR 判据：现在能不能发。
+ *
+ * 判据是"本机上行是否已经跑满"（EpochNetUplinkCongested，网卡速率 >=
+ * 配置上行带宽的 90%），不再看 ZMQ 队列——加了快照闸门后 backend 被 apply
+ * 拖住，ZMQ 队列基本不会满，POLLOUT 永远可写，DBR 就成了死代码。
+ */
+bool EpochPacerShouldDefer(void)
 {
-    uint64_t peer_max = 0;
-    uint32_t self = EpochGetNodeId();
-    uint32_t total = EpochGetTotalNodes();
-    for (uint32_t peer = 0; peer < total; ++peer) {
-        if (peer == self) {
-            continue;
-        }
-        uint64_t sealed = EpochGetPeerMaxSealedEpoch(peer);
-        if (sealed > peer_max) {
-            peer_max = sealed;
-        }
+    if (!EpochPacerDbrEnabled()) {
+        return false;
     }
-    return peer_max;
+    return EpochNetUplinkCongested();
 }
 
-bool EpochPacerHoldLocal(const E_WireTxn& txn, const std::string& wire)
-{
-    if (!EpochPacerDbrEnabled() || !EpochPacerIsSlowSelf() || txn.epoch == 0 || wire.empty()) {
-        return false;
-    }
-    /* 已经关窗的 epoch 不能再改计数，写集照常发送。 */
-    if (EpochPacerEpochSealed(txn.epoch)) {
-        return false;
-    }
-    if (!g_pacer_latched.load(std::memory_order_acquire)) {
-        return false;
-    }
+/*
+ * 每条写集的统一决策表。
+ *
+ * 一笔写集在每个 peer 队列里各有一份，会分别被两条发送线程 pop 到。
+ * 若各自独立判断拥塞，就可能"一份发、一份丢"。这里用 CAS 保证：
+ *   第一条到达的线程做决定（并负责自环入队），其余线程读它的结论。
+ *
+ * 单元存放 (epoch << 8) | flag，flag: 1 = 发送，2 = 丢弃。
+ * 带上 epoch 就自动规避了环形复用（旧 epoch 的值不会被误读）。
+ */
+/*
+ * DBR 决策表：**每笔事务一条记录**，key = csn ^ (server_id << 48)（全局唯一）。
+ *
+ * 为什么不用 (epoch, index) 当键：
+ *   1) 各 peer 队列的下标不保证对齐（延后重投、环形复用都会让 head 错位）
+ *   2) 延后次数必须是"整笔"的：不能一个 peer 延后、另一个发送
+ * 所以把"结论"和"次数"放在同一条记录上，所有线程读同一份。
+ */
+static constexpr uint64_t EPOCH_DBR_DEFER_AHEAD = 4;
+static constexpr uint32_t EPOCH_DBR_MAX_DEFER = 3;
+static constexpr uint8_t EPOCH_DEC_UNDECIDED = 0;
+static constexpr uint8_t EPOCH_DEC_SEND = 1;
+static constexpr uint8_t EPOCH_DEC_DEFER = 2;
+static constexpr uint8_t EPOCH_DEC_FORCED = 3;   /* 延后次数用尽，强制发送 */
+static constexpr uint8_t EPOCH_DEC_DROP = 4;     /* 直接丢弃（drop 模式） */
 
-    EpochPacerNoteNewTxn();
-    EpochPacerPending item;
-    item.wire = wire;
-    item.moves = 0;
-    std::lock_guard<std::mutex> lock(g_pacer_mu);
-    g_pacer_pending[txn.epoch].push_back(std::move(item));
-    return true;
+/* 拥塞时是丢弃还是延后：由 epoch_dbr_mode 决定 */
+static bool EpochPacerDbrDropMode(void)
+{
+    const char* m = g_epoch_dbr_mode;
+    return (m != nullptr && m[0] == 'd');    /* "drop" */
 }
 
-bool EpochPacerParkLocal(uint64_t epoch, const std::string& wire)
+struct EpochPacerDecide {
+    uint8_t state{EPOCH_DEC_UNDECIDED};
+    uint8_t count{0};
+    uint64_t last_epoch{0};
+};
+
+static std::mutex g_decide_mu;
+static std::unordered_map<uint64_t, EpochPacerDecide> g_decide;
+
+static inline uint64_t EpochPacerDecideKey(uint64_t csn, uint32_t server_id)
 {
-    if (!EpochPacerDbrEnabled() || !EpochPacerIsSlowSelf() || !g_pacer_latched.load(std::memory_order_acquire) ||
-        epoch == 0 || wire.empty()) {
-        return false;
-    }
-    EpochPacerNoteNewTxn();
-    EpochPacerPending item;
-    item.wire = wire;
-    item.moves = 0;
-    std::lock_guard<std::mutex> lock(g_pacer_mu);
-    g_pacer_scheduled[epoch].push_back(std::move(item));
-    return true;
+    return csn ^ (static_cast<uint64_t>(server_id) << 48);
 }
 
-bool EpochPacerBlocksSeal(uint64_t epoch)
+/* 定期清理：已经很旧的决策记录直接删掉，避免无限增长 */
+void EpochPacerSweepDecisions(uint64_t up_to_epoch)
 {
-    if (!EpochPacerDbrEnabled() || epoch == 0) {
-        return false;
-    }
-    std::lock_guard<std::mutex> lock(g_pacer_mu);
-    auto pending = g_pacer_pending.find(epoch);
-    if (pending != g_pacer_pending.end() && !pending->second.empty()) {
-        return true;
-    }
-    auto scheduled = g_pacer_scheduled.find(epoch);
-    return scheduled != g_pacer_scheduled.end() && !scheduled->second.empty();
-}
-
-static void EpochPacerRepark(std::vector<std::pair<uint64_t, EpochPacerPending>>* leftover)
-{
-    if (leftover->empty()) {
+    if (up_to_epoch < 64) {
         return;
     }
-    std::lock_guard<std::mutex> lock(g_pacer_mu);
-    for (auto& slot : *leftover) {
-        g_pacer_scheduled[slot.first].push_back(std::move(slot.second));
+    const uint64_t floor = up_to_epoch - 64;
+    std::lock_guard<std::mutex> lk(g_decide_mu);
+    for (auto it = g_decide.begin(); it != g_decide.end();) {
+        if (it->second.last_epoch < floor) {
+            it = g_decide.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
-/* merge 只取 merge_epoch 那一行。更后面的 epoch 先留着，格子被写满会让 pack 线程退出。 */
-static void EpochPacerAdmitList(std::vector<std::pair<uint64_t, EpochPacerPending>>& batch)
+/* 目标片：当前片 + AHEAD，且至少比 physical 大 2（保证目标片还没封口） */
+uint64_t EpochPacerDeferTarget(uint64_t epoch)
 {
-    const uint64_t merge_epoch = EpochMergePoolGetMergeEpoch();
-    std::vector<std::pair<uint64_t, EpochPacerPending>> leftover;
-    for (auto& slot : batch) {
-        if (merge_epoch > 0 && slot.first > merge_epoch) {
-            leftover.push_back(std::move(slot));
-            continue;
-        }
-        E_WireTxn txn;
-        if (!E_WireDeserializeTxn(slot.second.wire.data(), slot.second.wire.size(), &txn)) {
-            continue;
-        }
-        if (!EpochPipelineAdmitLocalWire(txn, slot.second.wire)) {
-            leftover.push_back(std::move(slot));
-        }
-    }
-    EpochPacerRepark(&leftover);
-}
-
-static void EpochPacerTakeEpoch(
-    std::map<uint64_t, std::vector<EpochPacerPending>>* table,
-    uint64_t epoch,
-    std::vector<std::pair<uint64_t, EpochPacerPending>>* release)
-{
-    auto it = table->find(epoch);
-    if (it == table->end()) {
-        return;
-    }
-    for (auto& item : it->second) {
-        release->emplace_back(epoch, std::move(item));
-    }
-    table->erase(it);
-}
-
-static uint64_t EpochPacerComputeTarget(uint64_t base)
-{
-    int t_ms = EpochPacerEpochMs();
-    int rtt = g_epoch_dyn_net_rtt_ms > 0 ? g_epoch_dyn_net_rtt_ms : t_ms;
-    int rtt_epochs = (rtt + t_ms - 1) / t_ms;
-    if (rtt_epochs < 1) {
-        rtt_epochs = 1;
-    }
-    int k = g_epoch_dyn_net_catchup_k > 0 ? g_epoch_dyn_net_catchup_k : 0;
-    uint64_t anchor = base;
-    uint64_t logical = E_NodeManager::GetLogicalEpoch();
-    uint64_t physical = E_NodeManager::GetPhysicalEpoch();
-    uint64_t peer = EpochPacerMaxPeerEpoch();
-    if (logical > anchor) {
-        anchor = logical;
-    }
-    if (physical > anchor) {
-        anchor = physical;
-    }
-    if (peer > anchor) {
-        anchor = peer;
-    }
-    uint64_t target = anchor + static_cast<uint64_t>(rtt_epochs + k);
-    if (base > 0 && target < base + 1) {
-        target = base + 1;
-    }
-    if (base > 0 && target > base + EPOCH_PACER_MAX_DELTA) {
-        target = base + EPOCH_PACER_MAX_DELTA;
+    uint64_t target = epoch + EPOCH_DBR_DEFER_AHEAD;
+    const uint64_t phys = E_NodeManager::GetPhysicalEpoch();
+    if (target < phys + 2) {
+        target = phys + 2;
     }
     return target;
 }
 
-/* 整批改记到后面的 epoch。持续受限时不放回当前 epoch。 */
-static void EpochPacerShiftOffLocked(
-    uint64_t src,
-    std::vector<EpochPacerPending>* items)
+/* 兼容旧接口：目标片由内部计算，调用方不再需要 DeferDone */
+void EpochPacerDeferDone(uint64_t csn, uint32_t server_id)
 {
-    if (items->empty()) {
-        return;
-    }
-    uint32_t self = EpochGetNodeId();
-    uint64_t target = EpochPacerComputeTarget(src);
-    size_t moved = 0;
-    std::vector<EpochPacerPending> failed;
-    for (auto& item : *items) {
-        E_WireTxn txn;
-        if (!E_WireDeserializeTxn(item.wire.data(), item.wire.size(), &txn)) {
-            failed.push_back(std::move(item));
-            continue;
-        }
-        txn.epoch = target;
-        std::string rewritten;
-        if (!E_WireSerializeTxn(txn, &rewritten)) {
-            failed.push_back(std::move(item));
-            continue;
-        }
-        (void)E_NodeManager::DecLocalPackTxnCounters(src, self);
-        (void)E_NodeManager::DecChangeSetTxnCounters(src, self);
-        (void)E_NodeManager::IncLocalPackTxnCounters(target, self);
-        (void)E_NodeManager::IncChangeSetTxnCounters(target, self);
-        EpochPacerPending next;
-        next.wire = std::move(rewritten);
-        next.moves = item.moves + 1;
-        if (next.moves > EPOCH_PACER_MAX_MOVES) {
-            next.moves = 1;
-        }
-        g_pacer_scheduled[target].push_back(std::move(next));
-        moved++;
-    }
-    if (!failed.empty()) {
-        auto& slot = g_pacer_pending[src];
-        slot.insert(slot.end(), std::make_move_iterator(failed.begin()), std::make_move_iterator(failed.end()));
-    }
-    if (moved > 0) {
-        ereport(LOG,
-            (errmsg("epoch pacer DBR: moved %zu local write sets from epoch %lu to %lu",
-                moved,
-                src,
-                target)));
-    }
+    (void)csn;
+    (void)server_id;
 }
 
-/* 慢节点关窗：还在受限就把本 epoch 的本地写集全部改记走，然后发 EOF。 */
-static void EpochPacerDispatchEpochLocked(
-    uint64_t epoch,
-    bool congested,
-    std::vector<std::pair<uint64_t, EpochPacerPending>>* release)
+/*
+ * 自环入队的固定负责人（最小的对端 id）。
+ *
+ * 注意：这个"固定线程"只用来保证同片写入顺序，不代表它的速度可以慢——
+ * 因此自环最好由独立的 self 线程承担（见 e_pipeline 的 self drain）。
+ */
+uint32_t EpochPacerSelfLoopPeer(void)
 {
-    if (EpochPacerEpochSealed(epoch) || !congested) {
-        EpochPacerTakeEpoch(&g_pacer_pending, epoch, release);
-        EpochPacerTakeEpoch(&g_pacer_scheduled, epoch, release);
-        return;
+    const uint32_t self = EpochGetNodeId();
+    const uint32_t total = EpochGetTotalNodes();
+    for (uint32_t p = 0; p < total; ++p) {
+        if (p != self) {
+            return p;
+        }
     }
-    std::vector<EpochPacerPending> pending;
-    std::vector<EpochPacerPending> scheduled;
-    auto pit = g_pacer_pending.find(epoch);
-    if (pit != g_pacer_pending.end()) {
-        pending.swap(pit->second);
-        g_pacer_pending.erase(pit);
-    }
-    auto sit = g_pacer_scheduled.find(epoch);
-    if (sit != g_pacer_scheduled.end()) {
-        scheduled.swap(sit->second);
-        g_pacer_scheduled.erase(sit);
-    }
-    EpochPacerShiftOffLocked(epoch, &pending);
-    EpochPacerShiftOffLocked(epoch, &scheduled);
+    return UINT32_MAX;
 }
 
-void EpochPacerBeforeSeal(uint64_t epoch)
+/*
+ * 单笔事务的统一决策：返回 1 = 发送、0 = 延后。
+ *
+ * 所有 peer 线程 + self 线程读同一张表（key = csn ^ server），因此
+ * "这笔到底发不发"是整笔一致的；延后次数也是整笔共享的。
+ */
+int EpochPacerDecideItem(uint64_t epoch, uint64_t csn, uint32_t server_id, bool is_eof)
 {
-    if (!EpochPacerDbrEnabled() || epoch == 0 || !EpochPacerIsSlowSelf()) {
-        return;
+    if (is_eof) {
+        return 1;                       /* 收尾包永远发送 */
     }
-    bool congested = EpochPacerCongestionLatched();
-    std::vector<std::pair<uint64_t, EpochPacerPending>> release;
-    {
-        std::lock_guard<std::mutex> lock(g_pacer_mu);
-        EpochPacerDispatchEpochLocked(epoch, congested, &release);
+
+    const uint64_t key = EpochPacerDecideKey(csn, server_id);
+    std::lock_guard<std::mutex> lk(g_decide_mu);
+
+    auto it = g_decide.find(key);
+    if (it == g_decide.end()) {
+        const bool congested = EpochPacerShouldDefer();
+        EpochPacerDecide d;
+        d.count = 0;
+        d.last_epoch = epoch;
+        if (!congested) {
+            d.state = EPOCH_DEC_SEND;
+        } else if (EpochPacerDbrDropMode()) {
+            d.state = EPOCH_DEC_DROP;      /* 丢弃：整笔都不发、也不自环 */
+        } else {
+            d.state = EPOCH_DEC_DEFER;
+            d.count = 1;
+        }
+        g_decide.emplace(key, d);
+        return (d.state == EPOCH_DEC_DROP) ? 2 : (d.state == EPOCH_DEC_DEFER ? 0 : 1);
     }
-    EpochPacerAdmitList(release);
+
+    EpochPacerDecide& d = it->second;
+    d.last_epoch = epoch;
+
+    if (d.state == EPOCH_DEC_FORCED) {
+        return 1;                       /* 次数用尽：一律发送 */
+    }
+    if (d.state == EPOCH_DEC_DROP) {
+        return 2;                       /* 整笔丢弃（所有 peer 一致） */
+    }
+    if (d.state == EPOCH_DEC_DEFER) {
+        if (d.count < EPOCH_DBR_MAX_DEFER) {
+            ++d.count;
+            return 0;                   /* 再延后一次 */
+        }
+        d.state = EPOCH_DEC_FORCED;
+        return 1;
+    }
+    return 1;
 }
 
-static void EpochPacerPublishPaActivate(uint32_t self, uint32_t proxy, uint32_t session_id, uint64_t e_f,
-                                        uint64_t e_t)
+static std::atomic<uint64_t> g_pacer_dropped{0};
+
+/* merge 入队失败后的重试次数（背压指标，正常应为 0） */
+static std::atomic<uint64_t> g_merge_retry{0};
+
+void EpochPacerNoteMergeRetry(void)
 {
-    E_WireTxn msg;
-    msg.csn = EPOCH_WIRE_PA_ACTIVATE_CSN;
-    msg.epoch = e_f;
-    msg.server_id = self;
-    msg.route_wid = static_cast<uint16_t>(proxy);
-    msg.txn_state = EPOCH_TXN_EMPTY;
-    E_WireRow row;
-    row.expected_csn = e_t;
-    row.relid = session_id;
-    msg.rows.push_back(row);
-    std::string payload;
-    if (!E_WireSerializeTxn(msg, &payload)) {
-        return;
-    }
-    (void)EpochNetPublish(payload);
-    ereport(LOG,
-        (errmsg("epoch pacer PA: slow=%u proxy=%u session=%u range=[%lu,%lu]",
-            self,
-            proxy,
-            session_id,
-            e_f,
-            e_t)));
+    g_merge_retry.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t EpochPacerMergeRetryCount(void)
+{
+    return g_merge_retry.load(std::memory_order_relaxed);
+}
+
+void EpochPacerNoteDropped(void)
+{
+    g_pacer_dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t EpochPacerDroppedCount(void)
+{
+    return g_pacer_dropped.load(std::memory_order_relaxed);
 }
 
 void EpochPacerPackTick(void)
 {
-    if (!g_pacer_logged && (EpochPacerDbrEnabled() || EpochPacerPaEnabled())) {
-        g_pacer_logged = true;
-        ereport(LOG,
-            (errmsg("epoch pacer: DBR=%d PA=%d queue_tolerance=%d k=%d rtt_ms=%d",
-                EpochPacerDbrEnabled() ? 1 : 0,
-                EpochPacerPaEnabled() ? 1 : 0,
-                g_epoch_dyn_net_queue_tolerance,
-                g_epoch_dyn_net_catchup_k,
-                g_epoch_dyn_net_rtt_ms)));
+    if (EpochPacerPaEnabled() && EpochPacerIsSlowSelf()) {
+        EpochPacerPaSlowSideTick();      /* 慢节点：采样下行速率并广播状态 */
     }
+}
 
-    if (EpochPacerDbrEnabled()) {
-        /* 积压只在关窗时按预算放回。这里整表放行会把一个 epoch 撑到上千笔。 */
-        (void)EpochPacerCongestionLatched();
+/* 单调时钟（微秒），用于 PA 采样 */
+static int64_t EpochPacerMonoUs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000 + static_cast<int64_t>(ts.tv_nsec / 1000);
+}
+
+/* ============================================================================
+ * PA（最小版）：慢节点下行受限时的代理转发
+ *
+ *   慢节点：采样自己的"入向"速率，接近下行上限时把状态广播给 proxy
+ *   proxy ：收到状态后，对每个 send epoch 做一次决策
+ *             · 拥塞   → 本片不直接发给慢节点（改由 merge 之后统一转发）
+ *             · 不拥塞 → 正常直发
+ *   proxy merge：对"被跳过"的片，收集 CRDT 判定为赢家的事务，该片 merge
+ *            完成时一次性发给慢节点，并补一个 EOF。
+ * ==========================================================================*/
+
+/* proxy 侧：最近一次收到的慢节点下行拥塞状态 */
+static std::atomic<bool> g_pa_slow_congested{false};
+
+/*
+ * proxy 侧：每个 epoch 对慢节点的发送方式
+ *   0 = 未决定，1 = 直发（未拥塞），2 = 跳过（改由 merge 后转发）
+ * 高 8 位存 epoch，规避环形复用误读。
+ */
+static std::atomic<uint64_t> g_pa_epoch_mode[EPOCH_TXN_EPOCH_COUNT];
+
+/*
+ * proxy 侧：被跳过片的待转发写集（按 epoch 分格的并发队列，无锁）
+ *
+ * 只缓存原始 wire + 身份，不做"是不是赢家"的判定——
+ * 判定必须等到该片 merge 全部结束（abort 集合此时才完整）再做。
+ */
+struct EpochPacerPaPending {
+    uint64_t csn = 0;
+    uint32_t server_id = 0;
+    std::string wire;
+};
+
+static moodycamel::ConcurrentQueue<EpochPacerPaPending> g_pa_fwd[EPOCH_TXN_EPOCH_COUNT];
+static std::atomic<bool> g_pa_logged{false};
+
+constexpr uint8_t EPOCH_PA_DIRECT = 1;
+constexpr uint8_t EPOCH_PA_SKIP = 2;
+
+/* 慢节点 id（slow_nodes 名单里的第一个）；没有则 UINT32_MAX */
+static uint32_t EpochPacerPaSlowNodeId(void)
+{
+    const uint32_t total = EpochGetTotalNodes();
+    for (uint32_t p = 0; p < total; ++p) {
+        if (EpochPacerIdInSlowList(p)) {
+            return p;
+        }
     }
+    return UINT32_MAX;
+}
 
-    if (!EpochPacerPaEnabled()) {
+/* proxy id（第一台不在慢名单里的节点）；没有则 UINT32_MAX */
+uint32_t EpochPacerPaProxyNodeId(void)
+{
+    const uint32_t total = EpochGetTotalNodes();
+    for (uint32_t p = 0; p < total; ++p) {
+        if (!EpochPacerIdInSlowList(p)) {
+            return p;
+        }
+    }
+    return UINT32_MAX;
+}
+
+/* proxy 侧：收到慢节点广播的状态 */
+void EpochPacerPaNoteSlowState(bool congested)
+{
+    const bool old = g_pa_slow_congested.exchange(congested, std::memory_order_acq_rel);
+    if (old != congested) {
+        EPOCH_DBG_FPRINTF("EPOCH_DBG pa_slow_state congested=%d\n", congested ? 1 : 0);
+        fflush(stderr);
+    }
+}
+
+/* 慢节点侧：读入向累计字节（所有非 lo 网卡） */
+static uint64_t EpochPacerPaReadRxBytes(void)
+{
+    FILE* fp = fopen("/proc/net/dev", "r");
+    if (fp == nullptr) {
+        return 0;
+    }
+    char line[512];
+    uint64_t total = 0;
+    if (fgets(line, sizeof(line), fp) == nullptr || fgets(line, sizeof(line), fp) == nullptr) {
+        fclose(fp);
+        return 0;
+    }
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        char* colon = strchr(line, ':');
+        if (colon == nullptr) {
+            continue;
+        }
+        const char* name = line;
+        while (*name == ' ') {
+            ++name;
+        }
+        if (strncmp(name, "lo:", 3) == 0) {
+            continue;
+        }
+        unsigned long long rx_bytes = 0;
+        if (sscanf(colon + 1, "%llu", &rx_bytes) == 1) {
+            total += rx_bytes;
+        }
+    }
+    fclose(fp);
+    return total;
+}
+
+/* 慢节点侧：采样入向速率，状态翻转时单播给 proxy */
+void EpochPacerPaSlowSideTick(void)
+{
+    const double cap = g_epoch_dyn_net_download_bps;
+    if (cap <= 0) {
         return;
     }
-    uint32_t self = EpochGetNodeId();
-    if (!EpochPacerIdInSlowList(self)) {
+
+    static uint64_t last_rx = 0;
+    static int64_t last_us = 0;
+    static bool inited = false;
+    static bool last_sent = false;
+    static bool last_sent_valid = false;
+
+    const int64_t now = EpochPacerMonoUs();
+    const uint64_t rx = EpochPacerPaReadRxBytes();
+    if (!inited || last_us == 0 || rx < last_rx) {
+        inited = true;
+        last_us = now;
+        last_rx = rx;
+        return;
+    }
+    if (now - last_us < 100000) {          /* 100ms 采样窗口 */
+        return;
+    }
+    const double bps = static_cast<double>(rx - last_rx) * 8.0 /
+                       (static_cast<double>(now - last_us) / 1000000.0);
+    last_us = now;
+    last_rx = rx;
+
+    int pct = g_epoch_dbr_threshold_pct;
+    if (pct < 1) {
+        pct = 1;
+    } else if (pct > 100) {
+        pct = 100;
+    }
+    const bool congested = (bps >= cap * (static_cast<double>(pct) / 100.0));
+
+    if (last_sent_valid && last_sent == congested) {
+        return;                            /* 状态没变就不发 */
+    }
+    last_sent = congested;
+    last_sent_valid = true;
+
+    const uint32_t proxy = EpochPacerPaProxyNodeId();
+    if (proxy == UINT32_MAX || proxy == EpochGetNodeId()) {
+        return;
+    }
+
+    E_WireTxn ctl;
+    ctl.epoch = 1;                         /* 控制消息，接收端按 csn 识别 */
+    ctl.server_id = EpochGetNodeId();
+    ctl.txn_state = EPOCH_TXN_EMPTY;
+    ctl.csn = congested ? EPOCH_WIRE_PA_STATE_ON_CSN : EPOCH_WIRE_PA_STATE_OFF_CSN;
+    ctl.rows.clear();
+
+    std::string wire;
+    if (E_WireSerializeTxn(ctl, &wire)) {
+        /*
+     * 广播给所有对端：不只 proxy，其它快节点也要知道，
+     * 否则它们会继续直发给慢节点，造成重复投递。
+     */
+    (void)EpochNetPublish(wire);
+        if (!g_pa_logged.exchange(true)) {
+            ereport(LOG, (errmsg("epoch pacer: PA slow-side reports to node %u", proxy)));
+        }
+    }
+}
+
+static bool EpochPacerPaEpochSkipped(uint64_t epoch);
+
+/* 非代理节点：代理广播的每片决策（epoch<<8 | flag，0 表示未知） */
+static std::atomic<uint64_t> g_pa_peer_decision[EPOCH_TXN_EPOCH_COUNT];
+
+void EpochPacerPaNoteEpochDecision(uint64_t epoch, bool skip)
+{
+    if (epoch == 0) {
+        return;
+    }
+    const uint64_t v = (epoch << 8) | (skip ? EPOCH_PA_SKIP : EPOCH_PA_DIRECT);
+    g_pa_peer_decision[EpochSlotOf(epoch)].store(v, std::memory_order_release);
+}
+
+/* 代理决定完一片后，广播给其它快节点（每片一次） */
+static void EpochPacerPaBroadcastDecision(uint64_t epoch, bool skip)
+{
+    E_WireTxn ctl;
+    ctl.epoch = epoch;
+    ctl.server_id = EpochGetNodeId();
+    ctl.txn_state = EPOCH_TXN_EMPTY;
+    ctl.csn = skip ? EPOCH_WIRE_PA_EPOCH_SKIP_CSN : EPOCH_WIRE_PA_EPOCH_DIRECT_CSN;
+    ctl.rows.clear();
+
+    std::string wire;
+    if (E_WireSerializeTxn(ctl, &wire)) {
+        (void)EpochNetPublish(wire);
+    }
+}
+
+/* proxy 发送端：这一片要不要跳过慢节点（首次遇到该片时按当时状态定） */
+bool EpochPacerPaShouldSkipPeer(uint32_t peer, uint64_t epoch)
+{
+    if (!EpochPacerPaEnabled()) {
+        return false;
+    }
+    if (peer != EpochPacerPaSlowNodeId()) {
+        return false;
+    }
+
+    /* 代理：本地拍板，并广播给其它快节点 */
+    if (EpochGetNodeId() == EpochPacerPaProxyNodeId()) {
+        const bool skip = EpochPacerPaEpochSkipped(epoch);
+        static std::atomic<uint64_t> broadcast_done[EPOCH_TXN_EPOCH_COUNT];
+        std::atomic<uint64_t>& mark = broadcast_done[EpochSlotOf(epoch)];
+        uint64_t cur = mark.load(std::memory_order_acquire);
+        if ((cur >> 8) != epoch &&
+            mark.compare_exchange_strong(cur, (epoch << 8) | 1, std::memory_order_acq_rel)) {
+            EpochPacerPaBroadcastDecision(epoch, skip);
+        }
+        return skip;
+    }
+
+    /*
+     * 其它快节点：无条件等代理对这片给出决策。
+     * 代理在"第一次碰到该片"时就会广播，而代理的发送线程不依赖本节点，
+     * 所以这里一定会被唤醒；不设超时是为了保证结论完全一致
+     * （超时兜底会引入"一片之内两个节点结论不同"的窗口）。
+     */
+    std::atomic<uint64_t>& slot = g_pa_peer_decision[EpochSlotOf(epoch)];
+    for (;;) {
+        const uint64_t cur = slot.load(std::memory_order_acquire);
+        if ((cur >> 8) == epoch) {
+            return ((cur & 0xFF) == EPOCH_PA_SKIP);
+        }
+        CHECK_FOR_INTERRUPTS();
+        pg_usleep(200);
+    }
+}
+
+/*
+ * 该片是否"跳过慢节点"。
+ *
+ * 未决定时按当前拥塞状态就地决定（CAS），这样发送线程与 merge 线程
+ * 无论谁先到达，都会得到同一结论——否则 merge 若跑在 send 前面，
+ * 会误判为"没跳过"而不缓存赢家，慢节点就永远收不齐这一片。
+ */
+static bool EpochPacerPaEpochSkipped(uint64_t epoch)
+{
+    std::atomic<uint64_t>& slot = g_pa_epoch_mode[EpochSlotOf(epoch)];
+    uint64_t cur = slot.load(std::memory_order_acquire);
+    if ((cur >> 8) == epoch) {
+        return ((cur & 0xFF) == EPOCH_PA_SKIP);
+    }
+
+    const bool congested = g_pa_slow_congested.load(std::memory_order_relaxed);
+    const uint64_t want = (epoch << 8) | (congested ? EPOCH_PA_SKIP : EPOCH_PA_DIRECT);
+    if (slot.compare_exchange_strong(cur, want, std::memory_order_acq_rel)) {
+        return congested;
+    }
+    return ((cur >> 8) == epoch) && ((cur & 0xFF) == EPOCH_PA_SKIP);
+}
+
+/* proxy merge 侧：每合并完一笔，若是"被跳过片"的赢家就缓存 */
+void EpochPacerPaMaybeBufferMerged(const E_WireTxn& txn)
+{
+    if (!EpochPacerPaEnabled() || EpochGetNodeId() != EpochPacerPaProxyNodeId()) {
+        return;
+    }
+    if (txn.epoch == 0 || !EpochPacerPaEpochSkipped(txn.epoch)) {
+        return;
+    }
+    /* 收尾包不缓存：由 Resend 统一补 */
+    if (E_WireTxnIsEpochEnd(txn)) {
         return;
     }
 
     /*
-     * 下行受限时，慢节点收到的是所有健康副本的写集之和。
-     * 至少要有两个健康副本，proxy 才能把多路收成一路。两个节点时这一路本来就只有一个发送方。
+     * 慢节点自己的事务它本来就有（自环入队），再转发回去会变成重复投递：
+     * 第二份同 csn 同 server_id 在合并时必然判输，白白抬高 abort。
      */
-    uint32_t total = EpochGetTotalNodes();
-    uint32_t healthy = 0;
-    uint32_t proxy = total;
-    uint64_t best_epoch = 0;
-    bool have = false;
-    for (uint32_t peer = 0; peer < total; ++peer) {
-        if (peer == self || EpochPacerIdInSlowList(peer)) {
-            continue;
-        }
-        healthy++;
-        uint64_t sealed = EpochGetPeerMaxSealedEpoch(peer);
-        if (!have || sealed > best_epoch || (sealed == best_epoch && peer < proxy)) {
-            proxy = peer;
-            best_epoch = sealed;
-            have = true;
-        }
-    }
-    if (healthy < 2 || !have || proxy >= total) {
-        if (!g_pacer_pa_short_logged) {
-            g_pacer_pa_short_logged = true;
-            ereport(LOG,
-                (errmsg("epoch pacer PA: need 3 replicas so two healthy senders can share one proxy. "
-                        "total=%u healthy=%u, keep direct send",
-                    total,
-                    healthy)));
-        }
+    if (txn.server_id == EpochPacerPaSlowNodeId()) {
         return;
     }
 
-    uint64_t e_f = E_NodeManager::GetLogicalEpoch();
-    if (e_f == 0) {
-        e_f = E_NodeManager::GetPhysicalEpoch();
-    }
-    if (e_f == 0) {
+    EpochPacerPaPending item;
+    item.csn = txn.csn;
+    item.server_id = txn.server_id;
+    if (!E_WireSerializeTxn(txn, &item.wire)) {
         return;
     }
-    uint64_t want_to = e_f + EPOCH_PACER_PA_WINDOW - 1;
-
-    uint32_t session_id = 0;
-    uint32_t use_proxy = proxy;
-    uint64_t use_from = e_f;
-    uint64_t use_to = want_to;
-    {
-        std::lock_guard<std::mutex> lock(g_pacer_session_mu);
-        if (g_pacer_session.active && g_pacer_session.slow_id == self &&
-            g_pacer_session.epoch_to >= e_f + EPOCH_PACER_PA_REFRESH_LEAD) {
-            return;
-        }
-        if (g_pacer_session.active && g_pacer_session.slow_id == self) {
-            session_id = g_pacer_session.session_id;
-            use_proxy = g_pacer_session.proxy_id;
-            use_from = g_pacer_session.epoch_from;
-            g_pacer_session.epoch_to = want_to;
-            use_to = want_to;
-        } else {
-            session_id = g_pacer_next_session++;
-            g_pacer_session.active = true;
-            g_pacer_session.slow_id = self;
-            g_pacer_session.proxy_id = proxy;
-            g_pacer_session.session_id = session_id;
-            g_pacer_session.epoch_from = e_f;
-            g_pacer_session.epoch_to = want_to;
-            use_proxy = proxy;
-            use_from = e_f;
-            use_to = want_to;
-        }
-    }
-    EpochPacerPublishPaActivate(self, use_proxy, session_id, use_from, use_to);
+    g_pa_fwd[EpochSlotOf(txn.epoch)].enqueue(std::move(item));
 }
 
-struct EpochPacerPaItem {
-    E_WireTxn txn;
-    std::string wire;
-};
-
-struct EpochPacerPaCollect {
-    std::vector<EpochPacerPaItem> txns;
-    std::set<std::pair<uint32_t, uint64_t>> seen;
-    std::map<uint32_t, uint64_t> eof_count;
-    bool emitted = false;
-    size_t in_bytes = 0;
-};
-
-static std::mutex g_pa_collect_mu;
-static std::map<uint64_t, EpochPacerPaCollect> g_pa_collect;
-
-static bool EpochPacerPaRowKey(const E_WireRow& row, std::string* key)
+/* proxy merge 侧：该片 merge 完成时，把缓存的赢家 + EOF 一次性发给慢节点 */
+void EpochPacerPaResendEpoch(uint64_t epoch)
 {
-    if (key == nullptr || !E_WireRowHasPackedPk(row)) {
-        return false;
-    }
-    key->clear();
-    if (!row.relname.empty()) {
-        key->append(row.relname);
-    } else {
-        key->append(std::to_string(row.relid));
-    }
-    key->push_back('\0');
-    key->append(row.pk.data(), row.pk.size());
-    return true;
-}
-
-/* 健康写集按到达顺序做先写胜出。输家整笔不进入结果；后来获胜的行替换先到的行。 */
-static void EpochPacerPaEmitReduced(uint64_t epoch, uint32_t slow_id, std::vector<EpochPacerPaItem> items,
-    std::map<uint32_t, uint64_t> eof_count, size_t in_bytes)
-{
-    struct Winner {
-        uint64_t csn;
-        uint32_t server_id;
-        size_t txn_i;
-        size_t row_i;
-    };
-    std::map<std::string, Winner> winners;
-    bool unsafe = false;
-    for (size_t ti = 0; ti < items.size() && !unsafe; ++ti) {
-        const E_WireTxn& txn = items[ti].txn;
-        std::vector<size_t> writes;
-        for (size_t ri = 0; ri < txn.rows.size(); ++ri) {
-            if (txn.rows[ri].op_type == EPOCH_OP_READ) {
-                continue;
-            }
-            std::string key;
-            if (!EpochPacerPaRowKey(txn.rows[ri], &key)) {
-                unsafe = true;
-                break;
-            }
-            writes.push_back(ri);
-        }
-        if (unsafe) {
-            break;
-        }
-        bool accept = true;
-        for (size_t ri : writes) {
-            std::string key;
-            if (!EpochPacerPaRowKey(txn.rows[ri], &key)) {
-                unsafe = true;
-                accept = false;
-                break;
-            }
-            auto it = winners.find(key);
-            if (it != winners.end() &&
-                !EpochCrdtTxnWinsOver(txn.csn, txn.server_id, it->second.csn, it->second.server_id)) {
-                accept = false;
-                break;
-            }
-        }
-        if (unsafe || !accept) {
-            continue;
-        }
-        for (size_t ri : writes) {
-            std::string key;
-            if (!EpochPacerPaRowKey(txn.rows[ri], &key)) {
-                continue;
-            }
-            winners[key] = Winner{txn.csn, txn.server_id, ti, ri};
-        }
-    }
-
-    std::map<uint32_t, uint64_t> sent;
-    size_t out_bytes = 0;
-    size_t out_txns = 0;
-    if (unsafe) {
-        for (const auto& item : items) {
-            if (!EpochNetPublishTo(slow_id, item.wire)) {
-                continue;
-            }
-            out_bytes += item.wire.size();
-            out_txns++;
-        }
-        sent = eof_count;
-    } else {
-        std::map<size_t, std::vector<size_t>> live_rows;
-        for (const auto& kv : winners) {
-            live_rows[kv.second.txn_i].push_back(kv.second.row_i);
-        }
-        for (auto& kv : live_rows) {
-            const E_WireTxn& src = items[kv.first].txn;
-            E_WireTxn reduced = src;
-            reduced.rows.clear();
-            std::sort(kv.second.begin(), kv.second.end());
-            for (size_t ri : kv.second) {
-                if (ri < src.rows.size()) {
-                    reduced.rows.push_back(src.rows[ri]);
-                }
-            }
-            if (reduced.rows.empty()) {
-                continue;
-            }
-            std::string payload;
-            if (!E_WireSerializeTxn(reduced, &payload)) {
-                continue;
-            }
-            if (!EpochNetPublishTo(slow_id, payload)) {
-                continue;
-            }
-            sent[reduced.server_id]++;
-            out_bytes += payload.size();
-            out_txns++;
-        }
-    }
-
-    uint32_t total = EpochGetTotalNodes();
-    for (uint32_t peer = 0; peer < total; ++peer) {
-        if (peer == slow_id) {
-            continue;
-        }
-        E_WireTxn end;
-        end.csn = sent[peer];
-        end.epoch = epoch;
-        end.server_id = peer;
-        end.txn_state = EPOCH_TXN_EMPTY;
-        std::string payload;
-        if (!E_WireSerializeTxn(end, &payload)) {
-            continue;
-        }
-        (void)EpochNetPublishTo(slow_id, payload);
-        out_bytes += payload.size();
-    }
-    ereport(LOG,
-        (errmsg("epoch pacer PA: reduced epoch=%lu slow=%u bytes %zu -> %zu txns %zu -> %zu%s",
-            epoch,
-            slow_id,
-            in_bytes,
-            out_bytes,
-            items.size(),
-            out_txns,
-            unsafe ? " (pk missing, forwarded original)" : "")));
-}
-
-static void EpochPacerPaHoldSlowCopy(const E_WireTxn& txn, const std::string& wire, uint32_t slow_id)
-{
-    if (txn.epoch == 0 || wire.empty() || slow_id >= EpochGetTotalNodes()) {
+    if (!EpochPacerPaEnabled() || EpochGetNodeId() != EpochPacerPaProxyNodeId()) {
         return;
     }
-    std::vector<EpochPacerPaItem> ready;
-    std::map<uint32_t, uint64_t> eof_count;
-    size_t in_bytes = 0;
-    bool emit = false;
-    {
-        std::lock_guard<std::mutex> lock(g_pa_collect_mu);
-        if (g_pa_collect.size() > 32) {
-            for (auto it = g_pa_collect.begin(); it != g_pa_collect.end();) {
-                if (it->second.emitted && it->first + 2 < txn.epoch) {
-                    it = g_pa_collect.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        }
-        EpochPacerPaCollect& slot = g_pa_collect[txn.epoch];
-        if (slot.emitted) {
-            return;
-        }
-        if (E_WireTxnIsEpochEnd(txn)) {
-            slot.eof_count[txn.server_id] = txn.csn;
-        } else if (slot.seen.insert(std::make_pair(txn.server_id, txn.csn)).second) {
-            EpochPacerPaItem item;
-            item.txn = txn;
-            item.wire = wire;
-            slot.in_bytes += wire.size();
-            slot.txns.push_back(std::move(item));
-        }
-        uint32_t total = EpochGetTotalNodes();
-        bool all = true;
-        for (uint32_t peer = 0; peer < total; ++peer) {
-            if (peer == slow_id) {
-                continue;
-            }
-            if (slot.eof_count.find(peer) == slot.eof_count.end()) {
-                all = false;
-                break;
-            }
-        }
-        if (!all) {
-            return;
-        }
-        slot.emitted = true;
-        ready.swap(slot.txns);
-        eof_count.swap(slot.eof_count);
-        in_bytes = slot.in_bytes;
-        emit = true;
-    }
-    if (emit) {
-        EpochPacerPaEmitReduced(txn.epoch, slow_id, std::move(ready), std::move(eof_count), in_bytes);
-    }
-}
-
-bool EpochPacerRouteSend(const std::string& wire, const E_WireTxn& txn)
-{
-    if (!EpochPacerPaEnabled() || wire.empty() || txn.epoch == 0 || EpochGetTotalNodes() < 3) {
-        return false;
-    }
-    EpochPacerSession session;
-    {
-        std::lock_guard<std::mutex> lock(g_pacer_session_mu);
-        if (!g_pacer_session.active) {
-            return false;
-        }
-        session = g_pacer_session;
-    }
-    if (txn.epoch < session.epoch_from || txn.epoch > session.epoch_to) {
-        return false;
-    }
-    uint32_t self = EpochGetNodeId();
-    if (self == session.slow_id) {
-        return false;
+    if (!EpochPacerPaEpochSkipped(epoch)) {
+        return;
     }
 
-    uint32_t total = EpochGetTotalNodes();
-    bool ok = true;
-    for (uint32_t peer = 0; peer < total; ++peer) {
-        if (peer == self || peer == session.slow_id) {
+    const uint32_t slow = EpochPacerPaSlowNodeId();
+    if (slow == UINT32_MAX || slow == EpochGetNodeId()) {
+        return;
+    }
+
+    /*
+     * 到这一刻该片的 merge 已全部完成（merge 游标刚推进），
+     * abort 集合才完整，可以准确判断哪些事务真正输了。
+     */
+    std::vector<EpochPacerPaPending> items;
+    EpochPacerPaPending item;
+    auto& q = g_pa_fwd[EpochSlotOf(epoch)];
+    while (q.try_dequeue(item)) {
+        items.push_back(std::move(item));
+    }
+
+    uint32_t forwarded = 0;
+    uint32_t skipped = 0;
+    for (const EpochPacerPaPending& it : items) {
+        if (EpochAbortCsnContains(epoch, it.csn, it.server_id)) {
+            ++skipped;                     /* 判输：不转发 */
             continue;
         }
-        if (!EpochNetPublishTo(peer, wire)) {
-            ok = false;
-        }
-    }
-    if (self == session.proxy_id) {
-        EpochPacerPaHoldSlowCopy(txn, wire, session.slow_id);
-    }
-    (void)ok;
-    return true;
-}
-
-bool EpochPacerOnIncoming(const E_WireTxn& txn, const std::string& wire)
-{
-    if (E_WireTxnIsPaActivate(txn)) {
-        uint64_t e_t = txn.epoch;
-        uint32_t session_id = 0;
-        if (!txn.rows.empty()) {
-            if (txn.rows[0].expected_csn > e_t) {
-                e_t = txn.rows[0].expected_csn;
-            }
-            session_id = txn.rows[0].relid;
-        }
-        std::lock_guard<std::mutex> lock(g_pacer_session_mu);
-        if (!g_pacer_session.active || session_id > g_pacer_session.session_id) {
-            g_pacer_session.active = true;
-            g_pacer_session.slow_id = txn.server_id;
-            g_pacer_session.proxy_id = txn.route_wid;
-            g_pacer_session.session_id = session_id;
-            g_pacer_session.epoch_from = txn.epoch;
-            g_pacer_session.epoch_to = e_t;
-        } else if (session_id == g_pacer_session.session_id && e_t > g_pacer_session.epoch_to) {
-            g_pacer_session.epoch_to = e_t;
-        }
-        return true;
+        (void)EpochNetPublishTo(slow, it.wire);
+        ++forwarded;
     }
 
-    if (!EpochPacerPaEnabled() || wire.empty() || txn.epoch == 0) {
-        return false;
-    }
-    EpochPacerSession session;
-    {
-        std::lock_guard<std::mutex> lock(g_pacer_session_mu);
-        if (!g_pacer_session.active) {
-            return false;
+    /*
+     * 补 EOF：除了本端，还要替"被抑制的其它快节点"各补一个（server_id 用它们的 id）。
+     *
+     * 慢节点要求每个节点都有 EOF 才会推进 recv；被跳过的片上 node2 一条数据都没发，
+     * 它的 declared 自然是 0，所以由代理代发一个同身份的 EOF 即可。
+     * 顺序：先转发数据，再发这些 EOF（同一连接内有序）。
+     */
+    const uint32_t total = EpochGetTotalNodes();
+    std::string eof_payload;
+    for (uint32_t p = 0; p < total; ++p) {
+        if (p == slow) {
+            continue;
         }
-        session = g_pacer_session;
+        E_WireTxn eof_wire;
+        eof_wire.epoch = epoch;
+        eof_wire.server_id = p;                 /* 以被代发节点的身份 */
+        eof_wire.txn_state = EPOCH_TXN_EMPTY;
+        eof_wire.csn = 0;
+        eof_wire.rows.clear();
+
+        eof_payload.clear();
+        if (E_WireSerializeTxn(eof_wire, &eof_payload)) {
+            (void)EpochNetPublishTo(slow, eof_payload);
+        }
     }
-    uint32_t self = EpochGetNodeId();
-    if (self != session.proxy_id) {
-        return false;
-    }
-    if (txn.epoch < session.epoch_from || txn.epoch > session.epoch_to) {
-        return false;
-    }
-    if (txn.server_id == self || txn.server_id == session.slow_id) {
-        return false;
-    }
-    EpochPacerPaHoldSlowCopy(txn, wire, session.slow_id);
-    return false;
+
+    EPOCH_DBG_FPRINTF("EPOCH_DBG pa_resend epoch=%lu forwarded=%u skipped=%u to_node=%u\n",
+        static_cast<unsigned long>(epoch), forwarded, skipped, slow);
+    fflush(stderr);
 }

@@ -14,8 +14,9 @@ struct EpochAbortCsnEntry {
 extern Size EpochAbortCsnShmemSize(void);
 extern void EpochAbortCsnShmemInit(void);
 extern void EpochAbortCsnClear(uint64_t epochId);
-extern void EpochAbortCsnInsert(uint64_t epochId, uint64_t csn, uint32_t serverId);
+extern bool EpochAbortCsnInsert(uint64_t epochId, uint64_t csn, uint32_t serverId);
 extern bool EpochAbortCsnContains(uint64_t epochId, uint64_t csn, uint32_t serverId);
-extern void EpochAbortCsnRecordMergeOutcome(uint64_t epochId, const E_WireTxn& txn, const E_CrdtMergeOutcome& outcome);
+/* 该时间片被判输的事务数（一个 csn = 一个事务）；须在 EpochAbortCsnClear 之前取 */
+extern uint64_t EpochAbortCsnCount(uint64_t epochId);
 
 #endif /* OPENGAUSS_E_ABORT_CSN_H */

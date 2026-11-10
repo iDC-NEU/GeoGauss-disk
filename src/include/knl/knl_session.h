@@ -2795,6 +2795,11 @@ typedef struct knl_u_occ_context {
 //HCJ ADDBY
 typedef struct knl_u_epoch_context {
     uint64_t txn_epoch;
+    /*
+     * 事务起点（微秒，gettimeofday 口径），在 XACT START 分配 epoch 时打点。
+     * 用于 per-txn 提交延迟统计：事务开始 → 本节点 apply 写回完成。
+     */
+    uint64_t txn_start_us;
     bool epoch_assigned;
     bool deferred_commit;
     bool epoch_exec_counted;
@@ -2804,6 +2809,12 @@ typedef struct knl_u_epoch_context {
     /* nogate：BEGIN 时钉扎的读可见 logical 上界 */
     uint64_t read_frontier;
     bool read_frontier_pinned;
+    /*
+     * 本会话上一次被分配的时间片。
+     * 下次分配拿到更大的时间片时，说明两者之间的每个时间片里都不会再有本会话的事务，
+     * 据此给它们各记一次“本终端已离开”。
+     */
+    uint64_t last_assigned_epoch;
 } knl_u_epoch_context;
 
 #ifdef USE_SPQ

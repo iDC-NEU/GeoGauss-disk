@@ -227,10 +227,7 @@ Size ComputeTotalSizeOfShmem()
         if (g_enable_epoch_multimaster) {
             size = add_size(size, EpochShmemSize());
             size = add_size(size, EpochTxnQueueShmemSize(EpochGetTxnQueueCapacity()));
-            size = add_size(size, EpochApplyQueueShmemSize());
             size = add_size(size, EpochCrdtShmemSize());
-            size = add_size(size, EpochMergeQueueShmemSize());
-            size = add_size(size, EpochMergeRetractShmemSize());
             size = add_size(size, EpochAbortCsnShmemSize());
             size = add_size(size, EpochTipStagingShmemSize());
             size = add_size(size, EpochPkStagingShmemSize());
@@ -445,10 +442,7 @@ void CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
         if (g_enable_epoch_multimaster) {
             EpochShmemInit();
             EpochTxnQueueShmemInit(EpochGetTxnQueueCapacity());
-            EpochApplyQueueShmemInit();
             EpochCrdtShmemInit();
-            EpochMergeQueueShmemInit();
-            EpochMergeRetractShmemInit();
             EpochAbortCsnShmemInit();
             EpochTipStagingShmemInit();
             EpochPkStagingShmemInit();

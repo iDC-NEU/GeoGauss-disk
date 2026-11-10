@@ -199,7 +199,7 @@ typedef struct knl_g_pid_context {
     ThreadId EpochWorkerPID;
     ThreadId EpochApplyWorkerPIDs[EPOCH_MAX_APPLY_WORKERS];
     ThreadId EpochMergeWorkerPIDs[EPOCH_MAX_MERGE_WORKERS];
-    ThreadId EpochPackWorkerPIDs[EPOCH_MAX_PACK_WORKERS];
+    ThreadId EpochPackWorkerPIDs[EPOCH_MAX_SEND_WORKERS];
     ThreadId EpochSendWorkerPID;
     ThreadId EpochTipFlushWorkerPIDs[EPOCH_MAX_TIP_FLUSH_WORKERS];
     ThreadId AioCompleterStarted;
