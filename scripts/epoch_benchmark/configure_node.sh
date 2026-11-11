@@ -48,7 +48,7 @@ if ! epoch_is_local_node "${NODE_ID}"; then
         export EPOCH_DYN_NET_BW_MBPS=${EPOCH_DYN_NET_BW_MBPS:-}; \
         export EPOCH_DYN_NET_CATCHUP_K=${EPOCH_DYN_NET_CATCHUP_K:-}; \
         export EPOCH_TPCC_DB=${EPOCH_TPCC_DB:-tpcc300}; \
-        export EPOCH_ENABLE_GEOGAUSS_OPT=${EPOCH_ENABLE_GEOGAUSS_OPT:-off}; \
+
         export EPOCH_PHYS_LOGICAL_GAP_LIMIT=${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}; \
         export EPOCH_PHYSICAL_TXNS_PER_EPOCH=${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}; \
         export EPOCH_SYNC_START_GATE=${EPOCH_SYNC_START_GATE:-}; \
@@ -143,6 +143,8 @@ for stale in \
     epoch_shard_warehouse_lo \
     epoch_shard_warehouse_hi \
     epoch_dbr_mode \
+    enable_epoch_dyn_net \
+    epoch_dyn_net_bw_mode \
     default_storage_nodegroup \
     expected_computing_nodegroup; do
     remove_stale_conf "${stale}"
@@ -158,11 +160,8 @@ done
 #   四个 profile 的慢节点、RTT、带宽由 apply_netem.sh 用 tc 施加（ping 可见）
 #   single-node-baseline — epoch_total_nodes=1、无 peer_hosts，start_gate=on；仅 node1 压测对比用
 # 可选覆盖：EPOCH_PHYS_LOGICAL_GAP_LIMIT, EPOCH_PHYSICAL_TXNS_PER_EPOCH, EPOCH_SYNC_START_GATE
-# GeoGauss 模块开关（默认 off）：
-#   EPOCH_ENABLE_GEOGAUSS_OPT=on  — 打开 dynamic-net（独立的异构网络路径，默认 off，与 Pacer 无关）
+# 模块开关（默认 off）：
 #   EPOCH_ENABLE_OCC_STAGING=on   — 单独打开 occ staging（版本延迟写回），默认 off。
-#                                   Phase 1 的本地 tip staging 已由 g_epoch_local_tip_staging
-#                                   承担，二者不叠加；geogauss_opt 不再联动打开。
 EPOCH_PROFILE="${EPOCH_PROFILE:-benchmark}"
 if [ "${EPOCH_PROFILE}" = "stats-nogate" ]; then
     echo "WARN: EPOCH_PROFILE=stats-nogate 已改名为 wait" >&2
@@ -172,44 +171,19 @@ if [ "${EPOCH_PROFILE}" = "single-node-baseline" ] && [ "${NODE_ID}" != "1" ]; t
     echo "ERROR: EPOCH_PROFILE=single-node-baseline 仅适用于 node1（NODE_ID=1）" >&2
     exit 1
 fi
-EPOCH_ENABLE_GEOGAUSS_OPT="${EPOCH_ENABLE_GEOGAUSS_OPT:-off}"
 EPOCH_PHYSICAL_TXNS_PER_EPOCH="${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}"
 EPOCH_PHYS_LOGICAL_GAP_LIMIT="${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}"
 EPOCH_SYNC_START_GATE="${EPOCH_SYNC_START_GATE:-}"
 
-geogauss_opt_val="off"
 occ_staging_val="${EPOCH_ENABLE_OCC_STAGING:-off}"
-epoch_dyn_net_val="off"
 epoch_dyn_net_catchup_val="off"
 epoch_dyn_net_proxy_val="off"
 epoch_dyn_net_slow_nodes_val="''"
-
-case "${EPOCH_ENABLE_GEOGAUSS_OPT}" in
-    on|yes|1|true|TRUE)
-        geogauss_opt_val="on"
-        # occ_staging 不再随 geogauss_opt 联动（Phase 1 tip staging 已覆盖其职责），
-        # 需要时用 EPOCH_ENABLE_OCC_STAGING=on 单独开启。
-        epoch_dyn_net_val="on"
-        epoch_dyn_net_catchup_val="${EPOCH_DYN_NET_CATCHUP:-off}"
-        epoch_dyn_net_proxy_val="${EPOCH_DYN_NET_PROXY:-off}"
-        if [ -n "${EPOCH_DYN_NET_SLOW_NODES:-}" ]; then
-            epoch_dyn_net_slow_nodes_val="'${EPOCH_DYN_NET_SLOW_NODES}'"
-        else
-            epoch_dyn_net_slow_nodes_val="''"
-        fi
-        ;;
-    off|no|0|false|FALSE|"")
-        ;;
-    *)
-        echo "WARN: unknown EPOCH_ENABLE_GEOGAUSS_OPT=${EPOCH_ENABLE_GEOGAUSS_OPT}, using off" >&2
-        ;;
-esac
 if [ -n "${EPOCH_DYN_NET_SLOW_NODES:-}" ]; then
     epoch_dyn_net_slow_nodes_val="'${EPOCH_DYN_NET_SLOW_NODES}'"
 fi
 
 set_conf enable_occ_staging "${occ_staging_val}"
-set_conf enable_epoch_dyn_net "${epoch_dyn_net_val}"
 set_conf epoch_dyn_net_catchup "${epoch_dyn_net_catchup_val}"
 set_conf epoch_dyn_net_proxy "${epoch_dyn_net_proxy_val}"
 if [ "${epoch_dyn_net_slow_nodes_val}" = "''" ]; then
@@ -488,7 +462,7 @@ verify_conf() {
     fi
 }
 
-echo "configured ${DATA_DIR} ($(epoch_node_display_name "${NODE_ID}") id=${NODE_ID}, ip ${NODE_IP}, port ${EPOCH_DB_PORT}, profile=${EPOCH_PROFILE}, geogauss=${geogauss_opt_val})"
+echo "configured ${DATA_DIR} ($(epoch_node_display_name "${NODE_ID}") id=${NODE_ID}, ip ${NODE_IP}, port ${EPOCH_DB_PORT}, profile=${EPOCH_PROFILE})"
 echo "edited: ${CONF}"
 verify_conf epoch_sync_start_gate "${sync_start_gate_val}"
 verify_conf epoch_phys_logical_gap_limit "${gap_limit_val}"
@@ -500,12 +474,11 @@ if [ -n "${epoch_total_nodes_val}" ]; then
     verify_conf epoch_total_nodes "${epoch_total_nodes_val}"
 fi
 verify_conf enable_occ_staging "${occ_staging_val}"
-verify_conf enable_epoch_dyn_net "${epoch_dyn_net_val}"
 verify_conf synchronous_commit "${synchronous_commit_val}"
 verify_conf default_transaction_isolation "repeatable read"
 echo "verified: sync_start_gate=${sync_start_gate_val}, gap=${gap_limit_val}, physical_txns_per_epoch=${physical_txns_per_epoch_val}, commit_threads=${commit_threads_val}, merge_threads=${merge_threads_val}, tip_flush_threads=${tip_flush_threads_val}"
 echo "verified: synchronous_commit=${synchronous_commit_val}, default_transaction_isolation=repeatable read"
-echo "verified: enable_occ_staging=${occ_staging_val}, enable_epoch_dyn_net=${epoch_dyn_net_val}, geogauss=${geogauss_opt_val}"
+echo "verified: enable_occ_staging=${occ_staging_val}"
 echo "epoch: profile=${EPOCH_PROFILE}, sync_start_gate=${sync_start_gate_val}, gap=${gap_limit_val}"
 case "${EPOCH_PROFILE}" in
     benchmark)

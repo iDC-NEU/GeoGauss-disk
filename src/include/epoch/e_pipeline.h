@@ -86,7 +86,6 @@ extern bool EpochPipelineIsMergePhaseComplete(uint64_t epoch);
 extern void EpochPipelineReadStageFlagsForDiag(uint64_t epoch, bool* physical_ready, bool* local_commit_ready,
     bool* self_send_sent, bool* merge_complete, bool* apply_complete);
 
-extern void EpochPipelineInjectRemoteWireTxn(const E_WireTxn& txn);
 /* DBR 放行：本地 merge + 发送队列。wire 里的 epoch 已是最终提交 epoch。 */
 /* 返回 false 表示 merge 环这格已满，调用方保留写集下个 tick 再试。 */
 extern bool EpochPipelineAdmitLocalWire(const E_WireTxn& txn, const std::string& wire);

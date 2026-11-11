@@ -66,7 +66,6 @@ int g_epoch_data_port_base = 25600;
 char* g_epoch_apply_database = NULL;
 char* g_epoch_apply_user = NULL;
 
-bool g_enable_epoch_dyn_net = false;
 bool g_epoch_dyn_net_catchup = false;
 bool g_epoch_dyn_net_proxy = false;
 int g_epoch_dyn_net_lag_tolerance = 5;
@@ -79,7 +78,6 @@ int g_epoch_dbr_admit_per_epoch = 8;
 char* g_epoch_dyn_net_slow_nodes = NULL;
 double g_epoch_dyn_net_upload_bps = 0;
 double g_epoch_dyn_net_download_bps = 0;
-int g_epoch_dyn_net_bw_mode = EPOCH_DYN_NET_BW_UNLIMIT;
 
 static bool EpochCheckMultimaster(bool* newval, void** extra, GucSource source)
 {
@@ -96,14 +94,6 @@ static void EpochAssignMultimaster(bool newval, void* extra)
         g_enable_occ_disk = true;
     }
 }
-
-static const struct config_enum_entry epoch_dyn_net_bw_mode_options[] = {
-    {"unlimit", EPOCH_DYN_NET_BW_UNLIMIT, false},
-    {"uplimit", EPOCH_DYN_NET_BW_UP, false},
-    {"downlimit", EPOCH_DYN_NET_BW_DOWN, false},
-    {"bilimit", EPOCH_DYN_NET_BW_BI, false},
-    {NULL, 0, false}
-};
 
 uint32_t EpochGetCacheSlots(void)
 {
@@ -565,17 +555,6 @@ void EpochRegisterGucs(void)
                                NULL,
                                NULL);
 
-    DefineCustomBoolVariable("enable_epoch_dyn_net",
-                             "Enable heterogeneous network shaping (dynamic-net) on epoch wire plane.",
-                             NULL,
-                             &g_enable_epoch_dyn_net,
-                             false,
-                             PGC_POSTMASTER,
-                             GUC_NO_RESET_ALL,
-                             NULL,
-                             NULL,
-                             NULL);
-
     DefineCustomBoolVariable("epoch_dyn_net_catchup",
                              "Enable Pacer DBR: move unsent local write sets forward and close skipped epochs with EOF.",
                              NULL,
@@ -709,16 +688,4 @@ void EpochRegisterGucs(void)
                                NULL,
                                NULL,
                                NULL);
-
-    DefineCustomEnumVariable("epoch_dyn_net_bw_mode",
-                             "Bandwidth limit mode for slow nodes.",
-                             NULL,
-                             &g_epoch_dyn_net_bw_mode,
-                             EPOCH_DYN_NET_BW_UNLIMIT,
-                             epoch_dyn_net_bw_mode_options,
-                             PGC_POSTMASTER,
-                             GUC_NO_RESET_ALL,
-                             NULL,
-                             NULL,
-                             NULL);
 }

@@ -46,7 +46,6 @@ add_subdirectory(occ)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/occ DESTINATION include/postgresql/server)
 add_subdirectory(epoch)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/epoch DESTINATION include/postgresql/server)
-add_subdirectory(dynamic-net)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/neu_concurrency_tools DESTINATION include/postgresql/server)
 
 add_subdirectory(gausskernel)

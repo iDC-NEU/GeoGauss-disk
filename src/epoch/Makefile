@@ -3,13 +3,10 @@ subdir = src/epoch
 top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 
-EPOCH_DN_CPPFLAGS = -I$(top_srcdir)/src/dynamic-net
-EPOCH_DN_SRCS = e_dyn_net.cpp e_dyn_net_bridge.cpp e_wire_envelope.cpp
-
 OBJS = $(patsubst %.cpp,%.o,$(wildcard *.cpp))
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(EPOCH_DN_CPPFLAGS) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) -c -o $@ $<
 
 all: $(OBJS) SUBSYS.o objfiles.txt
 

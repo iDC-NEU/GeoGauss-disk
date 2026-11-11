@@ -13,7 +13,6 @@
 #include "epoch/e_txn_wire.h"
 #include "epoch/e_epoch_capacity.h"
 #include "miscadmin.h"
-#include "epoch/e_dyn_net.h"
 #include "epoch/e_perf.h"
 
 #include <atomic>
@@ -189,11 +188,6 @@ static void EpochListenLoop(void)
 
         hb_msgs++;
         hb_bytes += msg.size();
-
-        if (EpochDynNetIsEnabled()) {
-            EpochDynNetEnqueueIncoming(payload, from_node, payload.size());
-            continue;
-        }
 
         /* 按 epoch 分格：解析一次只为拿到 epoch 字段 */
         E_WireTxn probe;
@@ -399,7 +393,6 @@ bool EpochNetInit(void)
         g_net_running.store(true, std::memory_order_release);
         EpochMarkPeerConnected(EpochGetNodeId());
         g_listen_thread = std::thread(EpochListenLoop);
-        EpochDynNetInit();
         /* 等对端的 PULL 建立完成再发 hello */
         pg_usleep(500000L);
         EpochNetPublishHello();
@@ -419,7 +412,6 @@ void EpochNetShutdown(void)
     if (!g_net_running.exchange(false)) {
         return;
     }
-    EpochDynNetShutdown();
 #ifdef EPOCH_USE_ZMQ
     if (g_listen_thread.joinable()) {
         g_listen_thread.join();

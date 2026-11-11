@@ -174,7 +174,6 @@ list(APPEND gaussdb_objects
 #HCJ ADDBY
     $<TARGET_OBJECTS:gausskernel_storage_access_occ>
     $<TARGET_OBJECTS:gausskernel_storage_access_epoch>
-    $<TARGET_OBJECTS:gausskernel_storage_access_dynamic_net>
     $<TARGET_OBJECTS:gausskernel_storage_access_index>
     $<TARGET_OBJECTS:gausskernel_storage_access_nbtree>
     $<TARGET_OBJECTS:gausskernel_storage_access_psort>

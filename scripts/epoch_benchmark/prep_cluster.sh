@@ -84,7 +84,7 @@ remote_params() {
         return 0
     fi
     ssh -o BatchMode=yes "${target}" \
-        "NODE_ID='${tnid}' EFF_NODES='${EFF_NODES}' EFF_HOSTS='${EFF_HOSTS}' DN_ENABLE='${DN_ENABLE}' DN_CATCHUP='${DN_CATCHUP}' DN_PROXY='${DN_PROXY}' DN_SLOW='${DN_SLOW}' DN_RTT='${DN_RTT}' DN_UPBPS='${DN_UPBPS}' DN_DOWNBPS='${DN_DOWNBPS}' DN_DBR_PCT='${DN_DBR_PCT}' DN_DBR_MODE='${DN_DBR_MODE}' bash -s -- '${ddir}'" <<'EOS'
+        "NODE_ID='${tnid}' EFF_NODES='${EFF_NODES}' EFF_HOSTS='${EFF_HOSTS}' DN_CATCHUP='${DN_CATCHUP}' DN_PROXY='${DN_PROXY}' DN_SLOW='${DN_SLOW}' DN_RTT='${DN_RTT}' DN_UPBPS='${DN_UPBPS}' DN_DOWNBPS='${DN_DOWNBPS}' DN_DBR_PCT='${DN_DBR_PCT}' bash -s -- '${ddir}'" <<'EOS'
 D=$1
 sed -i -E \
  -e "s/^#?listen_addresses *=.*/listen_addresses = '*'/" \
@@ -95,7 +95,6 @@ sed -i -E \
  -e "s/^epoch_node_id *=.*/epoch_node_id = ${NODE_ID}/" \
  -e "s/^epoch_total_nodes *=.*/epoch_total_nodes = ${EFF_NODES}/" \
  -e "s/^epoch_peer_hosts *=.*/epoch_peer_hosts = '${EFF_HOSTS}'/" \
- -e "s/^enable_epoch_dyn_net *=.*/enable_epoch_dyn_net = ${DN_ENABLE}/" \
  -e "s/^epoch_dyn_net_catchup *=.*/epoch_dyn_net_catchup = ${DN_CATCHUP}/" \
  -e "s/^epoch_dyn_net_proxy *=.*/epoch_dyn_net_proxy = ${DN_PROXY}/" \
  -e "s/^epoch_dyn_net_slow_nodes *=.*/epoch_dyn_net_slow_nodes = '${DN_SLOW}'/" \
@@ -123,8 +122,6 @@ EOS
 
 apply_params() {
     log "apply params"
-    # 正式实验一律关闭应用层虚拟网络（Dn），限速/延迟全部由 tc（tbf+netem）真实提供
-    local DN_ENABLE="off"
     local DN_CATCHUP="${EPOCH_DYN_NET_CATCHUP:-off}"
     local DN_PROXY="${EPOCH_DYN_NET_PROXY:-off}"
     local DN_SLOW="${EPOCH_DYN_NET_SLOW_NODES:-}"
@@ -141,7 +138,6 @@ apply_params() {
         -e "s/^epoch_node_id *=.*/epoch_node_id = $(node_index_of_ip "${EPOCH_NODE1_IP}")/"
         -e "s/^epoch_total_nodes *=.*/epoch_total_nodes = ${EFF_NODES}/"
         -e "s/^epoch_peer_hosts *=.*/epoch_peer_hosts = '${EFF_HOSTS}'/"
-        -e "s/^enable_epoch_dyn_net *=.*/enable_epoch_dyn_net = ${DN_ENABLE}/"
         -e "s/^epoch_dyn_net_catchup *=.*/epoch_dyn_net_catchup = ${DN_CATCHUP}/"
         -e "s/^epoch_dyn_net_proxy *=.*/epoch_dyn_net_proxy = ${DN_PROXY}/"
         -e "s/^epoch_dyn_net_slow_nodes *=.*/epoch_dyn_net_slow_nodes = '${DN_SLOW}'/"
@@ -156,7 +152,7 @@ apply_params() {
     )
     sed -i -E "${sedexpr[@]}" "${D1}/postgresql.conf"
     # 旧版脚本写入、当前代码未注册的 GUC：残留会让实例起不来
-    sed -i '/^[[:space:]]*epoch_dbr_mode[[:space:]]*=/d' "${D1}/postgresql.conf"
+    sed -i -e '/^[[:space:]]*epoch_dbr_mode[[:space:]]*=/d' -e '/^[[:space:]]*enable_epoch_dyn_net[[:space:]]*=/d' -e '/^[[:space:]]*epoch_dyn_net_bw_mode[[:space:]]*=/d' "${D1}/postgresql.conf"
     # 新参数：旧 conf 里没有这一行，sed 不会创建它
     grep -q '^epoch_dyn_net_upload_bps' "${D1}/postgresql.conf" || echo "epoch_dyn_net_upload_bps = ${DN_UPBPS}" >> "${D1}/postgresql.conf"
     grep -q '^epoch_dyn_net_download_bps' "${D1}/postgresql.conf" || echo "epoch_dyn_net_download_bps = ${DN_DOWNBPS}" >> "${D1}/postgresql.conf"

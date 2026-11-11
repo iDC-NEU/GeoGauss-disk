@@ -58,8 +58,7 @@ extern int g_epoch_data_port_base;
 extern char* g_epoch_apply_database;
 extern char* g_epoch_apply_user;
 
-/* heterogeneous network (dynamic-net) */
-extern bool g_enable_epoch_dyn_net;
+/* Pacer */
 extern bool g_epoch_dyn_net_catchup;
 extern bool g_epoch_dyn_net_proxy;
 extern int g_epoch_dyn_net_lag_tolerance;
@@ -75,14 +74,6 @@ extern int g_epoch_dbr_admit_per_epoch;
 extern char* g_epoch_dyn_net_slow_nodes;
 extern double g_epoch_dyn_net_upload_bps;
 extern double g_epoch_dyn_net_download_bps;
-
-enum EpochDynNetBwMode {
-    EPOCH_DYN_NET_BW_UNLIMIT = 0,
-    EPOCH_DYN_NET_BW_UP = 1,
-    EPOCH_DYN_NET_BW_DOWN = 2,
-    EPOCH_DYN_NET_BW_BI = 3
-};
-extern int g_epoch_dyn_net_bw_mode;
 
 extern void EpochConfigInit(void);
 extern uint32_t EpochGetCacheSlots(void);

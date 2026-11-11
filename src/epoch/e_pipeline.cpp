@@ -5,7 +5,6 @@
 #include "epoch/e_pipeline.h"
 #include "epoch/e_epoch_lifecycle.h"
 #include "epoch/e_log_path.h"
-#include "epoch/e_dyn_net.h"
 #include "epoch/e_abort_csn.h"
 #include "epoch/e_apply.h"
 #include "epoch/e_apply_pool.h"
@@ -32,14 +31,10 @@
 #include "epoch/e_pk_staging_shmem.h"
 #include "epoch/e_txn_queue.h"
 #include "epoch/e_txn_wire.h"
-#include "epoch/e_wire_envelope.h"
 #include "epoch/e_pacer.h"
 #include "epoch/e_perf.h"
 #include "epoch/e_concurrent_map.h"
 
-#include "dn_api.h"
-#include "dn_config.h"
-#include "dn_types.h"
 #include "occ/o_staging.h"
 
 #include "portability/instr_time.h"
@@ -52,21 +47,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
-/*
- * 入站 merge：按 txn.epoch 直接落入二维 MergeCell[epoch%slots][route_wid]（GeoGauss）。
- * 不再经中间 recv 队列 + Drain/epoch 比较/塞回。
- */
-static void EpochPipelineSubmitMergeWireTxn(const E_WireTxn& txn);
-static bool EpochPipelineTrySubmitMergeWireTxn(const E_WireTxn& txn);
-
-static void EpochRemoteMergeEnqueue(const E_WireTxn& txn)
-{
-    if (txn.epoch == 0) {
-        return;
-    }
-    EpochPipelineSubmitMergeWireTxn(txn);
-}
 
 /* 每个 epoch 按到达顺序保留原始 wire txn，供按 txn 粒度 apply（GeoGauss 式分片 map，无全局锁） */
 static EpochConcurrent::UnorderedMap<uint64_t, std::vector<E_WireTxn>> g_epoch_wire_txns;
@@ -1179,66 +1159,6 @@ void EpochPipelineStartPeerSendThreads(void)
 }
 
 /*
- * 按 txn.epoch 写入 MergeCell[epoch%slots][route]；满/失败 → ERROR（无 throttle/塞回）。
- * 必须先 Remember 再 Submit：async Claim 可能在 Submit 返回前 Finish，
- * 否则 FindWireTxn 失败 → ERROR（node3 epoch=96 wire_key=1315）。
- */
-static bool EpochPipelineTrySubmitMergeWireTxn(const E_WireTxn& txn)
-{
-    uint64_t wire_key = EpochPipelineWireTxnKey(txn);
-
-    /* 持久受理去重：成功 merge 后仍保留，直到 epoch clear */
-    if (!EpochConcurrent::U64SetInsert(g_merge_accepted_wires, txn.epoch, wire_key)) {
-        {
-            static uint64_t dbg_dup = 0;
-            if ((++dbg_dup % 20) == 0) {
-                EPOCH_DBG_FPRINTF("EPOCH_DBG merge_dup epoch=%lu key=%lu csn=%lu from=%u rows=%zu\n",
-                    (unsigned long)txn.epoch, (unsigned long)wire_key,
-                    (unsigned long)txn.csn, txn.server_id, txn.rows.size());
-                fflush(stderr);
-            }
-        }
-        return true;
-    }
-
-    /*
-     * 迟到写集延后：merge 游标已越过该 epoch（wire 晚于游标推进才到）时不能入池——
-     * task 入行后永不被游标行 TryClaim，行被占死（实测 epoch 1 迟到 task 卡住行[1]，
-     * epoch 9 撞 slot 重绑被拒 2370 万次）。判据用 merge 游标而非 logical：游标才是
-     * “已处理到哪”的真实位置（自愈跳窗时游标会领先 logical）。
-     * 按约束【不丢弃、延后】：写集 Remember 进 g_epoch_wire_txns 持久保留
-     * （直到 epoch clear），待该 epoch 重开机制消费；pending 项由调用方移除。
-     */
-    /* 同上：用 logical 判断“已结算”，不能用领先很多的 merge 游标 */
-    const uint64_t settled = E_NodeManager::GetLogicalEpoch();
-    if (txn.epoch > 0 && settled > 0 && txn.epoch < settled) {
-        EpochPipelineRememberWireTxn(txn.epoch, txn);
-        return true;
-    }
-
-    EpochPipelineRememberWireTxn(txn.epoch, txn);
-
-    bool is_local = (txn.server_id == EpochGetNodeId());
-    uint64_t rebind_before = 0;
-    uint64_t full_before = 0;
-    if (!EpochMergePoolSubmit(txn)) {
-        /* 逐笔记录失败原因：行仍绑在别的 epoch（rebind）还是本列格满 */
-        if (0 > rebind_before) {
-            EpochStuckTraceNote(EST_SUBMIT_FAIL_REBIND, static_cast<uint32_t>(txn.epoch), wire_key);
-        } else if (0 > full_before) {
-            EpochStuckTraceNote(EST_SUBMIT_FAIL_CELLS_FULL, static_cast<uint32_t>(txn.epoch), wire_key);
-        }
-        /*
-         * 保留 accepted/remembered（写集仍在 g_epoch_wire_txns），登记待提交。
-         * 绝不能 erase：erase 等于这笔写集从 merge 里消失，该 epoch 永远少一条。
-         */
-        return false;
-    }
-    EpochStuckTraceNote(EST_SUBMIT_OK, static_cast<uint32_t>(txn.epoch), wire_key);
-    return true;
-}
-
-/*
  * 收包路径专用：调用方已做过 wire 去重（g_merge_accepted_wires 已插入），
  * 这里只负责 Remember + 提交 / 暂存。绝不丢弃。
  */
@@ -1271,17 +1191,6 @@ static void EpochPipelineSubmitAcceptedMergeWireTxn(const E_WireTxn& txn, uint64
     }
 }
 
-
-static void EpochPipelineSubmitMergeWireTxn(const E_WireTxn& txn)
-{
-    /*
-     * 不阻塞、不丢弃：行被未来 epoch 占用 / 本列格满时，TrySubmit 会把 wire_key
-     * （pending 暂存机制已删除：提交就是一次入队，不会失败。）
-     * 这里运行在 recv / pack 线程（无 u_sess），禁止 ereport，也不能长时间阻塞——
-     * 一旦阻塞 recv，就连"迟到的那笔写集"本身都收不到，形成互等死锁。
-     */
-    (void)EpochPipelineTrySubmitMergeWireTxn(txn);
-}
 
 /*
  * 重试 pending 里的 merge 提交。由 merge worker 每跳调用；
@@ -1482,7 +1391,6 @@ static void EpochPipelinePhysicalAdvanceThreadMain(void)
         if (elapsed_ms >= interval_ms) {
             EpochPerfNoteWorkerPoll();
             EpochPerfMaybeReport();
-            EpochDynNetMaybeCatchup();
             OccStagingFlusherTick();
             /* 卡死定位：merge worker 单 task 超过 2s 未完成即打 MERGE_STUCK */
             EpochMergeProfileMaybeReportStuck();
@@ -1807,12 +1715,7 @@ static void EpochPipelineTrySealEpochs(void)
 
 
 
-void EpochPipelineInjectRemoteWireTxn(const E_WireTxn& txn)
-{
-    EpochMarkPeerConnected(txn.server_id);
-    EpochDynNetObserveWireTxn(txn);
-    EpochRemoteMergeEnqueue(txn);
-}
+
 
 
 
