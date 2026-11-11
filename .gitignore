@@ -32,3 +32,11 @@ build.log*
 lex.backup
 scripts/epoch_benchmark/_agent_edits.json
 Pacer__Straggler_Tolerant_Replication_for_Epoch_Based_Geo_Distributed_OLTP_Databases (2).pdf
+
+# 本地工具配置与私人笔记（不进入公开镜像）
+/.cursor/
+/代码相关版本说明.txt
+*.pdf
+dbr_pa_stat.txt
+pacer_text.txt
+pacer2_text.txt
