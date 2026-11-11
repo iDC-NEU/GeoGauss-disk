@@ -70,8 +70,7 @@ extern int g_epoch_dyn_net_rtt_ms;
 /* DBR 触发阈值：上行速率达到配置带宽的百分之多少即判为拥塞 */
 extern int g_epoch_dbr_threshold_pct;
 
-/* DBR 拥塞时的处理方式：drop（丢弃，省带宽）| defer（延后，保数据） */
-extern char* g_epoch_dbr_mode;
+/* DBR：每个片最多直发的写集条数，其余整笔改期 */
 extern int g_epoch_dbr_admit_per_epoch;
 extern char* g_epoch_dyn_net_slow_nodes;
 extern double g_epoch_dyn_net_upload_bps;

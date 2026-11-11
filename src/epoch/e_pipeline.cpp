@@ -176,80 +176,55 @@ static bool EpochPipelineDrainLocalQueueForEpoch(uint32_t peer, uint64_t epoch)
     const bool decoded = E_WireDeserializeTxn(buffer, len, &txn);
     const bool is_eof = decoded && E_WireTxnIsEpochEnd(txn);
 
-    /*
-     * ② 统一决策 + ③ 收尾包例外 + ④ 自环入队
-     *
-     * 同一笔写集在每条 peer 队列里各有一份，会被多条线程 pop 到。
-     * EpochPacerDecideItem 用 CAS 保证"只决定一次"：
-     *   - 第一条到达的线程按拥塞情况决定发送/丢弃（收尾包永远发送）
-     *   - 其余线程直接读它的结论
-     *   - 决定"发送"的那个线程顺便把这条写集入到本地接收队列，保证只入一次
-     *
-     * 丢弃不会让对端等死：对端的 declared 在收到 EOF 时冻结为"实际收到的条数"。
-     */
-    /*
-     * PA：如果这一片被判定为"跳过慢节点"，则不直接发给它——
-     * 数据与 EOF 都由 proxy 在 merge 完成后补发。本地自环照常，不能影响本地推进。
-     */
+    /* PA：跳过慢节点时，数据与 EOF 由 proxy 补发。 */
     if (EpochPacerPaShouldSkipPeer(peer, epoch)) {
         if (is_eof) {
-            /*
-             * 被跳过的片：本节点不直接发给慢节点，连 EOF 也不发。
-             * 数据与"各节点身份的 EOF"统一由代理在 merge 完成后补发，
-             * 这样 node2 在这片上对慢节点完全静默。
-             */
             EpochAdvanceSendEpoch(peer, epoch);
         }
         return true;
     }
 
-    const int send_now = EpochPacerDecideItem(epoch, txn.csn, txn.server_id, is_eof);
+    /* DBR：每笔只决策一次，所有 peer 队列沿用同一结论。 */
+    uint64_t defer_to = 0;
+    const int verdict = decoded
+        ? EpochPacerDecideItem(epoch, txn.csn, txn.server_id, is_eof, &defer_to)
+        : 1;
 
-    if (send_now == 2) {
-        /* drop 模式：整笔丢弃（不发对端、也不自环），对端的 declared 会按实收冻结 */
-        EpochPacerNoteDropped();
-        return true;
-    }
-
-    if (send_now == 0) {
-        /*
-         * 拥塞：不丢弃，改为"延后"——把这一条挪到更晚的时间片重发。
-         * 目标片由 EpochPacerDeferTarget 计算（>= epoch+4 且 > physical+1），
-         * 保证目标片的 EOF 还没进队列，延后的写集不会排到 EOF 之后。
-         */
-        const uint64_t target = EpochPacerDeferTarget(epoch);
+    if (verdict == 0) {
         E_WireTxn moved = txn;
-        moved.epoch = target;
+        moved.epoch = defer_to;
 
         std::string out;
         bool requeued = false;
         if (E_WireSerializeTxn(moved, &out)) {
-            requeued = EpochTxnQueuePush(peer, target, out.data(),
-                static_cast<uint32_t>(out.size()));
+            /* 目标格满则等待，不能退回原片发送。 */
+            for (;;) {
+                if (EpochTxnQueuePush(peer, defer_to, out.data(),
+                        static_cast<uint32_t>(out.size()))) {
+                    requeued = true;
+                    break;
+                }
+                pg_usleep(200);
+                CHECK_FOR_INTERRUPTS();
+            }
         }
-
-        if (!requeued) {
-            /* 压不回队列（目标格已满）：照常发送，绝不静默丢数据 */
-            EpochPacerDeferDone(txn.csn, txn.server_id);
-            (void)EpochNetPublishOne(peer, payload);
+        if (requeued) {
+            EpochPacerNoteDeferred();
         } else {
-            EpochPacerNoteDropped();      /* 计数口径：被延后的条数 */
+            (void)EpochNetPublishOne(peer, payload);
         }
     } else {
         /* 只负责外发；本端入队由独立的 self 线程处理（见 DrainSelfForEpoch） */
         (void)EpochNetPublishOne(peer, payload);
-        if (!is_eof) {
-            EpochPacerDeferDone(txn.csn, txn.server_id);   /* 已发出：清掉延后计数 */
-        }
     }
 
     /* 收尾包 → 该 peer 的 send 游标 +1 */
     if (is_eof) {
         /* 存一份到环形缓存：未被对端 ack 时会补发 */
         EpochNetNoteEofSent(peer, epoch, payload);
-        EPOCH_DBG_FPRINTF("EPOCH_DBG send_eof epoch=%lu from_node=%u to_peer=%u dropped=%lu\n",
+        EPOCH_DBG_FPRINTF("EPOCH_DBG send_eof epoch=%lu from_node=%u to_peer=%u deferred=%lu\n",
             static_cast<unsigned long>(epoch), EpochGetNodeId(), peer,
-            static_cast<unsigned long>(EpochPacerDroppedCount()));
+            static_cast<unsigned long>(EpochPacerDeferredCount()));
         fflush(stderr);
         EpochAdvanceSendEpoch(peer, epoch);
     }
@@ -954,7 +929,8 @@ void EpochPipelineBootstrapOwner(void)
     EpochPipelineInit();
     EpochApplyPoolInit();
     EpochMergePoolInit();
-    EpochRecvLedgerInit();      /* 账本第一格要初始化成 declared=99999 */
+    EpochRecvLedgerInit();
+    EpochPacerPaRestoreState();
     EpochPipelineStartRecvThread();
     EpochPipelineStartMergeThread();
     EpochPipelineStartApplyThread();
@@ -1109,24 +1085,31 @@ static bool EpochPipelineDrainSelfForEpoch(void)
     const bool decoded = E_WireDeserializeTxn(buffer, len, &txn);
     const bool is_eof = decoded && E_WireTxnIsEpochEnd(txn);
 
-    const int send_now = EpochPacerDecideItem(epoch, txn.csn, txn.server_id, is_eof);
-    if (send_now == 2) {
-        EpochPacerNoteDropped();        /* drop 模式：本端也不入队 */
-    } else if (send_now == 0) {
-        /* 延后：本端这一片也不收，挪到目标片再入队 */
-        const uint64_t target = EpochPacerDeferTarget(epoch);
+    /* 与 peer 线程共用决策。 */
+    uint64_t defer_to = 0;
+    const int verdict = decoded
+        ? EpochPacerDecideItem(epoch, txn.csn, txn.server_id, is_eof, &defer_to)
+        : 1;
+    if (verdict == 0) {
         E_WireTxn moved = txn;
-        moved.epoch = target;
+        moved.epoch = defer_to;
         std::string out;
         bool requeued = false;
         if (E_WireSerializeTxn(moved, &out)) {
-            requeued = EpochTxnQueuePush(self, target, out.data(),
-                static_cast<uint32_t>(out.size()));
+            for (;;) {
+                if (EpochTxnQueuePush(self, defer_to, out.data(),
+                        static_cast<uint32_t>(out.size()))) {
+                    requeued = true;
+                    break;
+                }
+                pg_usleep(200);
+                CHECK_FOR_INTERRUPTS();
+            }
         }
-        if (!requeued) {
-            (void)EpochNetEnqueueSelf(epoch, payload);   /* 压不回去就照常入队 */
+        if (requeued) {
+            EpochPacerNoteDeferred();
         } else {
-            EpochPacerNoteDropped();
+            (void)EpochNetEnqueueSelf(epoch, payload);
         }
     } else {
         (void)EpochNetEnqueueSelf(epoch, payload);

@@ -130,7 +130,6 @@ apply_params() {
     local DN_SLOW="${EPOCH_DYN_NET_SLOW_NODES:-}"
     local DN_RTT="${EPOCH_NETWORK_RTT_MS:-100}"
     local DN_DBR_PCT="${EPOCH_DBR_THRESHOLD_PCT:-95}"
-    local DN_DBR_MODE="${EPOCH_DBR_MODE:-drop}"
     # 上行带宽上限（bit/s）：拥塞判定用“网卡实际速率 / 该上限”，0=不限速
     local DN_UPBPS="${EPOCH_DYN_NET_UPLOAD_BPS:-0}"
     local DN_DOWNBPS="${EPOCH_DYN_NET_DOWNLOAD_BPS:-0}"
@@ -148,7 +147,6 @@ apply_params() {
         -e "s/^epoch_dyn_net_slow_nodes *=.*/epoch_dyn_net_slow_nodes = '${DN_SLOW}'/"
         -e "s/^epoch_dyn_net_rtt_ms *=.*/epoch_dyn_net_rtt_ms = ${DN_RTT}/"
         -e "s/^epoch_dbr_threshold_pct *=.*/epoch_dbr_threshold_pct = ${DN_DBR_PCT}/"
-        -e "s/^epoch_dbr_mode *=.*/epoch_dbr_mode = ${DN_DBR_MODE}/"
         -e "s/^epoch_dyn_net_upload_bps *=.*/epoch_dyn_net_upload_bps = ${DN_UPBPS}/"
         -e "s/^epoch_dyn_net_download_bps *=.*/epoch_dyn_net_download_bps = ${DN_DOWNBPS}/"
         -e "s/^epoch_pack_threads *=.*/epoch_pack_threads = 1/"
@@ -157,12 +155,13 @@ apply_params() {
         -e "s/^epoch_abort_csn_per_epoch *=.*/epoch_abort_csn_per_epoch = 1024/"
     )
     sed -i -E "${sedexpr[@]}" "${D1}/postgresql.conf"
+    # 旧版脚本写入、当前代码未注册的 GUC：残留会让实例起不来
+    sed -i '/^[[:space:]]*epoch_dbr_mode[[:space:]]*=/d' "${D1}/postgresql.conf"
     # 新参数：旧 conf 里没有这一行，sed 不会创建它
     grep -q '^epoch_dyn_net_upload_bps' "${D1}/postgresql.conf" || echo "epoch_dyn_net_upload_bps = ${DN_UPBPS}" >> "${D1}/postgresql.conf"
     grep -q '^epoch_dyn_net_download_bps' "${D1}/postgresql.conf" || echo "epoch_dyn_net_download_bps = ${DN_DOWNBPS}" >> "${D1}/postgresql.conf"
     grep -q '^epoch_dbr_threshold_pct' "${D1}/postgresql.conf" || echo "epoch_dbr_threshold_pct = ${DN_DBR_PCT}" >> "${D1}/postgresql.conf"
-    grep -q '^epoch_dbr_mode' "${D1}/postgresql.conf" || echo "epoch_dbr_mode = ${DN_DBR_MODE}" >> "${D1}/postgresql.conf"
-    grep -q '^epoch_abort_csn_per_epoch' "${D1}/postgresql.conf" || echo "epoch_abort_csn_per_epoch = 1024" >> "${D1}/postgresql.conf"
+        grep -q '^epoch_abort_csn_per_epoch' "${D1}/postgresql.conf" || echo "epoch_abort_csn_per_epoch = 1024" >> "${D1}/postgresql.conf"
     for ip in 172.16.1.11 172.16.1.12 172.16.1.13; do
         grep -q "^host all all ${ip}/32 trust" "${D1}/pg_hba.conf" || echo "host all all ${ip}/32 trust" >> "${D1}/pg_hba.conf"
     done

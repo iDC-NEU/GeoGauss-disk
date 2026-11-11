@@ -88,6 +88,30 @@ static void EpochCrdtFillRow(EpochCrdtRow* dst, const E_WireRow& src, const E_Wi
     dst->cen = txn.csn;       /* 本实现用 csn 作为 CRDT 版本 */
     dst->server_id = txn.server_id;
     dst->merged_ok = 1;
+    dst->claim_only = 0;
+}
+
+/* PA 影子：只记冲突声明，不带行数据。 */
+static void EpochCrdtFillClaim(EpochCrdtRow* dst, const E_WireRow& src, const E_WireTxn& txn)
+{
+    dst->relid = src.relid;
+    dst->bi_hi = src.bi_hi;
+    dst->bi_lo = src.bi_lo;
+    dst->ip_posid = src.ip_posid;
+    size_t pk_len = src.pk.size();
+    if (pk_len > EPOCH_CRDT_MAX_PK) {
+        pk_len = EPOCH_CRDT_MAX_PK;
+    }
+    dst->pk_len = static_cast<uint16_t>(pk_len);
+    if (dst->pk_len > 0) {
+        memcpy(dst->pk, src.pk.data(), dst->pk_len);
+    }
+    dst->tuple_len = 0;
+    dst->csn = txn.csn;
+    dst->cen = txn.csn;
+    dst->server_id = txn.server_id;
+    dst->merged_ok = 1;
+    dst->claim_only = 1;
 }
 
 /* CRDT 已改为进程内结构，不再占用共享内存 */
@@ -107,6 +131,37 @@ E_CrdtMergeOutcome EpochCrdtShmemMergeWireTxn(const E_WireTxn& txn)
     outcome.resource_failure = false;
 
     if (txn.rows.empty() || txn.epoch == 0) {
+        return outcome;
+    }
+
+    /* PA 影子：按行重放冲突声明，不做整笔预检。 */
+    if (txn.claim_only) {
+        if (EpochAbortCsnInsert(txn.epoch, txn.csn, txn.server_id)) {
+            EpochApplyStatsNoteAbortN(1);
+        }
+        g_crdt_rows.Modify(txn.epoch, [&](EpochCrdtRowMap& rows, bool /*is_new*/) {
+            for (const E_WireRow& row : txn.rows) {
+                if (row.op_type == EPOCH_OP_READ) {
+                    continue;
+                }
+                const uint64_t key = EpochCrdtRowKey(row.relid, row.pk.data(), row.pk.size(),
+                    row.bi_hi, row.bi_lo, row.ip_posid);
+                auto it = rows.find(key);
+                if (it != rows.end()) {
+                    if (it->second.csn <= txn.csn) {
+                        continue;   /* 该行已有更早的赢家，声明失效 */
+                    }
+                    /* 声明压过更晚的版本：该版本应判输，与直接路径一致 */
+                    EpochAbortCsnInsert(txn.epoch, it->second.csn, it->second.server_id);
+                    EpochCrdtFillClaim(&it->second, row, txn);
+                } else {
+                    EpochCrdtRow fresh;
+                    EpochCrdtFillClaim(&fresh, row, txn);
+                    rows.emplace(key, fresh);
+                }
+            }
+        });
+        outcome.txn_accepted = false;
         return outcome;
     }
 

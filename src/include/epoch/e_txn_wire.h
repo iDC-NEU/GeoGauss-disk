@@ -8,7 +8,8 @@
 #include "epoch/e_types.h"
 
 static constexpr uint64_t EPOCH_WIRE_MAGIC = 0xE0C0CAFEULL;
-static constexpr uint32_t EPOCH_WIRE_VERSION = 7;
+/* v8：事务头增加 claim_only（PA 影子）。控制消息沿用同一报文，不另立格式。 */
+static constexpr uint32_t EPOCH_WIRE_VERSION = 8;
 static constexpr uint64_t EPOCH_MERGE_TASK_MAGIC = 0xE0C0CAF2ULL;
 static constexpr uint32_t EPOCH_MERGE_TASK_VERSION = 2;
 /*
@@ -20,9 +21,14 @@ static constexpr uint32_t EPOCH_MAX_WIRE_TXN_BYTES = 12 * 1024;
 static constexpr uint16_t EPOCH_WIRE_MAX_PK = 128;
 /* 空包 + 该 CSN 表示请求对端重发某 epoch 的缓存事务 */
 static constexpr uint64_t EPOCH_WIRE_TXN_REQUEST_CSN = UINT64_MAX;
-/* PA 激活：带一行，expected_csn = 协助区间终点，relid = session */
-static constexpr uint64_t EPOCH_WIRE_PA_ACTIVATE_CSN = UINT64_MAX - 1;
-/* PA：慢节点下行拥塞状态广播（on/off 两个 csn 值区分） */
+/*
+ * PA 会话状态（on/off 两个 csn 值区分）。同一条控制报文携带：
+ *   epoch 字段        = 会话的首个未应用 epoch（e_f）
+ *   server_id 字段    = 慢节点 id
+ *   route_wid 字段    = 选定的 proxy id
+ *   origin_start_us   = session id
+ * 三个字段本来就在 v6/v7 报文头里，控制消息不必新增格式。
+ */
 static constexpr uint64_t EPOCH_WIRE_PA_STATE_ON_CSN = UINT64_MAX - 5;
 static constexpr uint64_t EPOCH_WIRE_PA_STATE_OFF_CSN = UINT64_MAX - 6;
 /* PA：代理对某一片的转发决策（epoch 字段带片号，csn 区分 skip/direct） */
@@ -34,6 +40,8 @@ static constexpr uint64_t EPOCH_WIRE_EOF_REQUEST_CSN = UINT64_MAX - 2;
 static constexpr uint64_t EPOCH_WIRE_PHYS_NOTIFY_CSN = UINT64_MAX - 3;
 /* EOF 确认：携带"我连续收到的你的 EOF 到第几片"（内容在 txn.epoch 里） */
 static constexpr uint64_t EPOCH_WIRE_EOF_ACK_CSN = UINT64_MAX - 9;
+/* PA：请代理对某一片立即给出路由决策（epoch 字段带片号），避免等它自己走到该片 */
+static constexpr uint64_t EPOCH_WIRE_PA_DECIDE_REQ_CSN = UINT64_MAX - 10;
 
 struct E_WireRow {
     EpochOpType op_type{EPOCH_OP_READ};
@@ -68,6 +76,11 @@ struct E_WireTxn {
     EpochTxnState txn_state{EPOCH_TXN_COMMIT};
     /* TPCC w_id；0=未知，路由 fallback 到 wire_key % N */
     uint16_t route_wid{0};
+    /*
+     * PA 影子（v8）：该事务在代理处已判输，转发时去掉行数据，只保留冲突声明。
+     * 影子参与冲突裁决（阻挡 CSN 更小的本地事务），但永远不会被 apply。
+     */
+    bool claim_only{false};
     std::vector<E_WireRow> rows;
 };
 
@@ -95,11 +108,11 @@ static inline bool E_WireTxnIsEofAck(const E_WireTxn& txn)
     return txn.csn == EPOCH_WIRE_EOF_ACK_CSN;
 }
 
+/* 收尾包：某源在本片的输入到此为止（不含任何计数，declared 由接收端冻结） */
 static inline bool E_WireTxnIsEpochEnd(const E_WireTxn& txn)
 {
-    return txn.rows.empty() && txn.epoch > 0 && txn.csn != EPOCH_WIRE_TXN_REQUEST_CSN &&
-           txn.csn != EPOCH_WIRE_PA_ACTIVATE_CSN && txn.csn != EPOCH_WIRE_EOF_REQUEST_CSN &&
-           txn.csn != EPOCH_WIRE_PHYS_NOTIFY_CSN && txn.csn != EPOCH_WIRE_EOF_ACK_CSN;
+    /* csn == 0 把“空写集”与“收尾包”区分开（收尾包不带事务号） */
+    return txn.rows.empty() && txn.epoch > 0 && txn.csn == 0 && !txn.claim_only;
 }
 
 /* PA 状态广播：返回 true 时 *congested 给出状态 */
@@ -130,9 +143,16 @@ static inline bool E_WireTxnIsPaEpochDecision(const E_WireTxn& txn, bool* skip)
     return false;
 }
 
-static inline bool E_WireTxnIsPaActivate(const E_WireTxn& txn)
+/* PA 影子：只带冲突声明，不带行数据 */
+static inline bool E_WireTxnIsShadow(const E_WireTxn& txn)
 {
-    return txn.csn == EPOCH_WIRE_PA_ACTIVATE_CSN && txn.epoch > 0;
+    return txn.claim_only;
+}
+
+/* PA 决策请求：epoch 字段即所问的片 */
+static inline bool E_WireTxnIsPaDecideRequest(const E_WireTxn& txn)
+{
+    return txn.csn == EPOCH_WIRE_PA_DECIDE_REQ_CSN && txn.epoch > 0;
 }
 
 static inline bool E_WireTxnIsTxnRequest(const E_WireTxn& txn)

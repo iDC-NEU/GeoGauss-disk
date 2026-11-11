@@ -7,181 +7,313 @@
 #include "epoch/e_abort_csn.h"
 #include "epoch/e_config.h"
 #include "epoch/e_epoch_capacity.h"
-#include "epoch/e_crdt_merge_logic.h"
 #include "epoch/e_net.h"
 #include "epoch/e_node_manager.h"
-#include "epoch/e_pipeline.h"
 #include "epoch/e_perf.h"
-#include "epoch/e_statistician.h"
+#include "epoch/e_recv_ledger.h"
+#include "epoch/e_txn_queue.h"
 #include "epoch/e_txn_wire.h"
+#include "epoch/e_types.h"
+
+#include "knl/knl_instance.h"
+#include "knl/knl_variable.h"
 
 #include "neu_concurrency_tools/concurrentqueue.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
-#include <atomic>
-#include <unordered_map>
-#include <map>
+#include <ctime>
+#include <deque>
+#include <fcntl.h>
 #include <mutex>
-#include <set>
 #include <string>
+#include <unistd.h>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-/*
- * ============================================================================
- * Pacer：DBR（发送端拥塞丢弃）+ PA（慢节点下行代理转发）
- * ============================================================================
- *
- * DBR 只做一件事，在发送线程里逐条判断：
- *   非收尾包且在对应 peer 方向上拥塞  → 丢弃（不入 ZMQ）
- *   收尾包                            → 必须发送
- * 判据是本机上行是否已经跑满（EpochNetUplinkCongested：/proc/net/dev 采样
- * 到的发送速率 >= 配置上行带宽的 90%）。不看 ZMQ 队列——加闸门后队列基本不满。
- *
- * 丢弃是安全的：对端的 declared 计数在收到 EOF 时冻结为"实际收到的条数"
- * （见 e_recv_ledger.cpp: EpochRecvNoteEof），所以少发的写集不会被期待。
- *
- * PA 部分保留完整实现，供后续三副本下行受限的实验使用。
- */
+/* Pacer：DBR 在发送出队点改期，PA 在 merge 游标处转发。 */
 
-static bool g_pacer_logged = false;
-
-bool EpochPacerPaEnabled(void)
+static int64_t PacerMonoUs(void)
 {
-    return g_enable_epoch_multimaster && EpochGetTotalNodes() > 1 && g_epoch_dyn_net_proxy;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000 + static_cast<int64_t>(ts.tv_nsec / 1000);
 }
 
-bool EpochPacerDbrEnabled(void)
+static bool PacerSlowListContains(uint32_t node)
 {
-    if (!g_enable_epoch_multimaster || EpochGetTotalNodes() <= 1 || !g_epoch_dyn_net_catchup) {
+    const char* s = g_epoch_dyn_net_slow_nodes;
+    if (s == nullptr || s[0] == '\0') {
         return false;
     }
-    /*
-     * 只有慢节点才启用 DBR。
-     * 快节点的上行没有受限，本来就不会拥塞；若也允许丢弃，只会在瞬时抖动时
-     * 白白丢数据，还把"谁该丢"的语义搞乱。
-     */
-    return EpochPacerIsSlowSelf();
+    uint32_t cur = 0;
+    bool in_num = false;
+    for (const char* p = s;; ++p) {
+        if (*p >= '0' && *p <= '9') {
+            cur = cur * 10 + static_cast<uint32_t>(*p - '0');
+            in_num = true;
+            continue;
+        }
+        if (in_num && cur == node) {
+            return true;
+        }
+        cur = 0;
+        in_num = false;
+        if (*p == '\0') {
+            break;
+        }
+    }
+    return false;
 }
 
 bool EpochPacerIsSlowSelf(void)
 {
-    const char* s = g_epoch_dyn_net_slow_nodes;
-    if (s == nullptr || s[0] == '\0') {
-        return false;
+    return PacerSlowListContains(EpochGetNodeId());
+}
+
+static uint32_t PacerSlowNodeId(void)
+{
+    const uint32_t total = EpochGetTotalNodes();
+    for (uint32_t p = 0; p < total; ++p) {
+        if (PacerSlowListContains(p)) {
+            return p;
+        }
     }
+    return UINT32_MAX;
+}
+
+static uint32_t PacerFirstHealthyNode(void)
+{
+    const uint32_t total = EpochGetTotalNodes();
+    for (uint32_t p = 0; p < total; ++p) {
+        if (!PacerSlowListContains(p)) {
+            return p;
+        }
+    }
+    return UINT32_MAX;
+}
+
+bool EpochPacerDbrEnabled(void)
+{
+    return g_enable_epoch_multimaster && EpochGetTotalNodes() > 1 && g_epoch_dyn_net_catchup &&
+           EpochPacerIsSlowSelf();
+}
+
+bool EpochPacerPaEnabled(void)
+{
+    return g_enable_epoch_multimaster && EpochGetTotalNodes() > 1 && g_epoch_dyn_net_proxy &&
+           PacerSlowNodeId() != UINT32_MAX;
+}
+
+/* 只发给健康节点；对慢节点的那条链路不承载控制消息。 */
+static bool PacerPublishToHealthy(const std::string& wire)
+{
+    bool ok = true;
     const uint32_t self = EpochGetNodeId();
-    int cur = 0;
-    bool in_num = false;
-    for (const char* p = s;; ++p) {
-        if (*p >= '0' && *p <= '9') {
-            cur = cur * 10 + (*p - '0');
-            in_num = true;
+    const uint32_t total = EpochGetTotalNodes();
+    for (uint32_t p = 0; p < total; ++p) {
+        if (p == self || PacerSlowListContains(p)) {
             continue;
         }
-        if (in_num && static_cast<uint32_t>(cur) == self) {
-            return true;
-        }
-        cur = 0;
-        in_num = false;
-        if (*p == '\0') {
-            break;
+        if (!EpochNetPublishTo(p, wire)) {
+            ok = false;
         }
     }
-    return false;
+    return ok;
 }
 
-static bool EpochPacerIdInSlowList(uint32_t node)
+/* ---------------- DBR ---------------- */
+
+static std::atomic<int64_t> g_epoch_interval_us{10000};
+static std::atomic<int64_t> g_pressure_since_us{0};
+static uint64_t g_last_phys_epoch = 0;
+static int64_t g_last_phys_change_us = 0;
+
+static int64_t PacerEpochIntervalUs(void)
 {
-    const char* s = g_epoch_dyn_net_slow_nodes;
-    if (s == nullptr || s[0] == '\0') {
+    return g_epoch_interval_us.load(std::memory_order_relaxed);
+}
+
+static void PacerSampleEpochInterval(void)
+{
+    const uint64_t phys = E_NodeManager::GetPhysicalEpoch();
+    const int64_t now = PacerMonoUs();
+    if (g_last_phys_epoch == 0) {
+        g_last_phys_epoch = phys;
+        g_last_phys_change_us = now;
+        return;
+    }
+    if (phys == g_last_phys_epoch) {
+        return;
+    }
+    const uint64_t delta = phys > g_last_phys_epoch ? (phys - g_last_phys_epoch) : 1;
+    const int64_t dt = now - g_last_phys_change_us;
+    if (dt > 0) {
+        int64_t per = dt / static_cast<int64_t>(delta);
+        if (per < 1000) {
+            per = 1000;
+        }
+        const int64_t cur = g_epoch_interval_us.load(std::memory_order_relaxed);
+        g_epoch_interval_us.store((cur * 7 + per) / 8, std::memory_order_relaxed);
+    }
+    g_last_phys_epoch = phys;
+    g_last_phys_change_us = now;
+}
+
+static bool PacerSenderPressure(void)
+{
+    if (EpochNetUplinkCongested()) {
+        return true;
+    }
+    const uint32_t peers = EpochGetTotalNodes() > 1 ? (EpochGetTotalNodes() - 1) : 1;
+    const uint32_t tolerance = static_cast<uint32_t>(g_epoch_dyn_net_queue_tolerance > 0
+        ? g_epoch_dyn_net_queue_tolerance : 20) * peers;
+    return EpochTxnQueueCount() >= tolerance;
+}
+
+static bool PacerSenderPressurePersistent(void)
+{
+    if (!PacerSenderPressure()) {
+        g_pressure_since_us.store(0, std::memory_order_relaxed);
         return false;
     }
-    int cur = 0;
-    bool in_num = false;
-    for (const char* p = s;; ++p) {
-        if (*p >= '0' && *p <= '9') {
-            cur = cur * 10 + (*p - '0');
-            in_num = true;
-            continue;
-        }
-        if (in_num && static_cast<uint32_t>(cur) == node) {
-            return true;
-        }
-        cur = 0;
-        in_num = false;
-        if (*p == '\0') {
-            break;
-        }
-    }
-    return false;
-}
-
-/*
- * 最小 DBR 判据：现在能不能发。
- *
- * 判据是"本机上行是否已经跑满"（EpochNetUplinkCongested，网卡速率 >=
- * 配置上行带宽的 90%），不再看 ZMQ 队列——加了快照闸门后 backend 被 apply
- * 拖住，ZMQ 队列基本不会满，POLLOUT 永远可写，DBR 就成了死代码。
- */
-bool EpochPacerShouldDefer(void)
-{
-    if (!EpochPacerDbrEnabled()) {
+    const int64_t now = PacerMonoUs();
+    const int64_t since = g_pressure_since_us.load(std::memory_order_relaxed);
+    if (since == 0) {
+        g_pressure_since_us.store(now, std::memory_order_relaxed);
         return false;
     }
-    return EpochNetUplinkCongested();
+    return (now - since) >= PacerEpochIntervalUs();
 }
 
-/*
- * 每条写集的统一决策表。
- *
- * 一笔写集在每个 peer 队列里各有一份，会分别被两条发送线程 pop 到。
- * 若各自独立判断拥塞，就可能"一份发、一份丢"。这里用 CAS 保证：
- *   第一条到达的线程做决定（并负责自环入队），其余线程读它的结论。
- *
- * 单元存放 (epoch << 8) | flag，flag: 1 = 发送，2 = 丢弃。
- * 带上 epoch 就自动规避了环形复用（旧 epoch 的值不会被误读）。
- */
-/*
- * DBR 决策表：**每笔事务一条记录**，key = csn ^ (server_id << 48)（全局唯一）。
- *
- * 为什么不用 (epoch, index) 当键：
- *   1) 各 peer 队列的下标不保证对齐（延后重投、环形复用都会让 head 错位）
- *   2) 延后次数必须是"整笔"的：不能一个 peer 延后、另一个发送
- * 所以把"结论"和"次数"放在同一条记录上，所有线程读同一份。
- */
-static constexpr uint64_t EPOCH_DBR_DEFER_AHEAD = 4;
-static constexpr uint32_t EPOCH_DBR_MAX_DEFER = 3;
-static constexpr uint8_t EPOCH_DEC_UNDECIDED = 0;
-static constexpr uint8_t EPOCH_DEC_SEND = 1;
-static constexpr uint8_t EPOCH_DEC_DEFER = 2;
-static constexpr uint8_t EPOCH_DEC_FORCED = 3;   /* 延后次数用尽，强制发送 */
-static constexpr uint8_t EPOCH_DEC_DROP = 4;     /* 直接丢弃（drop 模式） */
-
-/* 拥塞时是丢弃还是延后：由 epoch_dbr_mode 决定 */
-static bool EpochPacerDbrDropMode(void)
+/* e_t = max{e+1, ê_peer + ceil(RTT/T_epoch) + K}；返回 0 表示本片不适合改期。 */
+static uint64_t PacerTargetEpoch(uint64_t epoch)
 {
-    const char* m = g_epoch_dbr_mode;
-    return (m != nullptr && m[0] == 'd');    /* "drop" */
+    const uint64_t observed = EpochRecvGetEpoch();
+    const int64_t rtt_us = static_cast<int64_t>(g_epoch_dyn_net_rtt_ms > 0
+        ? g_epoch_dyn_net_rtt_ms : 100) * 1000;
+    const int64_t t_epoch_us = PacerEpochIntervalUs();
+    const int64_t slots = (rtt_us + t_epoch_us - 1) / t_epoch_us;
+    const int64_t k = g_epoch_dyn_net_catchup_k > 0 ? g_epoch_dyn_net_catchup_k : 3;
+
+    uint64_t target = observed + static_cast<uint64_t>(slots + k);
+    if (target <= epoch) {
+        target = epoch + 1;
+    }
+    const uint64_t phys = E_NodeManager::GetPhysicalEpoch();
+    if (target < phys + 2) {
+        target = phys + 2;
+    }
+    /* 最多前移 32 片；若这样仍追不上 physical，就不能改期（目标格已封口） */
+    if (target > epoch + 32) {
+        target = epoch + 32;
+    }
+    if (target < phys + 2 || target <= epoch) {
+        return 0;
+    }
+    return target;
 }
 
-struct EpochPacerDecide {
-    uint8_t state{EPOCH_DEC_UNDECIDED};
-    uint8_t count{0};
-    uint64_t last_epoch{0};
+static std::atomic<uint64_t> g_admit_slot[EPOCH_TXN_EPOCH_COUNT];
+static std::atomic<uint64_t> g_defer_slot[EPOCH_TXN_EPOCH_COUNT];
+static constexpr uint32_t PACER_DEFER_PER_EPOCH = 32;
+
+/* 槽位存 (epoch << 32 | used)，换片自动重置。 */
+static bool PacerSlotReserve(std::atomic<uint64_t>* table, uint64_t epoch, uint32_t limit)
+{
+    std::atomic<uint64_t>& slot = table[EpochSlotOf(epoch)];
+    uint64_t cur = slot.load(std::memory_order_acquire);
+    for (;;) {
+        const uint64_t bound = cur >> 32;
+        uint32_t used = static_cast<uint32_t>(cur & 0xffffffffu);
+        if (bound != epoch) {
+            used = 0;
+        }
+        if (used >= limit) {
+            return false;
+        }
+        const uint64_t want = (epoch << 32) | static_cast<uint64_t>(used + 1);
+        if (slot.compare_exchange_weak(cur, want, std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+    }
+}
+
+enum {
+    PACER_DEC_SEND = 1,
+    PACER_DEC_DEFER = 2,
+};
+
+struct PacerDecision {
+    uint8_t state;
+    uint64_t decided_epoch;
+    uint64_t target_epoch;
 };
 
 static std::mutex g_decide_mu;
-static std::unordered_map<uint64_t, EpochPacerDecide> g_decide;
+static std::unordered_map<uint64_t, PacerDecision> g_decide;
 
-static inline uint64_t EpochPacerDecideKey(uint64_t csn, uint32_t server_id)
+static inline uint64_t PacerDecideKey(uint64_t csn, uint32_t server_id)
 {
     return csn ^ (static_cast<uint64_t>(server_id) << 48);
 }
 
-/* 定期清理：已经很旧的决策记录直接删掉，避免无限增长 */
+int EpochPacerDecideItem(uint64_t epoch, uint64_t csn, uint32_t server_id, bool is_eof,
+    uint64_t* out_target)
+{
+    if (out_target != nullptr) {
+        *out_target = 0;
+    }
+    if (is_eof || !EpochPacerDbrEnabled()) {
+        return 1;
+    }
+
+    const uint64_t key = PacerDecideKey(csn, server_id);
+    std::lock_guard<std::mutex> lk(g_decide_mu);
+
+    auto it = g_decide.find(key);
+    if (it == g_decide.end()) {
+        PacerDecision d;
+        d.state = PACER_DEC_SEND;
+        d.decided_epoch = epoch;
+        d.target_epoch = 0;
+
+        const uint32_t budget = g_epoch_dbr_admit_per_epoch > 0
+            ? static_cast<uint32_t>(g_epoch_dbr_admit_per_epoch) : 8;
+        const bool admitted = PacerSlotReserve(g_admit_slot, epoch, budget);
+        if (!admitted && PacerSenderPressurePersistent()) {
+            const uint64_t target = PacerTargetEpoch(epoch);
+            if (target != 0 && PacerSlotReserve(g_defer_slot, target, PACER_DEFER_PER_EPOCH)) {
+                d.state = PACER_DEC_DEFER;
+                d.target_epoch = target;
+            }
+        }
+        g_decide.emplace(key, d);
+        if (d.state == PACER_DEC_DEFER) {
+            if (out_target != nullptr) {
+                *out_target = d.target_epoch;
+            }
+            return 0;
+        }
+        return 1;
+    }
+
+    const PacerDecision& d = it->second;
+    /* 只有“还在原片”的副本跟着改期；已改期的副本按目标片照常发送。 */
+    if (d.state == PACER_DEC_DEFER && epoch == d.decided_epoch) {
+        if (out_target != nullptr) {
+            *out_target = d.target_epoch;
+        }
+        return 0;
+    }
+    return 1;
+}
+
 void EpochPacerSweepDecisions(uint64_t up_to_epoch)
 {
     if (up_to_epoch < 64) {
@@ -190,7 +322,7 @@ void EpochPacerSweepDecisions(uint64_t up_to_epoch)
     const uint64_t floor = up_to_epoch - 64;
     std::lock_guard<std::mutex> lk(g_decide_mu);
     for (auto it = g_decide.begin(); it != g_decide.end();) {
-        if (it->second.last_epoch < floor) {
+        if (it->second.decided_epoch < floor && it->second.target_epoch < floor) {
             it = g_decide.erase(it);
         } else {
             ++it;
@@ -198,98 +330,7 @@ void EpochPacerSweepDecisions(uint64_t up_to_epoch)
     }
 }
 
-/* 目标片：当前片 + AHEAD，且至少比 physical 大 2（保证目标片还没封口） */
-uint64_t EpochPacerDeferTarget(uint64_t epoch)
-{
-    uint64_t target = epoch + EPOCH_DBR_DEFER_AHEAD;
-    const uint64_t phys = E_NodeManager::GetPhysicalEpoch();
-    if (target < phys + 2) {
-        target = phys + 2;
-    }
-    return target;
-}
-
-/* 兼容旧接口：目标片由内部计算，调用方不再需要 DeferDone */
-void EpochPacerDeferDone(uint64_t csn, uint32_t server_id)
-{
-    (void)csn;
-    (void)server_id;
-}
-
-/*
- * 自环入队的固定负责人（最小的对端 id）。
- *
- * 注意：这个"固定线程"只用来保证同片写入顺序，不代表它的速度可以慢——
- * 因此自环最好由独立的 self 线程承担（见 e_pipeline 的 self drain）。
- */
-uint32_t EpochPacerSelfLoopPeer(void)
-{
-    const uint32_t self = EpochGetNodeId();
-    const uint32_t total = EpochGetTotalNodes();
-    for (uint32_t p = 0; p < total; ++p) {
-        if (p != self) {
-            return p;
-        }
-    }
-    return UINT32_MAX;
-}
-
-/*
- * 单笔事务的统一决策：返回 1 = 发送、0 = 延后。
- *
- * 所有 peer 线程 + self 线程读同一张表（key = csn ^ server），因此
- * "这笔到底发不发"是整笔一致的；延后次数也是整笔共享的。
- */
-int EpochPacerDecideItem(uint64_t epoch, uint64_t csn, uint32_t server_id, bool is_eof)
-{
-    if (is_eof) {
-        return 1;                       /* 收尾包永远发送 */
-    }
-
-    const uint64_t key = EpochPacerDecideKey(csn, server_id);
-    std::lock_guard<std::mutex> lk(g_decide_mu);
-
-    auto it = g_decide.find(key);
-    if (it == g_decide.end()) {
-        const bool congested = EpochPacerShouldDefer();
-        EpochPacerDecide d;
-        d.count = 0;
-        d.last_epoch = epoch;
-        if (!congested) {
-            d.state = EPOCH_DEC_SEND;
-        } else if (EpochPacerDbrDropMode()) {
-            d.state = EPOCH_DEC_DROP;      /* 丢弃：整笔都不发、也不自环 */
-        } else {
-            d.state = EPOCH_DEC_DEFER;
-            d.count = 1;
-        }
-        g_decide.emplace(key, d);
-        return (d.state == EPOCH_DEC_DROP) ? 2 : (d.state == EPOCH_DEC_DEFER ? 0 : 1);
-    }
-
-    EpochPacerDecide& d = it->second;
-    d.last_epoch = epoch;
-
-    if (d.state == EPOCH_DEC_FORCED) {
-        return 1;                       /* 次数用尽：一律发送 */
-    }
-    if (d.state == EPOCH_DEC_DROP) {
-        return 2;                       /* 整笔丢弃（所有 peer 一致） */
-    }
-    if (d.state == EPOCH_DEC_DEFER) {
-        if (d.count < EPOCH_DBR_MAX_DEFER) {
-            ++d.count;
-            return 0;                   /* 再延后一次 */
-        }
-        d.state = EPOCH_DEC_FORCED;
-        return 1;
-    }
-    return 1;
-}
-
-static std::atomic<uint64_t> g_pacer_dropped{0};
-
-/* merge 入队失败后的重试次数（背压指标，正常应为 0） */
+static std::atomic<uint64_t> g_pacer_deferred{0};
 static std::atomic<uint64_t> g_merge_retry{0};
 
 void EpochPacerNoteMergeRetry(void)
@@ -302,106 +343,272 @@ uint64_t EpochPacerMergeRetryCount(void)
     return g_merge_retry.load(std::memory_order_relaxed);
 }
 
-void EpochPacerNoteDropped(void)
+void EpochPacerNoteDeferred(void)
 {
-    g_pacer_dropped.fetch_add(1, std::memory_order_relaxed);
+    g_pacer_deferred.fetch_add(1, std::memory_order_relaxed);
 }
 
-uint64_t EpochPacerDroppedCount(void)
+uint64_t EpochPacerDeferredCount(void)
 {
-    return g_pacer_dropped.load(std::memory_order_relaxed);
+    return g_pacer_deferred.load(std::memory_order_relaxed);
 }
 
-void EpochPacerPackTick(void)
-{
-    if (EpochPacerPaEnabled() && EpochPacerIsSlowSelf()) {
-        EpochPacerPaSlowSideTick();      /* 慢节点：采样下行速率并广播状态 */
-    }
-}
+/* ---------------- PA ---------------- */
 
-/* 单调时钟（微秒），用于 PA 采样 */
-static int64_t EpochPacerMonoUs(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<int64_t>(ts.tv_sec) * 1000000 + static_cast<int64_t>(ts.tv_nsec / 1000);
-}
-
-/* ============================================================================
- * PA（最小版）：慢节点下行受限时的代理转发
- *
- *   慢节点：采样自己的"入向"速率，接近下行上限时把状态广播给 proxy
- *   proxy ：收到状态后，对每个 send epoch 做一次决策
- *             · 拥塞   → 本片不直接发给慢节点（改由 merge 之后统一转发）
- *             · 不拥塞 → 正常直发
- *   proxy merge：对"被跳过"的片，收集 CRDT 判定为赢家的事务，该片 merge
- *            完成时一次性发给慢节点，并补一个 EOF。
- * ==========================================================================*/
-
-/* proxy 侧：最近一次收到的慢节点下行拥塞状态 */
+static std::atomic<uint64_t> g_pa_session{0};
+static std::atomic<uint64_t> g_pa_session_first{0};
+static std::atomic<uint64_t> g_pa_session_exit{0};
+static std::atomic<uint32_t> g_pa_proxy{UINT32_MAX};
 static std::atomic<bool> g_pa_slow_congested{false};
-
-/*
- * proxy 侧：每个 epoch 对慢节点的发送方式
- *   0 = 未决定，1 = 直发（未拥塞），2 = 跳过（改由 merge 后转发）
- * 高 8 位存 epoch，规避环形复用误读。
- */
-static std::atomic<uint64_t> g_pa_epoch_mode[EPOCH_TXN_EPOCH_COUNT];
-
-/*
- * proxy 侧：被跳过片的待转发写集（按 epoch 分格的并发队列，无锁）
- *
- * 只缓存原始 wire + 身份，不做"是不是赢家"的判定——
- * 判定必须等到该片 merge 全部结束（abort 集合此时才完整）再做。
- */
-struct EpochPacerPaPending {
-    uint64_t csn = 0;
-    uint32_t server_id = 0;
-    std::string wire;
-};
-
-static moodycamel::ConcurrentQueue<EpochPacerPaPending> g_pa_fwd[EPOCH_TXN_EPOCH_COUNT];
-static std::atomic<bool> g_pa_logged{false};
+static std::atomic<bool> g_pa_reannounce{false};
 
 constexpr uint8_t EPOCH_PA_DIRECT = 1;
 constexpr uint8_t EPOCH_PA_SKIP = 2;
 
-/* 慢节点 id（slow_nodes 名单里的第一个）；没有则 UINT32_MAX */
-static uint32_t EpochPacerPaSlowNodeId(void)
-{
-    const uint32_t total = EpochGetTotalNodes();
-    for (uint32_t p = 0; p < total; ++p) {
-        if (EpochPacerIdInSlowList(p)) {
-            return p;
-        }
-    }
-    return UINT32_MAX;
-}
+static std::atomic<uint64_t> g_pa_epoch_mode[EPOCH_TXN_EPOCH_COUNT];
+static std::atomic<uint64_t> g_pa_peer_decision[EPOCH_TXN_EPOCH_COUNT];
 
-/* proxy id（第一台不在慢名单里的节点）；没有则 UINT32_MAX */
-uint32_t EpochPacerPaProxyNodeId(void)
-{
-    const uint32_t total = EpochGetTotalNodes();
-    for (uint32_t p = 0; p < total; ++p) {
-        if (!EpochPacerIdInSlowList(p)) {
-            return p;
-        }
-    }
-    return UINT32_MAX;
-}
+struct EpochPacerPaPending {
+    E_WireTxn txn;
+};
 
-/* proxy 侧：收到慢节点广播的状态 */
-void EpochPacerPaNoteSlowState(bool congested)
+static moodycamel::ConcurrentQueue<EpochPacerPaPending> g_pa_fwd[EPOCH_TXN_EPOCH_COUNT];
+
+/* 转发报文由发送线程投递：merge 线程不能阻塞在慢节点的链路上。 */
+struct EpochPacerPaOut {
+    uint32_t target;
+    std::string wire;
+};
+
+static std::mutex g_pa_out_mu;
+static std::deque<EpochPacerPaOut> g_pa_out_q;
+
+static std::atomic<uint64_t> g_pa_out_dropped{0};
+
+/* 投递成功才出队，失败留到下一个 tick，保证片内顺序。 */
+static void PacerPaDrainOutbox(void)
 {
-    const bool old = g_pa_slow_congested.exchange(congested, std::memory_order_acq_rel);
-    if (old != congested) {
-        EPOCH_DBG_FPRINTF("EPOCH_DBG pa_slow_state congested=%d\n", congested ? 1 : 0);
+    static int64_t last_log_us = 0;
+    std::lock_guard<std::mutex> lk(g_pa_out_mu);
+    while (!g_pa_out_q.empty()) {
+        EpochPacerPaOut& msg = g_pa_out_q.front();
+        /* 对端断开时不要走 PublishTo 的广播回退：会把转发报文发给所有节点 */
+        if (!EpochPeerIsConnected(msg.target)) {
+            break;
+        }
+        if (!EpochNetPublishTo(msg.target, msg.wire)) {
+            break;
+        }
+        g_pa_out_q.pop_front();
+    }
+
+    /* 慢节点长时间不可投递时限制内存；丢的是最早的转发报文，计数可见 */
+    while (g_pa_out_q.size() > 8192) {
+        g_pa_out_q.pop_front();
+        g_pa_out_dropped.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    const int64_t now = PacerMonoUs();
+    if (g_pa_out_q.size() > 1024 && now - last_log_us > 5000000) {
+        last_log_us = now;
+        EPOCH_DBG_FPRINTF("EPOCH_DBG pa_outbox backlog=%zu dropped=%lu\n",
+            g_pa_out_q.size(), static_cast<unsigned long>(g_pa_out_dropped.load()));
         fflush(stderr);
     }
 }
 
-/* 慢节点侧：读入向累计字节（所有非 lo 网卡） */
-static uint64_t EpochPacerPaReadRxBytes(void)
+static void PacerPaEnqueueOut(uint32_t target, std::string* wire)
+{
+    EpochPacerPaOut msg;
+    msg.target = target;
+    msg.wire = std::move(*wire);
+    std::lock_guard<std::mutex> lk(g_pa_out_mu);
+    g_pa_out_q.push_back(std::move(msg));
+}
+
+/* 会话记录的落盘格式；只在状态翻转时写一次。 */
+static constexpr uint32_t EPOCH_PA_STATE_MAGIC = 0x45434150u;   /* "PACE" */
+static constexpr uint32_t EPOCH_PA_STATE_VERSION = 1;
+
+struct EpochPaStateRecord {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t session;
+    uint64_t first_epoch;
+    uint64_t exit_epoch;
+    uint32_t proxy;
+    uint32_t congested;
+    uint64_t checksum;
+};
+
+static uint64_t PacerStateChecksum(const EpochPaStateRecord& rec)
+{
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(&rec);
+    const size_t n = offsetof(EpochPaStateRecord, checksum);
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static const char* PacerDataDir(void)
+{
+    if (t_thrd.proc_cxt.DataDir != nullptr && t_thrd.proc_cxt.DataDir[0] != '\0') {
+        return t_thrd.proc_cxt.DataDir;
+    }
+    return nullptr;
+}
+
+static bool PacerStatePath(char* path, size_t size)
+{
+    const char* dir = PacerDataDir();
+    if (dir == nullptr) {
+        return false;
+    }
+    int rc = snprintf_s(path, size, size - 1, "%s/epoch_pa_session.state", dir);
+    securec_check_ss(rc, "\0", "\0");
+    return true;
+}
+
+static void PacerPaPersist(void)
+{
+    char path[1024];
+    if (!PacerStatePath(path, sizeof(path))) {
+        return;
+    }
+    char tmp[1024];
+    int rc = snprintf_s(tmp, sizeof(tmp), sizeof(tmp) - 1, "%s.tmp", path);
+    securec_check_ss(rc, "\0", "\0");
+
+    EpochPaStateRecord rec;
+    memset_s(&rec, sizeof(rec), 0, sizeof(rec));
+    rec.magic = EPOCH_PA_STATE_MAGIC;
+    rec.version = EPOCH_PA_STATE_VERSION;
+    rec.session = g_pa_session.load(std::memory_order_acquire);
+    rec.first_epoch = g_pa_session_first.load(std::memory_order_acquire);
+    rec.exit_epoch = g_pa_session_exit.load(std::memory_order_acquire);
+    rec.proxy = g_pa_proxy.load(std::memory_order_acquire);
+    rec.congested = g_pa_slow_congested.load(std::memory_order_acquire) ? 1 : 0;
+    rec.checksum = PacerStateChecksum(rec);
+
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        return;
+    }
+    const ssize_t n = write(fd, &rec, sizeof(rec));
+    if (n == static_cast<ssize_t>(sizeof(rec))) {
+        (void)fsync(fd);
+    }
+    close(fd);
+
+    if (rename(tmp, path) != 0) {
+        return;
+    }
+    int dfd = open(PacerDataDir(), O_RDONLY);
+    if (dfd >= 0) {
+        (void)fsync(dfd);
+        close(dfd);
+    }
+}
+
+void EpochPacerPaRestoreState(void)
+{
+    if (!EpochPacerPaEnabled()) {
+        return;
+    }
+    char path[1024];
+    if (!PacerStatePath(path, sizeof(path))) {
+        return;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    EpochPaStateRecord rec;
+    const ssize_t n = read(fd, &rec, sizeof(rec));
+    close(fd);
+    if (n != static_cast<ssize_t>(sizeof(rec))) {
+        return;
+    }
+    if (rec.magic != EPOCH_PA_STATE_MAGIC || rec.version != EPOCH_PA_STATE_VERSION) {
+        return;
+    }
+    if (rec.checksum != PacerStateChecksum(rec)) {
+        return;
+    }
+
+    g_pa_session.store(rec.session, std::memory_order_release);
+    g_pa_session_first.store(rec.first_epoch, std::memory_order_release);
+    g_pa_session_exit.store(rec.exit_epoch, std::memory_order_release);
+    if (rec.proxy < EpochGetTotalNodes() && !PacerSlowListContains(rec.proxy)) {
+        g_pa_proxy.store(rec.proxy, std::memory_order_release);
+    }
+    if (rec.congested != 0) {
+        g_pa_slow_congested.store(true, std::memory_order_release);
+        g_pa_reannounce.store(true, std::memory_order_release);
+    }
+}
+
+/* 可用的 proxy：健康、连通、不是本端。 */
+static bool PacerProxyUsable(uint32_t proxy)
+{
+    return proxy < EpochGetTotalNodes() && proxy != EpochGetNodeId() &&
+           !PacerSlowListContains(proxy) && EpochPeerIsConnected(proxy);
+}
+
+uint32_t EpochPacerPaProxyNodeId(void)
+{
+    const uint32_t proxy = g_pa_proxy.load(std::memory_order_acquire);
+    if (proxy < EpochGetTotalNodes() && !PacerSlowListContains(proxy)) {
+        return proxy;
+    }
+    return PacerFirstHealthyNode();
+}
+
+/* 取已确认进度最大的健康节点，同进度取小 id。只在没有可用 proxy 时调用。 */
+static uint32_t PacerChooseProxy(void)
+{
+    const uint32_t self = EpochGetNodeId();
+    const uint32_t total = EpochGetTotalNodes();
+    uint32_t best = UINT32_MAX;
+    uint64_t best_progress = 0;
+
+    for (uint32_t p = 0; p < total; ++p) {
+        if (p == self || PacerSlowListContains(p) || !EpochPeerIsConnected(p)) {
+            continue;
+        }
+        const uint64_t progress = EpochRecvAckUpto(p);
+        if (best == UINT32_MAX || progress > best_progress ||
+            (progress == best_progress && p < best)) {
+            best = p;
+            best_progress = progress;
+        }
+    }
+    if (best == UINT32_MAX) {
+        best = PacerFirstHealthyNode();
+    }
+    return best;
+}
+
+/*
+ * 一次运行只选一次 proxy：换代理会让同一片出现两个决策源，
+ * 两个发送端可能一个跳过、一个直发，重复投递会被判输。
+ * 只有当前 proxy 不可用时才重选。
+ */
+static uint32_t PacerPinnedProxy(void)
+{
+    uint32_t proxy = g_pa_proxy.load(std::memory_order_acquire);
+    if (PacerProxyUsable(proxy)) {
+        return proxy;
+    }
+    proxy = PacerChooseProxy();
+    g_pa_proxy.store(proxy, std::memory_order_release);
+    return proxy;
+}
+
+static uint64_t PacerReadRxBytes(void)
 {
     FILE* fp = fopen("/proc/net/dev", "r");
     if (fp == nullptr) {
@@ -434,218 +641,370 @@ static uint64_t EpochPacerPaReadRxBytes(void)
     return total;
 }
 
-/* 慢节点侧：采样入向速率，状态翻转时单播给 proxy */
-void EpochPacerPaSlowSideTick(void)
+static bool PacerReceiverPressure(void)
 {
-    const double cap = g_epoch_dyn_net_download_bps;
-    if (cap <= 0) {
-        return;
+    bool congested = false;
+
+    if (g_epoch_dyn_net_download_bps > 0) {
+        static uint64_t last_rx = 0;
+        static int64_t last_us = 0;
+        static bool inited = false;
+
+        const int64_t now = PacerMonoUs();
+        const uint64_t rx = PacerReadRxBytes();
+        if (!inited || last_us == 0 || rx < last_rx) {
+            inited = true;
+            last_us = now;
+            last_rx = rx;
+        } else if (now - last_us >= 100000) {
+            const double bps = static_cast<double>(rx - last_rx) * 8.0 /
+                               (static_cast<double>(now - last_us) / 1000000.0);
+            last_us = now;
+            last_rx = rx;
+
+            int pct = g_epoch_dbr_threshold_pct;
+            if (pct < 1) {
+                pct = 1;
+            } else if (pct > 100) {
+                pct = 100;
+            }
+            congested = (bps >= g_epoch_dyn_net_download_bps *
+                (static_cast<double>(pct) / 100.0));
+        }
     }
 
-    static uint64_t last_rx = 0;
-    static int64_t last_us = 0;
-    static bool inited = false;
-    static bool last_sent = false;
-    static bool last_sent_valid = false;
-
-    const int64_t now = EpochPacerMonoUs();
-    const uint64_t rx = EpochPacerPaReadRxBytes();
-    if (!inited || last_us == 0 || rx < last_rx) {
-        inited = true;
-        last_us = now;
-        last_rx = rx;
-        return;
+    const uint64_t recv_ep = EpochRecvGetEpoch();
+    const uint64_t phys = E_NodeManager::GetPhysicalEpoch();
+    const uint64_t lag_limit = static_cast<uint64_t>(g_epoch_dyn_net_lag_tolerance > 0
+        ? g_epoch_dyn_net_lag_tolerance : 5);
+    if (phys > recv_ep && (phys - recv_ep) >= lag_limit) {
+        congested = true;
     }
-    if (now - last_us < 100000) {          /* 100ms 采样窗口 */
-        return;
+    const uint32_t backlog_limit = static_cast<uint32_t>(g_epoch_dyn_net_queue_tolerance > 0
+        ? g_epoch_dyn_net_queue_tolerance : 20) * 8;
+    if (EpochIncomingQueueSize(recv_ep) >= backlog_limit) {
+        congested = true;
     }
-    const double bps = static_cast<double>(rx - last_rx) * 8.0 /
-                       (static_cast<double>(now - last_us) / 1000000.0);
-    last_us = now;
-    last_rx = rx;
+    return congested;
+}
 
-    int pct = g_epoch_dbr_threshold_pct;
-    if (pct < 1) {
-        pct = 1;
-    } else if (pct > 100) {
-        pct = 100;
-    }
-    const bool congested = (bps >= cap * (static_cast<double>(pct) / 100.0));
-
-    if (last_sent_valid && last_sent == congested) {
-        return;                            /* 状态没变就不发 */
-    }
-    last_sent = congested;
-    last_sent_valid = true;
-
-    const uint32_t proxy = EpochPacerPaProxyNodeId();
-    if (proxy == UINT32_MAX || proxy == EpochGetNodeId()) {
-        return;
-    }
-
+static void PacerPaPublishSession(bool congested, uint32_t proxy, uint64_t first,
+    uint64_t session)
+{
     E_WireTxn ctl;
-    ctl.epoch = 1;                         /* 控制消息，接收端按 csn 识别 */
+    ctl.epoch = first;
     ctl.server_id = EpochGetNodeId();
     ctl.txn_state = EPOCH_TXN_EMPTY;
     ctl.csn = congested ? EPOCH_WIRE_PA_STATE_ON_CSN : EPOCH_WIRE_PA_STATE_OFF_CSN;
+    ctl.route_wid = static_cast<uint16_t>(proxy);
+    ctl.origin_start_us = session;
+    ctl.claim_only = false;
     ctl.rows.clear();
 
     std::string wire;
     if (E_WireSerializeTxn(ctl, &wire)) {
-        /*
-     * 广播给所有对端：不只 proxy，其它快节点也要知道，
-     * 否则它们会继续直发给慢节点，造成重复投递。
-     */
-    (void)EpochNetPublish(wire);
-        if (!g_pa_logged.exchange(true)) {
-            ereport(LOG, (errmsg("epoch pacer: PA slow-side reports to node %u", proxy)));
-        }
+        (void)PacerPublishToHealthy(wire);
     }
 }
 
-static bool EpochPacerPaEpochSkipped(uint64_t epoch);
-
-/* 非代理节点：代理广播的每片决策（epoch<<8 | flag，0 表示未知） */
-static std::atomic<uint64_t> g_pa_peer_decision[EPOCH_TXN_EPOCH_COUNT];
-
-void EpochPacerPaNoteEpochDecision(uint64_t epoch, bool skip)
+static void PacerPaSlowSideTick(void)
 {
-    if (epoch == 0) {
+    static bool last_sent = false;
+    static bool last_sent_valid = false;
+    static bool proxy_announced = false;
+    static int64_t last_publish_us = 0;
+
+    if (!last_sent_valid) {
+        last_sent = g_pa_slow_congested.load(std::memory_order_acquire);
+        last_sent_valid = true;
+    }
+
+    const uint64_t recv_ep = EpochRecvGetEpoch();
+    uint64_t first = recv_ep == 0 ? 1 : recv_ep;
+
+    /* 先让所有节点对 proxy 达成一致，再谈会话 */
+    if (!proxy_announced) {
+        proxy_announced = true;
+        const uint32_t pinned = PacerPinnedProxy();
+        if (pinned != UINT32_MAX && pinned != EpochGetNodeId()) {
+            PacerPaPublishSession(false, pinned, first, 0);
+        }
+    }
+
+    if (g_pa_reannounce.exchange(false, std::memory_order_acq_rel)) {
+        const uint64_t session = (static_cast<uint64_t>(EpochGetNodeId() + 1) << 56) |
+            (static_cast<uint64_t>(PacerMonoUs()) & 0x00ffffffffffffffULL);
+        g_pa_session.store(session, std::memory_order_release);
+        g_pa_session_first.store(first, std::memory_order_release);
+        g_pa_session_exit.store(0, std::memory_order_release);
+        g_pa_slow_congested.store(true, std::memory_order_release);
+        PacerPaPersist();
+        PacerPaPublishSession(true, PacerPinnedProxy(), first, session);
+        last_publish_us = PacerMonoUs();
+        last_sent = true;
         return;
     }
-    const uint64_t v = (epoch << 8) | (skip ? EPOCH_PA_SKIP : EPOCH_PA_DIRECT);
-    g_pa_peer_decision[EpochSlotOf(epoch)].store(v, std::memory_order_release);
-}
 
-/* 代理决定完一片后，广播给其它快节点（每片一次） */
-static void EpochPacerPaBroadcastDecision(uint64_t epoch, bool skip)
-{
-    E_WireTxn ctl;
-    ctl.epoch = epoch;
-    ctl.server_id = EpochGetNodeId();
-    ctl.txn_state = EPOCH_TXN_EMPTY;
-    ctl.csn = skip ? EPOCH_WIRE_PA_EPOCH_SKIP_CSN : EPOCH_WIRE_PA_EPOCH_DIRECT_CSN;
-    ctl.rows.clear();
-
-    std::string wire;
-    if (E_WireSerializeTxn(ctl, &wire)) {
-        (void)EpochNetPublish(wire);
+    const bool congested = PacerReceiverPressure();
+    if (congested == last_sent) {
+        /* 会话进行中定期重播，防止控制消息丢失后对端一直等 */
+        if (congested && PacerMonoUs() - last_publish_us >= 500000) {
+            PacerPaPublishSession(true, PacerPinnedProxy(), first,
+                g_pa_session.load(std::memory_order_acquire));
+            last_publish_us = PacerMonoUs();
+        }
+        return;
     }
+    last_sent = congested;
+
+    if (!congested && g_pa_session.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+
+    const uint32_t proxy = PacerPinnedProxy();
+    if (proxy == UINT32_MAX || proxy == EpochGetNodeId()) {
+        return;
+    }
+    g_pa_slow_congested.store(congested, std::memory_order_release);
+
+    uint64_t session = g_pa_session.load(std::memory_order_acquire);
+    if (congested || session == 0) {
+        session = (static_cast<uint64_t>(EpochGetNodeId() + 1) << 56) |
+            (static_cast<uint64_t>(PacerMonoUs()) & 0x00ffffffffffffffULL);
+        g_pa_session.store(session, std::memory_order_release);
+        g_pa_session_first.store(first, std::memory_order_release);
+        g_pa_session_exit.store(0, std::memory_order_release);
+    } else {
+        g_pa_session_exit.store(E_NodeManager::GetPhysicalEpoch() + 1,
+            std::memory_order_release);
+    }
+
+    /* 先落盘再广播 */
+    PacerPaPersist();
+    PacerPaPublishSession(congested, proxy, first, session);
+    last_publish_us = PacerMonoUs();
 }
 
-/* proxy 发送端：这一片要不要跳过慢节点（首次遇到该片时按当时状态定） */
-bool EpochPacerPaShouldSkipPeer(uint32_t peer, uint64_t epoch)
+void EpochPacerPaNoteSlowState(const E_WireTxn& ctl)
 {
     if (!EpochPacerPaEnabled()) {
-        return false;
+        return;
     }
-    if (peer != EpochPacerPaSlowNodeId()) {
-        return false;
-    }
-
-    /* 代理：本地拍板，并广播给其它快节点 */
-    if (EpochGetNodeId() == EpochPacerPaProxyNodeId()) {
-        const bool skip = EpochPacerPaEpochSkipped(epoch);
-        static std::atomic<uint64_t> broadcast_done[EPOCH_TXN_EPOCH_COUNT];
-        std::atomic<uint64_t>& mark = broadcast_done[EpochSlotOf(epoch)];
-        uint64_t cur = mark.load(std::memory_order_acquire);
-        if ((cur >> 8) != epoch &&
-            mark.compare_exchange_strong(cur, (epoch << 8) | 1, std::memory_order_acq_rel)) {
-            EpochPacerPaBroadcastDecision(epoch, skip);
-        }
-        return skip;
+    const bool congested = (ctl.csn == EPOCH_WIRE_PA_STATE_ON_CSN);
+    const uint64_t first = ctl.epoch;
+    const uint32_t proxy = ctl.route_wid;
+    if (first == 0) {
+        return;
     }
 
-    /*
-     * 其它快节点：无条件等代理对这片给出决策。
-     * 代理在"第一次碰到该片"时就会广播，而代理的发送线程不依赖本节点，
-     * 所以这里一定会被唤醒；不设超时是为了保证结论完全一致
-     * （超时兜底会引入"一片之内两个节点结论不同"的窗口）。
-     */
-    std::atomic<uint64_t>& slot = g_pa_peer_decision[EpochSlotOf(epoch)];
-    for (;;) {
-        const uint64_t cur = slot.load(std::memory_order_acquire);
-        if ((cur >> 8) == epoch) {
-            return ((cur & 0xFF) == EPOCH_PA_SKIP);
-        }
-        CHECK_FOR_INTERRUPTS();
-        pg_usleep(200);
+    const uint64_t known_first = g_pa_session_first.load(std::memory_order_acquire);
+    if (known_first != 0 && first + 1 < known_first) {
+        return;
     }
+    if (proxy < EpochGetTotalNodes() && !PacerSlowListContains(proxy)) {
+        g_pa_proxy.store(proxy, std::memory_order_release);
+    }
+
+    if (congested) {
+        if (first != known_first) {
+            g_pa_session_first.store(first, std::memory_order_release);
+            g_pa_session.store(ctl.origin_start_us, std::memory_order_release);
+        }
+        g_pa_session_exit.store(0, std::memory_order_release);
+    } else {
+        g_pa_session_exit.store(E_NodeManager::GetPhysicalEpoch() + 1,
+            std::memory_order_release);
+    }
+    g_pa_slow_congested.store(congested, std::memory_order_release);
 }
 
-/*
- * 该片是否"跳过慢节点"。
- *
- * 未决定时按当前拥塞状态就地决定（CAS），这样发送线程与 merge 线程
- * 无论谁先到达，都会得到同一结论——否则 merge 若跑在 send 前面，
- * 会误判为"没跳过"而不缓存赢家，慢节点就永远收不齐这一片。
- */
-static bool EpochPacerPaEpochSkipped(uint64_t epoch)
+static bool PacerPaEpochInSession(uint64_t epoch)
+{
+    if (!g_pa_slow_congested.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const uint64_t first = g_pa_session_first.load(std::memory_order_acquire);
+    if (first == 0 || epoch < first) {
+        return false;
+    }
+    const uint64_t exit_epoch = g_pa_session_exit.load(std::memory_order_acquire);
+    return exit_epoch == 0 || epoch < exit_epoch;
+}
+
+static bool PacerPaEpochSkipped(uint64_t epoch)
 {
     std::atomic<uint64_t>& slot = g_pa_epoch_mode[EpochSlotOf(epoch)];
     uint64_t cur = slot.load(std::memory_order_acquire);
     if ((cur >> 8) == epoch) {
         return ((cur & 0xFF) == EPOCH_PA_SKIP);
     }
-
-    const bool congested = g_pa_slow_congested.load(std::memory_order_relaxed);
-    const uint64_t want = (epoch << 8) | (congested ? EPOCH_PA_SKIP : EPOCH_PA_DIRECT);
+    const bool skip = PacerPaEpochInSession(epoch);
+    const uint64_t want = (epoch << 8) | (skip ? EPOCH_PA_SKIP : EPOCH_PA_DIRECT);
     if (slot.compare_exchange_strong(cur, want, std::memory_order_acq_rel)) {
-        return congested;
+        return skip;
     }
     return ((cur >> 8) == epoch) && ((cur & 0xFF) == EPOCH_PA_SKIP);
 }
 
-/* proxy merge 侧：每合并完一笔，若是"被跳过片"的赢家就缓存 */
+static bool PacerPaBroadcastDecision(uint64_t epoch, bool skip)
+{
+    E_WireTxn ctl;
+    ctl.epoch = epoch;
+    ctl.server_id = EpochGetNodeId();
+    ctl.txn_state = EPOCH_TXN_EMPTY;
+    ctl.csn = skip ? EPOCH_WIRE_PA_EPOCH_SKIP_CSN : EPOCH_WIRE_PA_EPOCH_DIRECT_CSN;
+    ctl.claim_only = false;
+    ctl.rows.clear();
+
+    std::string wire;
+    if (!E_WireSerializeTxn(ctl, &wire)) {
+        return false;
+    }
+    return PacerPublishToHealthy(wire);
+}
+
+static bool PacerPaProxyDecide(uint64_t epoch)
+{
+    const bool skip = PacerPaEpochSkipped(epoch);
+    static std::atomic<uint64_t> broadcast_done[EPOCH_TXN_EPOCH_COUNT];
+    std::atomic<uint64_t>& mark = broadcast_done[EpochSlotOf(epoch)];
+    uint64_t cur = mark.load(std::memory_order_acquire);
+    if ((cur >> 8) != epoch &&
+        mark.compare_exchange_strong(cur, (epoch << 8) | 1, std::memory_order_acq_rel)) {
+        if (!PacerPaBroadcastDecision(epoch, skip)) {
+            mark.store(0, std::memory_order_release);   /* 发送失败，允许重试 */
+        }
+    }
+    return skip;
+}
+
+void EpochPacerPaNoteEpochDecision(uint64_t epoch, bool skip, uint32_t from_node)
+{
+    if (epoch == 0 || from_node != EpochPacerPaProxyNodeId()) {
+        return;
+    }
+    const uint64_t v = (epoch << 8) | (skip ? EPOCH_PA_SKIP : EPOCH_PA_DIRECT);
+    g_pa_peer_decision[EpochSlotOf(epoch)].store(v, std::memory_order_release);
+}
+
+static std::atomic<uint64_t> g_pa_decide_req[EPOCH_TXN_EPOCH_COUNT];
+static std::atomic<uint32_t> g_pa_decide_pending{0};
+
+void EpochPacerPaNoteDecideRequest(uint64_t epoch)
+{
+    if (!EpochPacerPaEnabled() || epoch == 0) {
+        return;
+    }
+    if (EpochGetNodeId() != EpochPacerPaProxyNodeId()) {
+        return;
+    }
+    const uint64_t v = (epoch << 8) | 1;
+    if (g_pa_decide_req[EpochSlotOf(epoch)].exchange(v, std::memory_order_acq_rel) != v) {
+        g_pa_decide_pending.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+static void PacerPaServeDecideRequests(void)
+{
+    if (g_pa_decide_pending.load(std::memory_order_relaxed) == 0) {
+        return;
+    }
+    if (EpochGetNodeId() != EpochPacerPaProxyNodeId()) {
+        return;
+    }
+    for (uint32_t slot = 0; slot < EPOCH_TXN_EPOCH_COUNT; ++slot) {
+        const uint64_t v = g_pa_decide_req[slot].exchange(0, std::memory_order_acq_rel);
+        const uint64_t epoch = v >> 8;
+        if (epoch == 0) {
+            continue;
+        }
+        g_pa_decide_pending.fetch_sub(1, std::memory_order_relaxed);
+        (void)PacerPaProxyDecide(epoch);
+    }
+    /* 覆盖写可能让计数偏大；调用方每 5ms 会重发请求，归零即可自愈 */
+    g_pa_decide_pending.store(0, std::memory_order_relaxed);
+}
+
+static void PacerPaPublishDecideRequest(uint64_t epoch)
+{
+    E_WireTxn ctl;
+    ctl.epoch = epoch;
+    ctl.server_id = EpochGetNodeId();
+    ctl.txn_state = EPOCH_TXN_EMPTY;
+    ctl.csn = EPOCH_WIRE_PA_DECIDE_REQ_CSN;
+    ctl.claim_only = false;
+    ctl.rows.clear();
+
+    std::string wire;
+    if (E_WireSerializeTxn(ctl, &wire)) {
+        (void)PacerPublishToHealthy(wire);
+    }
+}
+
+bool EpochPacerPaShouldSkipPeer(uint32_t peer, uint64_t epoch)
+{
+    if (!EpochPacerPaEnabled() || peer != PacerSlowNodeId()) {
+        return false;
+    }
+    if (EpochGetNodeId() == EpochPacerPaProxyNodeId()) {
+        return PacerPaProxyDecide(epoch);
+    }
+
+    std::atomic<uint64_t>& slot = g_pa_peer_decision[EpochSlotOf(epoch)];
+    int spins = 0;
+    for (;;) {
+        const uint64_t cur = slot.load(std::memory_order_acquire);
+        if ((cur >> 8) == epoch) {
+            return ((cur & 0xFF) == EPOCH_PA_SKIP);
+        }
+        if ((++spins % 25) == 0) {
+            PacerPaPublishDecideRequest(epoch);
+        }
+        CHECK_FOR_INTERRUPTS();
+        pg_usleep(200);
+    }
+}
+
 void EpochPacerPaMaybeBufferMerged(const E_WireTxn& txn)
 {
     if (!EpochPacerPaEnabled() || EpochGetNodeId() != EpochPacerPaProxyNodeId()) {
         return;
     }
-    if (txn.epoch == 0 || !EpochPacerPaEpochSkipped(txn.epoch)) {
+    if (txn.epoch == 0 || txn.claim_only || E_WireTxnIsEpochEnd(txn)) {
         return;
     }
-    /* 收尾包不缓存：由 Resend 统一补 */
-    if (E_WireTxnIsEpochEnd(txn)) {
+    if (txn.server_id == PacerSlowNodeId() || !PacerPaEpochSkipped(txn.epoch)) {
         return;
     }
-
-    /*
-     * 慢节点自己的事务它本来就有（自环入队），再转发回去会变成重复投递：
-     * 第二份同 csn 同 server_id 在合并时必然判输，白白抬高 abort。
-     */
-    if (txn.server_id == EpochPacerPaSlowNodeId()) {
+    bool writable = false;
+    for (const E_WireRow& row : txn.rows) {
+        if (row.op_type != EPOCH_OP_READ) {
+            writable = true;
+            break;
+        }
+    }
+    if (!writable) {
         return;
     }
 
     EpochPacerPaPending item;
-    item.csn = txn.csn;
-    item.server_id = txn.server_id;
-    if (!E_WireSerializeTxn(txn, &item.wire)) {
-        return;
-    }
+    item.txn = txn;
     g_pa_fwd[EpochSlotOf(txn.epoch)].enqueue(std::move(item));
 }
 
-/* proxy merge 侧：该片 merge 完成时，把缓存的赢家 + EOF 一次性发给慢节点 */
 void EpochPacerPaResendEpoch(uint64_t epoch)
 {
     if (!EpochPacerPaEnabled() || EpochGetNodeId() != EpochPacerPaProxyNodeId()) {
         return;
     }
-    if (!EpochPacerPaEpochSkipped(epoch)) {
+    if (!PacerPaEpochSkipped(epoch)) {
         return;
     }
-
-    const uint32_t slow = EpochPacerPaSlowNodeId();
+    const uint32_t slow = PacerSlowNodeId();
     if (slow == UINT32_MAX || slow == EpochGetNodeId()) {
         return;
     }
 
-    /*
-     * 到这一刻该片的 merge 已全部完成（merge 游标刚推进），
-     * abort 集合才完整，可以准确判断哪些事务真正输了。
-     */
     std::vector<EpochPacerPaPending> items;
     EpochPacerPaPending item;
     auto& q = g_pa_fwd[EpochSlotOf(epoch)];
@@ -653,44 +1012,61 @@ void EpochPacerPaResendEpoch(uint64_t epoch)
         items.push_back(std::move(item));
     }
 
-    uint32_t forwarded = 0;
-    uint32_t skipped = 0;
+    uint32_t candidates = 0;
+    uint32_t shadows = 0;
     for (const EpochPacerPaPending& it : items) {
-        if (EpochAbortCsnContains(epoch, it.csn, it.server_id)) {
-            ++skipped;                     /* 判输：不转发 */
-            continue;
+        const E_WireTxn& txn = it.txn;
+        E_WireTxn out = txn;
+        if (EpochAbortCsnContains(epoch, txn.csn, txn.server_id)) {
+            out.claim_only = true;
+            for (E_WireRow& row : out.rows) {
+                row.tuple_data.clear();
+            }
+            ++shadows;
+        } else {
+            ++candidates;
         }
-        (void)EpochNetPublishTo(slow, it.wire);
-        ++forwarded;
+
+        std::string wire;
+        if (E_WireSerializeTxn(out, &wire)) {
+            PacerPaEnqueueOut(slow, &wire);
+        }
     }
 
-    /*
-     * 补 EOF：除了本端，还要替"被抑制的其它快节点"各补一个（server_id 用它们的 id）。
-     *
-     * 慢节点要求每个节点都有 EOF 才会推进 recv；被跳过的片上 node2 一条数据都没发，
-     * 它的 declared 自然是 0，所以由代理代发一个同身份的 EOF 即可。
-     * 顺序：先转发数据，再发这些 EOF（同一连接内有序）。
-     */
+    /* 被抑制源在本片一条消息都没有，EOF 由代理补发。 */
     const uint32_t total = EpochGetTotalNodes();
-    std::string eof_payload;
     for (uint32_t p = 0; p < total; ++p) {
         if (p == slow) {
             continue;
         }
         E_WireTxn eof_wire;
         eof_wire.epoch = epoch;
-        eof_wire.server_id = p;                 /* 以被代发节点的身份 */
+        eof_wire.server_id = p;
         eof_wire.txn_state = EPOCH_TXN_EMPTY;
         eof_wire.csn = 0;
+        eof_wire.claim_only = false;
         eof_wire.rows.clear();
 
-        eof_payload.clear();
-        if (E_WireSerializeTxn(eof_wire, &eof_payload)) {
-            (void)EpochNetPublishTo(slow, eof_payload);
+        std::string payload;
+        if (E_WireSerializeTxn(eof_wire, &payload)) {
+            PacerPaEnqueueOut(slow, &payload);
         }
     }
 
-    EPOCH_DBG_FPRINTF("EPOCH_DBG pa_resend epoch=%lu forwarded=%u skipped=%u to_node=%u\n",
-        static_cast<unsigned long>(epoch), forwarded, skipped, slow);
+    EPOCH_DBG_FPRINTF("EPOCH_DBG pa_resend epoch=%lu candidates=%u shadows=%u to_node=%u\n",
+        static_cast<unsigned long>(epoch), candidates, shadows, slow);
     fflush(stderr);
+}
+
+void EpochPacerPackTick(void)
+{
+    PacerSampleEpochInterval();
+    if (!EpochPacerPaEnabled()) {
+        return;
+    }
+    PacerPaServeDecideRequests();
+    PacerPaDrainOutbox();
+    if (EpochPacerIsSlowSelf()) {
+        PacerPaSlowSideTick();
+    }
 }

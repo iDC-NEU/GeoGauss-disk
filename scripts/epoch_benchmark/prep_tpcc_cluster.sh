@@ -30,8 +30,8 @@ usage: $(basename "$0") [OPTION]
                 （不跑 TPCC；压测请自行 runBenchmark.sh）
   --deploy-only 仅 rsync 二进制到远程节点
 
-  env.sh 里改（wait/dbr/pa/het 共用）。configure_node.sh 写库参数时会按这些值执行 tc：
-    EPOCH_PROFILE=${EPOCH_PROFILE}          # wait | dbr | pa | het
+  env.sh 里改（wait/dbr/pa/pacer 共用）。configure_node.sh 写库参数时会按这些值执行 tc：
+    EPOCH_PROFILE=${EPOCH_PROFILE}          # wait | dbr | pa | pacer
     EPOCH_DYN_NET_SLOW_NODES=${EPOCH_DYN_NET_SLOW_NODES:-}  # 慢节点，0=node1 1=node2
     EPOCH_NETWORK_RTT_MS=${EPOCH_NETWORK_RTT_MS:-}         # ping 应看到的往返延迟
     EPOCH_DYN_NET_BW_MODE=${EPOCH_DYN_NET_BW_MODE:-}       # uplimit|downlimit|bilimit|unlimit

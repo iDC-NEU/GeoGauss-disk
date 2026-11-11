@@ -74,7 +74,8 @@ struct EpochCrdtRow {
     uint16_t ip_posid;                /* ctid 行号 */
     uint16_t pk_len;
     uint8_t merged_ok;                /* merge 是否判定该版本为赢家 */
-    uint8_t pad;
+    /* 1 = PA 影子声明：参与冲突裁决，但不带行数据、不进入 apply */
+    uint8_t claim_only;
     uint32_t server_id;               /* 谁写的 */
     uint64_t csn;                     /* 所属事务的 csn（裁决依据 & 统计去重键） */
     uint64_t cen;                     /* CRDT 版本（冲突比较用） */

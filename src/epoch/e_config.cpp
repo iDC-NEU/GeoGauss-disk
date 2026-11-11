@@ -74,7 +74,7 @@ int g_epoch_dyn_net_queue_tolerance = 20;
 int g_epoch_dyn_net_catchup_k = 3;
 int g_epoch_dyn_net_rtt_ms = 200;
 int g_epoch_dbr_threshold_pct = 95;
-char* g_epoch_dbr_mode = NULL;
+/* DBR：每个片最多直发的写集条数，其余整笔改期 */
 int g_epoch_dbr_admit_per_epoch = 8;
 char* g_epoch_dyn_net_slow_nodes = NULL;
 double g_epoch_dyn_net_upload_bps = 0;
@@ -588,7 +588,7 @@ void EpochRegisterGucs(void)
                              NULL);
 
     DefineCustomBoolVariable("epoch_dyn_net_proxy",
-                             "Enable Pacer PA: slow node selects a proxy; healthy nodes route its copy there.",
+                             "Enable Pacer PA: a proxy suppresses direct delivery and forwards candidates/shadows after merge.",
                              NULL,
                              &g_epoch_dyn_net_proxy,
                              false,
@@ -599,7 +599,7 @@ void EpochRegisterGucs(void)
                              NULL);
 
     DefineCustomIntVariable("epoch_dyn_net_lag_tolerance",
-                            "CATCHUP trigger: projected_max - local_epoch threshold.",
+                            "PA receiver pressure: recv cursor lagging physical by this many epochs.",
                             NULL,
                             &g_epoch_dyn_net_lag_tolerance,
                             5,
@@ -612,7 +612,7 @@ void EpochRegisterGucs(void)
                             NULL);
 
     DefineCustomIntVariable("epoch_dyn_net_queue_tolerance",
-                            "CATCHUP trigger: outgoing queue size threshold.",
+                            "Backlog threshold: outgoing queue entries (DBR) or receive queue items (PA).",
                             NULL,
                             &g_epoch_dyn_net_queue_tolerance,
                             20,
@@ -625,7 +625,7 @@ void EpochRegisterGucs(void)
                             NULL);
 
     DefineCustomIntVariable("epoch_dyn_net_catchup_k",
-                            "Extra epoch slots to jump ahead on CATCHUP.",
+                            "Scheduling headroom K in the DBR target-epoch formula.",
                             NULL,
                             &g_epoch_dyn_net_catchup_k,
                             3,
@@ -651,7 +651,7 @@ void EpochRegisterGucs(void)
                             NULL);
 
     DefineCustomIntVariable("epoch_dyn_net_rtt_ms",
-                            "Estimated RTT (ms) for epoch observer compensation.",
+                            "RTT (ms) used by the DBR target-epoch formula.",
                             NULL,
                             &g_epoch_dyn_net_rtt_ms,
                             200,
@@ -662,15 +662,6 @@ void EpochRegisterGucs(void)
                             NULL,
                             NULL,
                             NULL);
-
-    DefineCustomStringVariable("epoch_dbr_mode",
-                               "DBR 拥塞时：drop=丢弃写集（省带宽）| defer=延后到后续片（保数据）",
-                               NULL,
-                               &g_epoch_dbr_mode,
-                               "drop",
-                               PGC_SIGHUP,
-                               0,
-                               NULL, NULL, NULL),
 
     DefineCustomIntVariable("epoch_dbr_threshold_pct",
                             "DBR: 上行速率达到配置带宽的百分比阈值时判为拥塞（1~100）",

@@ -207,10 +207,11 @@ static void EpochListenLoop(void)
             continue;
         }
         {
-            /* PA 控制消息：慢节点广播下行拥塞状态，就地处理、不入接收队列 */
+            /* PA 控制消息：慢节点广播会话状态（session / e_f / proxy），就地处理、不入接收队列 */
             bool congested = false;
             if (E_WireTxnIsPaState(probe, &congested)) {
-                EpochPacerPaNoteSlowState(congested);
+                (void)congested;
+                EpochPacerPaNoteSlowState(probe);
                 continue;
             }
             /* EOF 确认：对端告诉我"它连续收到我的 EOF 到第几片" */
@@ -218,10 +219,15 @@ static void EpochListenLoop(void)
                 EpochNetNoteEofAck(static_cast<uint32_t>(from_node), probe.epoch);
                 continue;
             }
-            /* PA 控制消息：代理广播"某一片是否跳过慢节点" */
+            /* PA：代理对本片的路由结论 */
             bool skip = false;
             if (E_WireTxnIsPaEpochDecision(probe, &skip)) {
-                EpochPacerPaNoteEpochDecision(probe.epoch, skip);
+                EpochPacerPaNoteEpochDecision(probe.epoch, skip, static_cast<uint32_t>(from_node));
+                continue;
+            }
+            /* PA 控制消息：其它发送端催代理对该片立即给结论 */
+            if (E_WireTxnIsPaDecideRequest(probe)) {
+                EpochPacerPaNoteDecideRequest(probe.epoch);
                 continue;
             }
             const uint32_t enq_slot = EpochSlotOf(probe.epoch);

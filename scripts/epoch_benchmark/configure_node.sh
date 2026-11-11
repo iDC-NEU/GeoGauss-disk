@@ -13,7 +13,7 @@ fi
 
 validate_node_id "${NODE_ID}"
 
-# wait/dbr/pa/het：按 env.sh 的 RTT、带宽、慢节点用 tc 写网卡。其它 profile 清掉规则。
+# wait/dbr/pa/pacer：按 env.sh 的 RTT、带宽、慢节点用 tc 写网卡。其它 profile 清掉规则。
 # 只在发起配置的机器上做一次；SSH 到远端改 postgresql.conf 时不再套一层。
 epoch_apply_netem_from_profile() {
     if [ -n "${EPOCH_CONFIGURE_REMOTE:-}" ]; then
@@ -24,7 +24,7 @@ epoch_apply_netem_from_profile() {
         profile=wait
     fi
     case "${profile}" in
-        wait|dbr|pa|het)
+        wait|dbr|pa|pacer)
             echo "=== tc netem from profile=${profile} rtt=${EPOCH_NETWORK_RTT_MS:-100}ms bw=${EPOCH_DYN_NET_BW_MODE:-uplimit} ${EPOCH_DYN_NET_BW_MBPS:-100}Mbps slow=${EPOCH_DYN_NET_SLOW_NODES:-} ==="
             bash "${SCRIPT_DIR}/apply_netem.sh" add
             ;;
@@ -142,6 +142,7 @@ for stale in \
     epoch_apply_shard_only \
     epoch_shard_warehouse_lo \
     epoch_shard_warehouse_hi \
+    epoch_dbr_mode \
     default_storage_nodegroup \
     expected_computing_nodegroup; do
     remove_stale_conf "${stale}"
@@ -153,12 +154,12 @@ done
 #   stats                — gap=5, perf+diag+occ_stats, start_gate=on, synchronous_commit=on
 #   stats-async-commit   — 同 stats，synchronous_commit=off（apply commit 不做 XLogWaitFlush，验证 WAL 瓶颈）
 #   wait                 — 原 stats-nogate：start_gate=off, gap=5, physical_txns_per_epoch=50, sync_commit=off
-#   dbr / pa / het       — 与 wait 相同，分别打开 DBR、PA、两者
+#   dbr / pa / pacer       — 与 wait 相同，分别打开 DBR、PA、两者
 #   四个 profile 的慢节点、RTT、带宽由 apply_netem.sh 用 tc 施加（ping 可见）
 #   single-node-baseline — epoch_total_nodes=1、无 peer_hosts，start_gate=on；仅 node1 压测对比用
 # 可选覆盖：EPOCH_PHYS_LOGICAL_GAP_LIMIT, EPOCH_PHYSICAL_TXNS_PER_EPOCH, EPOCH_SYNC_START_GATE
 # GeoGauss 模块开关（默认 off）：
-#   EPOCH_ENABLE_GEOGAUSS_OPT=on  — 打开 dynamic-net（dbr/pa/het 的实验基础）
+#   EPOCH_ENABLE_GEOGAUSS_OPT=on  — 打开 dynamic-net（独立的异构网络路径，默认 off，与 Pacer 无关）
 #   EPOCH_ENABLE_OCC_STAGING=on   — 单独打开 occ staging（版本延迟写回），默认 off。
 #                                   Phase 1 的本地 tip staging 已由 g_epoch_local_tip_staging
 #                                   承担，二者不叠加；geogauss_opt 不再联动打开。
@@ -277,7 +278,7 @@ case "${EPOCH_PROFILE}" in
         merge_threads_val="5"
         synchronous_commit_val="off"
         ;;
-    wait|dbr|pa|het)
+    wait|dbr|pa|pacer)
         set_conf occ_enable_stats_log "on"
         set_conf epoch_recv_diag "on"
         set_conf epoch_recv_diag_verbose "off"
@@ -304,7 +305,7 @@ case "${EPOCH_PROFILE}" in
                 epoch_dyn_net_catchup_val="off"
                 epoch_dyn_net_proxy_val="on"
                 ;;
-            het)
+            pacer)
                 epoch_dyn_net_catchup_val="on"
                 epoch_dyn_net_proxy_val="on"
                 ;;
@@ -341,7 +342,7 @@ case "${EPOCH_PROFILE}" in
 esac
 
 case "${EPOCH_PROFILE}" in
-    wait|dbr|pa|het)
+    wait|dbr|pa|pacer)
         # RTT / 带宽由 apply_netem.sh 用 tc 施加。这里只把 RTT 写给 DBR 的目标 epoch 公式。
         if ! [[ "${EPOCH_NETWORK_RTT_MS:-100}" =~ ^[0-9]+$ ]]; then
             echo "ERROR: EPOCH_NETWORK_RTT_MS must be an integer, got: ${EPOCH_NETWORK_RTT_MS}" >&2
@@ -405,7 +406,7 @@ fi
 recv_diag_verbose_val="off"
 lifecycle_log_val="off"
 case "${EPOCH_PROFILE}" in
-    stats|stats-async-commit|wait|dbr|pa|het)
+    stats|stats-async-commit|wait|dbr|pa|pacer)
         recv_diag_verbose_val="off"
         lifecycle_log_val="on"
         ;;
@@ -417,7 +418,7 @@ if [ -n "${EPOCH_LIFECYCLE_LOG:-}" ]; then
     lifecycle_log_val="${EPOCH_LIFECYCLE_LOG}"
 fi
 case "${EPOCH_PROFILE}" in
-    stats|stats-async-commit|wait|dbr|pa|het)
+    stats|stats-async-commit|wait|dbr|pa|pacer)
         set_conf epoch_recv_diag_verbose "${recv_diag_verbose_val}"
         set_conf epoch_lifecycle_log "${lifecycle_log_val}"
         ;;
@@ -523,7 +524,7 @@ case "${EPOCH_PROFILE}" in
         verify_conf epoch_lifecycle_log "${lifecycle_log_val}"
         verify_conf epoch_apply_profile "on"
         ;;
-    wait|dbr|pa|het)
+    wait|dbr|pa|pacer)
         echo "epoch: ${EPOCH_PROFILE} — start_gate=off sync_commit=off gap=${gap_limit_val} physical_txns=${physical_txns_per_epoch_val} catchup=${epoch_dyn_net_catchup_val} proxy=${epoch_dyn_net_proxy_val}"
         echo "epoch: tc RTT=${EPOCH_NETWORK_RTT_MS:-100}ms bw=${EPOCH_DYN_NET_BW_MODE:-uplimit} ${EPOCH_DYN_NET_BW_MBPS:-100}Mbps slow=${epoch_dyn_net_slow_nodes_val}（apply_netem.sh，ping 可核对）"
         verify_conf epoch_recv_diag "on"
