@@ -40,3 +40,6 @@ Pacer__Straggler_Tolerant_Replication_for_Epoch_Based_Geo_Distributed_OLTP_Datab
 dbr_pa_stat.txt
 pacer_text.txt
 pacer2_text.txt
+
+# 设计文档与本地说明（仅保留在本地，不进入公开镜像）
+/docs/
