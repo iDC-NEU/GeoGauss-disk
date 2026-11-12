@@ -40,7 +40,7 @@ static void EpochClearPublishedReadFrontier(void)
 
 void EpochPinReadFrontierOnStart(void)
 {
-    if (!g_enable_epoch_multimaster || EpochGetTotalNodes() <= 1 || g_epoch_sync_start_gate) {
+    if (!g_enable_epoch_multimaster || EpochGetTotalNodes() <= 1) {
         u_sess->epoch_cxt.read_frontier_pinned = false;
         u_sess->epoch_cxt.read_frontier = 0;
         EpochClearPublishedReadFrontier();
@@ -60,7 +60,7 @@ void EpochResetReadFrontier(void)
 
 bool EpochReadFrontierActive(void)
 {
-    return g_enable_epoch_multimaster && EpochGetTotalNodes() > 1 && !g_epoch_sync_start_gate &&
+    return g_enable_epoch_multimaster && EpochGetTotalNodes() > 1 &&
            u_sess->epoch_cxt.read_frontier_pinned;
 }
 

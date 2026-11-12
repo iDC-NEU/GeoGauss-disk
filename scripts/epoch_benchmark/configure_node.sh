@@ -20,9 +20,6 @@ epoch_apply_netem_from_profile() {
         return 0
     fi
     local profile="${EPOCH_PROFILE:-wait}"
-    if [ "${profile}" = "stats-nogate" ]; then
-        profile=wait
-    fi
     case "${profile}" in
         wait|dbr|pa|pacer)
             echo "=== tc netem from profile=${profile} rtt=${EPOCH_NETWORK_RTT_MS:-100}ms bw=${EPOCH_DYN_NET_BW_MODE:-uplimit} ${EPOCH_DYN_NET_BW_MBPS:-100}Mbps slow=${EPOCH_DYN_NET_SLOW_NODES:-} ==="
@@ -41,17 +38,17 @@ if ! epoch_is_local_node "${NODE_ID}"; then
     RB="$(epoch_bench_root_for_node "${NODE_ID}")"
     ssh -o BatchMode=yes -o ConnectTimeout=10 "${REMOTE}" \
         "export EPOCH_LOCAL_NODE_ID=${NODE_ID}; export EPOCH_BENCH_ROOT=${RB}; \
-        export EPOCH_PROFILE=${EPOCH_PROFILE:-benchmark}; \
+        export EPOCH_PROFILE=${EPOCH_PROFILE:-wait}; \
         export EPOCH_DYN_NET_SLOW_NODES=${EPOCH_DYN_NET_SLOW_NODES:-}; \
         export EPOCH_NETWORK_RTT_MS=${EPOCH_NETWORK_RTT_MS:-}; \
+        export EPOCH_RTT_HEALTHY_MS=${EPOCH_RTT_HEALTHY_MS:-}; \
         export EPOCH_DYN_NET_BW_MODE=${EPOCH_DYN_NET_BW_MODE:-}; \
         export EPOCH_DYN_NET_BW_MBPS=${EPOCH_DYN_NET_BW_MBPS:-}; \
+        export EPOCH_DYN_NET_UPLOAD_BPS=${EPOCH_DYN_NET_UPLOAD_BPS:-}; \
+        export EPOCH_DYN_NET_DOWNLOAD_BPS=${EPOCH_DYN_NET_DOWNLOAD_BPS:-}; \
         export EPOCH_DYN_NET_CATCHUP_K=${EPOCH_DYN_NET_CATCHUP_K:-}; \
         export EPOCH_TPCC_DB=${EPOCH_TPCC_DB:-tpcc300}; \
 
-        export EPOCH_PHYS_LOGICAL_GAP_LIMIT=${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}; \
-        export EPOCH_PHYSICAL_TXNS_PER_EPOCH=${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}; \
-        export EPOCH_SYNC_START_GATE=${EPOCH_SYNC_START_GATE:-}; \
         export EPOCH_COMMIT_THREADS=${EPOCH_COMMIT_THREADS:-}; \
         export EPOCH_MERGE_THREADS=${EPOCH_MERGE_THREADS:-}; \
         export EPOCH_TIP_FLUSH_THREADS=${EPOCH_TIP_FLUSH_THREADS:-}; \
@@ -143,6 +140,7 @@ for stale in \
     epoch_shard_warehouse_lo \
     epoch_shard_warehouse_hi \
     epoch_dbr_mode \
+    epoch_sync_start_gate \
     enable_epoch_dyn_net \
     epoch_dyn_net_bw_mode \
     default_storage_nodegroup \
@@ -150,30 +148,10 @@ for stale in \
     remove_stale_conf "${stale}"
 done
 
-# HCJ ADDBY epoch multimaster（与 src/epoch/e_config.cpp 对齐，改后须 restart）
-# EPOCH_PROFILE 内置参数（仅 export EPOCH_PROFILE=xxx 即可）：
-#   benchmark            — gap=5, perf, start_gate=on, 2-node
-#   stats                — gap=5, perf+diag+occ_stats, start_gate=on, synchronous_commit=on
-#   stats-async-commit   — 同 stats，synchronous_commit=off（apply commit 不做 XLogWaitFlush，验证 WAL 瓶颈）
-#   wait                 — 原 stats-nogate：start_gate=off, gap=5, physical_txns_per_epoch=50, sync_commit=off
-#   dbr / pa / pacer       — 与 wait 相同，分别打开 DBR、PA、两者
-#   四个 profile 的慢节点、RTT、带宽由 apply_netem.sh 用 tc 施加（ping 可见）
-#   single-node-baseline — epoch_total_nodes=1、无 peer_hosts，start_gate=on；仅 node1 压测对比用
-# 可选覆盖：EPOCH_PHYS_LOGICAL_GAP_LIMIT, EPOCH_PHYSICAL_TXNS_PER_EPOCH, EPOCH_SYNC_START_GATE
-# 模块开关（默认 off）：
-#   EPOCH_ENABLE_OCC_STAGING=on   — 单独打开 occ staging（版本延迟写回），默认 off。
-EPOCH_PROFILE="${EPOCH_PROFILE:-benchmark}"
-if [ "${EPOCH_PROFILE}" = "stats-nogate" ]; then
-    echo "WARN: EPOCH_PROFILE=stats-nogate 已改名为 wait" >&2
-    EPOCH_PROFILE=wait
-fi
-if [ "${EPOCH_PROFILE}" = "single-node-baseline" ] && [ "${NODE_ID}" != "1" ]; then
-    echo "ERROR: EPOCH_PROFILE=single-node-baseline 仅适用于 node1（NODE_ID=1）" >&2
-    exit 1
-fi
-EPOCH_PHYSICAL_TXNS_PER_EPOCH="${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}"
-EPOCH_PHYS_LOGICAL_GAP_LIMIT="${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}"
-EPOCH_SYNC_START_GATE="${EPOCH_SYNC_START_GATE:-}"
+# epoch multimaster（与 src/epoch/e_config.cpp 对齐，改后须 restart）
+# EPOCH_PROFILE：wait | dbr | pa | pacer
+#   慢节点、RTT、带宽由 apply_netem.sh 用 tc 施加（ping 可见）
+EPOCH_PROFILE="${EPOCH_PROFILE:-wait}"
 
 occ_staging_val="${EPOCH_ENABLE_OCC_STAGING:-off}"
 epoch_dyn_net_catchup_val="off"
@@ -184,175 +162,78 @@ if [ -n "${EPOCH_DYN_NET_SLOW_NODES:-}" ]; then
 fi
 
 set_conf enable_occ_staging "${occ_staging_val}"
-set_conf epoch_dyn_net_catchup "${epoch_dyn_net_catchup_val}"
-set_conf epoch_dyn_net_proxy "${epoch_dyn_net_proxy_val}"
-if [ "${epoch_dyn_net_slow_nodes_val}" = "''" ]; then
-    set_conf epoch_dyn_net_slow_nodes "''"
-else
-    set_conf epoch_dyn_net_slow_nodes "${epoch_dyn_net_slow_nodes_val}"
-fi
 set_conf enable_occ_disk "on"
 set_conf enable_epoch_multimaster "on"
-set_conf epoch_recv_diag "off"
-set_conf epoch_diag "off"
-set_conf epoch_perf_log "off"
-set_conf occ_enable_stats_log "off"
 
-sync_start_gate_val="on"
-gap_limit_val="5"
-physical_txns_per_epoch_val="0"
-commit_threads_val="1"
-merge_threads_val="1"
+commit_threads_val="10"
+merge_threads_val="5"
 tip_flush_threads_val="1"
-synchronous_commit_val="on"
-epoch_total_nodes_val=""
-epoch_peer_hosts_val=""
+synchronous_commit_val="off"
 
+# 四个 profile 共用同一套节点参数，只切换 Pacer 的两个开关
 case "${EPOCH_PROFILE}" in
-    benchmark)
-        set_conf epoch_perf_log "on"
-        set_conf epoch_apply_profile "on"
-        sync_start_gate_val="on"
-        gap_limit_val="5"
-        commit_threads_val="5"
-        merge_threads_val="5"
-        ;;
-    stats)
-        set_conf occ_enable_stats_log "on"
-        set_conf epoch_recv_diag "on"
-        set_conf epoch_recv_diag_verbose "off"
-        set_conf epoch_lifecycle_log "on"
-        set_conf epoch_diag "on"
-        set_conf epoch_perf_log "on"
-        set_conf epoch_apply_profile "on"
-        set_conf epoch_merge_profile "on"
-        set_conf epoch_apply_lock_trace_ms "10"
-        set_conf log_lock_waits "on"
-        set_conf deadlock_timeout "1s"
-        sync_start_gate_val="on"
-        gap_limit_val="5"
-        commit_threads_val="5"
-        merge_threads_val="5"
-        ;;
-    stats-async-commit)
-        set_conf occ_enable_stats_log "on"
-        set_conf epoch_recv_diag "on"
-        set_conf epoch_recv_diag_verbose "off"
-        set_conf epoch_lifecycle_log "on"
-        set_conf epoch_diag "on"
-        set_conf epoch_perf_log "on"
-        set_conf epoch_apply_profile "on"
-        set_conf epoch_merge_profile "on"
-        set_conf epoch_apply_lock_trace_ms "10"
-        set_conf log_lock_waits "on"
-        set_conf deadlock_timeout "1s"
-        sync_start_gate_val="on"
-        gap_limit_val="5"
-        commit_threads_val="5"
-        merge_threads_val="5"
-        synchronous_commit_val="off"
-        ;;
-    wait|dbr|pa|pacer)
-        set_conf occ_enable_stats_log "on"
-        set_conf epoch_recv_diag "on"
-        set_conf epoch_recv_diag_verbose "off"
-        set_conf epoch_lifecycle_log "on"
-        set_conf epoch_diag "on"
-        set_conf epoch_perf_log "on"
-        set_conf epoch_apply_profile "on"
-        set_conf epoch_merge_profile "on"
-        set_conf epoch_apply_lock_trace_ms "10"
-        set_conf log_lock_waits "on"
-        set_conf deadlock_timeout "1s"
-        sync_start_gate_val="off"
-        gap_limit_val="5"
-        physical_txns_per_epoch_val="50"
-        commit_threads_val="10"
-        merge_threads_val="5"
-        synchronous_commit_val="off"
-        case "${EPOCH_PROFILE}" in
-            dbr)
-                epoch_dyn_net_catchup_val="on"
-                epoch_dyn_net_proxy_val="off"
-                ;;
-            pa)
-                epoch_dyn_net_catchup_val="off"
-                epoch_dyn_net_proxy_val="on"
-                ;;
-            pacer)
-                epoch_dyn_net_catchup_val="on"
-                epoch_dyn_net_proxy_val="on"
-                ;;
-            *)
-                epoch_dyn_net_catchup_val="off"
-                epoch_dyn_net_proxy_val="off"
-                ;;
-        esac
-        ;;
-    single-node-baseline)
-        set_conf epoch_perf_log "on"
-        set_conf epoch_recv_diag "off"
-        set_conf epoch_recv_diag_verbose "off"
-        set_conf epoch_lifecycle_log "off"
-        set_conf epoch_diag "off"
-        set_conf occ_enable_stats_log "off"
-        set_conf epoch_apply_lock_trace_ms "0"
-        set_conf log_lock_waits "off"
-        sync_start_gate_val="on"
-        gap_limit_val="5"
-        commit_threads_val="5"
-        merge_threads_val="5"
-        epoch_total_nodes_val="1"
-        epoch_peer_hosts_val="''"
-        ;;
+    wait) ;;
+    dbr)   epoch_dyn_net_catchup_val="on" ;;
+    pa)    epoch_dyn_net_proxy_val="on" ;;
+    pacer) epoch_dyn_net_catchup_val="on"; epoch_dyn_net_proxy_val="on" ;;
     *)
-        echo "WARN: unknown EPOCH_PROFILE=${EPOCH_PROFILE}, using benchmark defaults" >&2
-        set_conf epoch_perf_log "on"
-        sync_start_gate_val="on"
-        gap_limit_val="5"
-        commit_threads_val="1"
-        merge_threads_val="1"
+        echo "WARN: unknown EPOCH_PROFILE=${EPOCH_PROFILE}, using wait" >&2
+        EPOCH_PROFILE=wait
         ;;
 esac
 
-case "${EPOCH_PROFILE}" in
-    wait|dbr|pa|pacer)
-        # RTT / 带宽由 apply_netem.sh 用 tc 施加。这里只把 RTT 写给 DBR 的目标 epoch 公式。
-        if ! [[ "${EPOCH_NETWORK_RTT_MS:-100}" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: EPOCH_NETWORK_RTT_MS must be an integer, got: ${EPOCH_NETWORK_RTT_MS}" >&2
-            exit 1
-        fi
-        set_conf epoch_dyn_net_catchup "${epoch_dyn_net_catchup_val}"
-        set_conf epoch_dyn_net_proxy "${epoch_dyn_net_proxy_val}"
-        if [ "${epoch_dyn_net_slow_nodes_val}" = "''" ]; then
-            set_conf epoch_dyn_net_slow_nodes "''"
-        else
-            set_conf epoch_dyn_net_slow_nodes "${epoch_dyn_net_slow_nodes_val}"
-        fi
-        set_conf epoch_dyn_net_rtt_ms "${EPOCH_NETWORK_RTT_MS:-100}"
-        set_conf epoch_dyn_net_catchup_k "${EPOCH_DYN_NET_CATCHUP_K:-3}"
-        echo "epoch net: profile=${EPOCH_PROFILE} catchup=${epoch_dyn_net_catchup_val} proxy=${epoch_dyn_net_proxy_val} slow=${epoch_dyn_net_slow_nodes_val} rtt_ms=${EPOCH_NETWORK_RTT_MS:-100} (tc: apply_netem.sh, bw=${EPOCH_DYN_NET_BW_MODE:-uplimit} ${EPOCH_DYN_NET_BW_MBPS:-100}Mbps)"
-        ;;
-esac
+set_conf occ_enable_stats_log "on"
+set_conf epoch_recv_diag "on"
+set_conf epoch_recv_diag_verbose "off"
+set_conf epoch_lifecycle_log "on"
+set_conf epoch_diag "on"
+set_conf epoch_perf_log "on"
+set_conf epoch_apply_profile "on"
+set_conf epoch_merge_profile "on"
+set_conf epoch_apply_lock_trace_ms "10"
+set_conf log_lock_waits "on"
+set_conf deadlock_timeout "1s"
+
+# RTT / 带宽由 apply_netem.sh 用 tc 施加；这里只把 RTT 与 K 写给 DBR 的目标 epoch 公式
+if ! [[ "${EPOCH_NETWORK_RTT_MS:-100}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: EPOCH_NETWORK_RTT_MS must be an integer, got: ${EPOCH_NETWORK_RTT_MS}" >&2
+    exit 1
+fi
+set_conf epoch_dyn_net_catchup "${epoch_dyn_net_catchup_val}"
+set_conf epoch_dyn_net_proxy "${epoch_dyn_net_proxy_val}"
+set_conf epoch_dyn_net_slow_nodes "${epoch_dyn_net_slow_nodes_val}"
+set_conf epoch_dyn_net_rtt_ms "${EPOCH_NETWORK_RTT_MS:-100}"
+set_conf epoch_dyn_net_catchup_k "${EPOCH_DYN_NET_CATCHUP_K:-3}"
+
+# 慢节点把 tc 的带宽上限同时告诉 PM，DBR/PA 才能按利用率判定拥塞
+if epoch_node_is_slow "${NODE_ID}"; then
+    case "${EPOCH_DYN_NET_BW_MODE:-uplimit}" in
+        uplimit)
+            set_conf epoch_dyn_net_upload_bps "${EPOCH_DYN_NET_UPLOAD_BPS}"
+            set_conf epoch_dyn_net_download_bps "0"
+            ;;
+        downlimit)
+            set_conf epoch_dyn_net_upload_bps "0"
+            set_conf epoch_dyn_net_download_bps "${EPOCH_DYN_NET_DOWNLOAD_BPS}"
+            ;;
+        bilimit)
+            set_conf epoch_dyn_net_upload_bps "${EPOCH_DYN_NET_UPLOAD_BPS}"
+            set_conf epoch_dyn_net_download_bps "${EPOCH_DYN_NET_DOWNLOAD_BPS}"
+            ;;
+        *)
+            set_conf epoch_dyn_net_upload_bps "0"
+            set_conf epoch_dyn_net_download_bps "0"
+            ;;
+    esac
+else
+    set_conf epoch_dyn_net_upload_bps "0"
+    set_conf epoch_dyn_net_download_bps "0"
+fi
+
+echo "epoch net: profile=${EPOCH_PROFILE} catchup=${epoch_dyn_net_catchup_val} proxy=${epoch_dyn_net_proxy_val} slow=${epoch_dyn_net_slow_nodes_val} rtt_ms=${EPOCH_NETWORK_RTT_MS:-100}/${EPOCH_RTT_HEALTHY_MS:-35} (tc: apply_netem.sh, bw=${EPOCH_DYN_NET_BW_MODE:-uplimit} ${EPOCH_DYN_NET_BW_MBPS:-10}Mbps)"
 
 set_conf synchronous_commit "${synchronous_commit_val}"
 
-if [ -n "${EPOCH_SYNC_START_GATE:-}" ]; then
-    case "${EPOCH_SYNC_START_GATE}" in
-        on|yes|1|true|TRUE) sync_start_gate_val="on" ;;
-        off|no|0|false|FALSE) sync_start_gate_val="off" ;;
-        *)
-            echo "WARN: unknown EPOCH_SYNC_START_GATE=${EPOCH_SYNC_START_GATE}, using ${sync_start_gate_val}" >&2
-            ;;
-    esac
-fi
-
-if [ -n "${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}" ]; then
-    gap_limit_val="${EPOCH_PHYS_LOGICAL_GAP_LIMIT}"
-fi
-if [ -n "${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}" ]; then
-    physical_txns_per_epoch_val="${EPOCH_PHYSICAL_TXNS_PER_EPOCH}"
-fi
 if [ -n "${EPOCH_COMMIT_THREADS:-}" ]; then
     if ! [[ "${EPOCH_COMMIT_THREADS}" =~ ^[0-9]+$ ]] || [ "${EPOCH_COMMIT_THREADS}" -lt 1 ]; then
         echo "ERROR: EPOCH_COMMIT_THREADS must be integer >= 1, got: ${EPOCH_COMMIT_THREADS}" >&2
@@ -378,46 +259,22 @@ if [ -n "${EPOCH_TIP_FLUSH_THREADS:-}" ]; then
 fi
 
 recv_diag_verbose_val="off"
-lifecycle_log_val="off"
-case "${EPOCH_PROFILE}" in
-    stats|stats-async-commit|wait|dbr|pa|pacer)
-        recv_diag_verbose_val="off"
-        lifecycle_log_val="on"
-        ;;
-esac
+lifecycle_log_val="on"
 if [ -n "${EPOCH_RECV_DIAG_VERBOSE:-}" ]; then
     recv_diag_verbose_val="${EPOCH_RECV_DIAG_VERBOSE}"
 fi
 if [ -n "${EPOCH_LIFECYCLE_LOG:-}" ]; then
     lifecycle_log_val="${EPOCH_LIFECYCLE_LOG}"
 fi
-case "${EPOCH_PROFILE}" in
-    stats|stats-async-commit|wait|dbr|pa|pacer)
-        set_conf epoch_recv_diag_verbose "${recv_diag_verbose_val}"
-        set_conf epoch_lifecycle_log "${lifecycle_log_val}"
-        ;;
-esac
+set_conf epoch_recv_diag_verbose "${recv_diag_verbose_val}"
+set_conf epoch_lifecycle_log "${lifecycle_log_val}"
 
 set_conf epoch_node_id "$(epoch_guc_node_id "${NODE_ID}")"
-if [ "${EPOCH_PROFILE}" = "single-node-baseline" ]; then
-    set_conf epoch_node_id "0"
-fi
-if [ -n "${epoch_total_nodes_val}" ]; then
-    set_conf epoch_total_nodes "${epoch_total_nodes_val}"
-else
-    set_conf epoch_total_nodes "$(epoch_effective_total_nodes)"
-fi
-if [ -n "${epoch_peer_hosts_val}" ]; then
-    set_conf epoch_peer_hosts "${epoch_peer_hosts_val}"
-else
-    set_conf epoch_peer_hosts "'$(epoch_effective_peer_hosts)'"
-fi
+set_conf epoch_total_nodes "$(epoch_effective_total_nodes)"
+set_conf epoch_peer_hosts "'$(epoch_effective_peer_hosts)'"
 set_conf epoch_data_port_base "${EPOCH_ZMQ_PORT_BASE}"
-set_conf epoch_physical_txns_per_epoch "${physical_txns_per_epoch_val}"
 set_conf epoch_delay_slots "0"
 set_conf epoch_cache_slots "8192"
-set_conf epoch_phys_logical_gap_limit "${gap_limit_val}"
-set_conf epoch_sync_start_gate "${sync_start_gate_val}"
 set_conf epoch_merge_threads "${merge_threads_val}"
 set_conf epoch_commit_threads "${commit_threads_val}"
 set_conf epoch_tip_flush_threads "${tip_flush_threads_val}"
@@ -425,7 +282,7 @@ set_conf epoch_tip_flush_threads "${tip_flush_threads_val}"
 # “取到收尾包时已发多少条”即声明条数，不产生任何并发分叉。
 set_conf epoch_pack_threads "1"
 set_conf epoch_txn_queue_capacity "8192"
-set_conf epoch_abort_csn_per_epoch "65536"
+set_conf epoch_abort_csn_per_epoch "1024"
 set_conf epoch_crdt_slot_count "32"
 set_conf epoch_crdt_rows_per_slot "8192"
 set_conf epoch_crdt_inserts_per_slot "2048"
@@ -436,7 +293,6 @@ set_conf epoch_apply_done_capacity "8192"
 echo "epoch: pipeline coordinator + apply pool（epoch_commit_threads=${commit_threads_val}，多节点时启动 postmaster apply worker 进程）"
 echo "epoch: merge pool（epoch_merge_threads=${merge_threads_val}，多节点时启动 postmaster merge worker 进程）"
 echo "epoch: tip flush（epoch_tip_flush_threads=${tip_flush_threads_val}，tip staging 后台写回 heap）"
-echo "epoch: verify after TPCC — bash scripts/epoch_benchmark/verify_epoch_end_consistency.sh"
 set_conf epoch_apply_database "'${EPOCH_TPCC_DB}'"
 set_conf epoch_apply_user "'$(epoch_super_user_for_node "${NODE_ID}")'"
 
@@ -464,60 +320,21 @@ verify_conf() {
 
 echo "configured ${DATA_DIR} ($(epoch_node_display_name "${NODE_ID}") id=${NODE_ID}, ip ${NODE_IP}, port ${EPOCH_DB_PORT}, profile=${EPOCH_PROFILE})"
 echo "edited: ${CONF}"
-verify_conf epoch_sync_start_gate "${sync_start_gate_val}"
-verify_conf epoch_phys_logical_gap_limit "${gap_limit_val}"
-verify_conf epoch_physical_txns_per_epoch "${physical_txns_per_epoch_val}"
 verify_conf epoch_commit_threads "${commit_threads_val}"
 verify_conf epoch_merge_threads "${merge_threads_val}"
 verify_conf epoch_tip_flush_threads "${tip_flush_threads_val}"
-if [ -n "${epoch_total_nodes_val}" ]; then
-    verify_conf epoch_total_nodes "${epoch_total_nodes_val}"
-fi
 verify_conf enable_occ_staging "${occ_staging_val}"
 verify_conf synchronous_commit "${synchronous_commit_val}"
 verify_conf default_transaction_isolation "repeatable read"
-echo "verified: sync_start_gate=${sync_start_gate_val}, gap=${gap_limit_val}, physical_txns_per_epoch=${physical_txns_per_epoch_val}, commit_threads=${commit_threads_val}, merge_threads=${merge_threads_val}, tip_flush_threads=${tip_flush_threads_val}"
+echo "verified: commit_threads=${commit_threads_val}, merge_threads=${merge_threads_val}, tip_flush_threads=${tip_flush_threads_val}"
 echo "verified: synchronous_commit=${synchronous_commit_val}, default_transaction_isolation=repeatable read"
 echo "verified: enable_occ_staging=${occ_staging_val}"
-echo "epoch: profile=${EPOCH_PROFILE}, sync_start_gate=${sync_start_gate_val}, gap=${gap_limit_val}"
-case "${EPOCH_PROFILE}" in
-    benchmark)
-        echo "epoch: benchmark — PRE_COMMIT pack + worker defer, perf on, START gate on"
-        ;;
-    stats)
-        echo "epoch: stats — recv_diag(on,verbose=${recv_diag_verbose_val}) lifecycle_log=${lifecycle_log_val} + epoch/occ/perf diag, START gate on, synchronous_commit=on"
-        verify_conf epoch_recv_diag "on"
-        verify_conf epoch_recv_diag_verbose "${recv_diag_verbose_val}"
-        verify_conf epoch_lifecycle_log "${lifecycle_log_val}"
-        ;;
-    stats-async-commit)
-        echo "epoch: stats-async-commit — 同 stats diag/lifecycle/apply_profile，synchronous_commit=off（async WAL commit）"
-        verify_conf epoch_recv_diag "on"
-        verify_conf epoch_recv_diag_verbose "${recv_diag_verbose_val}"
-        verify_conf epoch_lifecycle_log "${lifecycle_log_val}"
-        verify_conf epoch_apply_profile "on"
-        ;;
-    wait|dbr|pa|pacer)
-        echo "epoch: ${EPOCH_PROFILE} — start_gate=off sync_commit=off gap=${gap_limit_val} physical_txns=${physical_txns_per_epoch_val} catchup=${epoch_dyn_net_catchup_val} proxy=${epoch_dyn_net_proxy_val}"
-        echo "epoch: tc RTT=${EPOCH_NETWORK_RTT_MS:-100}ms bw=${EPOCH_DYN_NET_BW_MODE:-uplimit} ${EPOCH_DYN_NET_BW_MBPS:-100}Mbps slow=${epoch_dyn_net_slow_nodes_val}（apply_netem.sh，ping 可核对）"
-        verify_conf epoch_recv_diag "on"
-        verify_conf epoch_recv_diag_verbose "${recv_diag_verbose_val}"
-        verify_conf epoch_lifecycle_log "${lifecycle_log_val}"
-        verify_conf epoch_apply_profile "on"
-        verify_conf epoch_physical_txns_per_epoch "${physical_txns_per_epoch_val}"
-        verify_conf epoch_dyn_net_catchup "${epoch_dyn_net_catchup_val}"
-        verify_conf epoch_dyn_net_proxy "${epoch_dyn_net_proxy_val}"
-        verify_conf epoch_dyn_net_rtt_ms "${EPOCH_NETWORK_RTT_MS:-100}"
-        ;;
-    single-node-baseline)
-        echo "epoch: single-node-baseline — epoch_total_nodes=1, peer_hosts empty, START gate GUC on"
-        echo "epoch: hint — 代码在 total_nodes<=1 时 E_IsSyncEpochMode 为 false，PRE_COMMIT defer/gate 自旋不生效；与 2-node 验收路径不同，仅作单节点开销对比"
-        verify_conf epoch_total_nodes "1"
-        verify_conf epoch_sync_start_gate "on"
-        verify_conf epoch_recv_diag "off"
-        verify_conf epoch_lifecycle_log "off"
-        ;;
-esac
+echo "epoch: profile=${EPOCH_PROFILE} sync_commit=${synchronous_commit_val} catchup=${epoch_dyn_net_catchup_val} proxy=${epoch_dyn_net_proxy_val}"
+echo "epoch: tc RTT=${EPOCH_NETWORK_RTT_MS:-100}ms bw=${EPOCH_DYN_NET_BW_MODE:-uplimit} ${EPOCH_DYN_NET_BW_MBPS:-100}Mbps slow=${epoch_dyn_net_slow_nodes_val}"
+verify_conf epoch_recv_diag "on"
+verify_conf epoch_apply_profile "on"
+verify_conf epoch_dyn_net_catchup "${epoch_dyn_net_catchup_val}"
+verify_conf epoch_dyn_net_proxy "${epoch_dyn_net_proxy_val}"
 if [ -z "${EPOCH_CONFIGURE_REMOTE:-}" ]; then
     epoch_apply_netem_from_profile
 fi

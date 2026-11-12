@@ -11,9 +11,6 @@ if [ -n "${LD_LIBRARY_PATH:-}" ] && [ -z "${EPOCH_DEPLOY_SANITIZED:-}" ]; then
         EPOCH_DEPLOY_SANITIZED=1 \
         EPOCH_BENCH_ROOT="${EPOCH_BENCH_ROOT:-}" \
         EPOCH_PROFILE="${EPOCH_PROFILE:-}" \
-        EPOCH_PHYS_LOGICAL_GAP_LIMIT="${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}" \
-        EPOCH_PHYSICAL_TXNS_PER_EPOCH="${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}" \
-        EPOCH_SYNC_START_GATE="${EPOCH_SYNC_START_GATE:-}" \
         EPOCH_NODE1_IP="${EPOCH_NODE1_IP:-}" \
         EPOCH_NODE2_IP="${EPOCH_NODE2_IP:-}" \
         EPOCH_NODE3_IP="${EPOCH_NODE3_IP:-}" \
@@ -59,7 +56,6 @@ stage_runtime_libs() {
     mkdir -p "${RUNTIME_LIBS}"
     local src
     for src in \
-        /home/hcj2003/GeoGauss/dest/lib/libzmq.so* \
         /lib64/libzmq.so* \
         /lib64/libpgm-5.2.so* \
         /lib64/libncurses.so.5* \
@@ -129,8 +125,8 @@ cat <<EOF
 
 三端 TPCC props 参考（benchmarksql-5.0-epoch/run）：
   node1 (id=1): runWarehouseOffset=0, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE1}
-  node2 (id=2): runWarehouseOffset=33, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE2}  props=$(epoch_tpcc_props_for_node 2)
-  node3 (id=3): runWarehouseOffset=33, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE3}  (EPOCH_SKIP_NODE=3 时不跑)
+  node2 (id=2): runWarehouseOffset=34, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE2}  props=$(epoch_tpcc_props_for_node 2)
+  node3 (id=3): runWarehouseOffset=68, runWarehouses=${EPOCH_RUN_WAREHOUSES_PER_NODE}, terminals=${EPOCH_TPCC_TERMINALS_NODE3}  (EPOCH_SKIP_NODE=3 时不跑)
   warehouses=${EPOCH_LOAD_WAREHOUSES}
 
 EOF

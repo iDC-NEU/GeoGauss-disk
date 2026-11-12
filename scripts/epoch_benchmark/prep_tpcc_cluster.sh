@@ -8,9 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=env.sh
 source "${SCRIPT_DIR}/env.sh"
 
-export EPOCH_BENCH_ROOT="${EPOCH_BENCH_ROOT:-/home/hcj2003/2025-9}"
+export EPOCH_BENCH_ROOT="${EPOCH_BENCH_ROOT:-${HOME}/pacer-bench}"
 # EPOCH_PROFILE、慢节点、RTT、带宽在 env.sh 里改
-# stats 类 profile 内置 commit/merge threads；仅显式 export 时才覆盖 configure_node.sh 的 profile 默认值
+# thread 数由 configure_node.sh 设定；仅在显式 export 时覆盖
 export EPOCH_RECV_DIAG_VERBOSE="${EPOCH_RECV_DIAG_VERBOSE:-off}"
 export EPOCH_LIFECYCLE_LOG="${EPOCH_LIFECYCLE_LOG:-on}"
 
@@ -45,9 +45,7 @@ usage: $(basename "$0") [OPTION]
     tpcc300 → node1: props.epoch.node0-300w ；node2: props.epoch.node2-300w
     test    → node1: props.epoch.node0-33 ；node2: props.epoch.node2-33
 
-  可选覆盖: EPOCH_PHYS_LOGICAL_GAP_LIMIT, EPOCH_PHYSICAL_TXNS_PER_EPOCH, EPOCH_SYNC_START_GATE
   可选覆盖: EPOCH_COMMIT_THREADS, EPOCH_MERGE_THREADS
-  EPOCH_SKIP_HIST_ID_SHARD=1（默认）：跳过 bmsql_hist_id_seq 分片。
 EOF
 }
 
@@ -55,9 +53,6 @@ epoch_invoke_deploy() {
     env -u LD_LIBRARY_PATH \
         EPOCH_BENCH_ROOT="${EPOCH_BENCH_ROOT}" \
         EPOCH_PROFILE="${EPOCH_PROFILE:-}" \
-        EPOCH_PHYS_LOGICAL_GAP_LIMIT="${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}" \
-        EPOCH_PHYSICAL_TXNS_PER_EPOCH="${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}" \
-        EPOCH_SYNC_START_GATE="${EPOCH_SYNC_START_GATE:-}" \
         EPOCH_SKIP_NODE="${EPOCH_SKIP_NODE:-}" \
         EPOCH_SKIP_NODE2="${EPOCH_SKIP_NODE2:-}" \
         PATH="/usr/bin:/bin:/usr/local/bin" \
@@ -65,21 +60,21 @@ epoch_invoke_deploy() {
 }
 
 epoch_cluster_deploy() {
-    echo "=== [1/4] deploy binary to remote nodes ==="
+    echo "=== [1/3] deploy binary to remote nodes ==="
     for n in $(epoch_remote_deploy_node_ids); do
         epoch_invoke_deploy "${n}"
     done
 }
 
 epoch_cluster_configure() {
-    echo "=== [2/4] configure profile nodes (profile=${EPOCH_PROFILE}, db=${EPOCH_TPCC_DB}) ==="
+    echo "=== [2/3] configure profile nodes (profile=${EPOCH_PROFILE}, db=${EPOCH_TPCC_DB}) ==="
     for n in $(epoch_profile_node_ids); do
         bash "${SCRIPT_DIR}/configure_node.sh" "${n}"
     done
 }
 
 epoch_cluster_restart() {
-    echo "=== [3/4] stop profile nodes ==="
+    echo "=== [3/3] stop profile nodes ==="
     for n in $(epoch_profile_node_ids); do
         bash "${SCRIPT_DIR}/stop_node.sh" "${n}" || true
     done
@@ -160,17 +155,6 @@ epoch_check_nodes_running() {
     done
 }
 
-epoch_cluster_shard_hist_id() {
-    if [ "${EPOCH_SKIP_HIST_ID_SHARD:-1}" = "1" ]; then
-        echo "=== [4/4] skip shard bmsql_hist_id_seq (EPOCH_SKIP_HIST_ID_SHARD=1) ==="
-        return 0
-    fi
-    echo "=== [4/4] shard bmsql_hist_id_seq (profile nodes, post-start) ==="
-    for n in $(epoch_profile_node_ids); do
-        bash "${SCRIPT_DIR}/shard_hist_id_seq.sh" "${n}"
-    done
-}
-
 epoch_snapshot_epoch_guc() {
     local result_dir="$1"
     echo "=== postflight: epoch GUC snapshot ==="
@@ -208,15 +192,11 @@ epoch_do_prep() {
         echo "props_node1=$(epoch_tpcc_props_for_node 1)"
         echo "props_node2=$(epoch_tpcc_props_for_node 2)"
         echo "EPOCH_BENCH_ROOT=${EPOCH_BENCH_ROOT}"
-        echo "EPOCH_PHYS_LOGICAL_GAP_LIMIT=${EPOCH_PHYS_LOGICAL_GAP_LIMIT:-}"
-        echo "EPOCH_PHYSICAL_TXNS_PER_EPOCH=${EPOCH_PHYSICAL_TXNS_PER_EPOCH:-}"
-        echo "EPOCH_SYNC_START_GATE=${EPOCH_SYNC_START_GATE:-}"
         echo "EPOCH_COMMIT_THREADS=${EPOCH_COMMIT_THREADS:-<profile default>}"
         echo "EPOCH_MERGE_THREADS=${EPOCH_MERGE_THREADS:-<profile default>}"
         echo "EPOCH_RECV_DIAG_VERBOSE=${EPOCH_RECV_DIAG_VERBOSE}"
         echo "EPOCH_LIFECYCLE_LOG=${EPOCH_LIFECYCLE_LOG}"
         echo "EPOCH_SKIP_NODE=${EPOCH_SKIP_NODE:-0}"
-        echo "EPOCH_SKIP_HIST_ID_SHARD=${EPOCH_SKIP_HIST_ID_SHARD:-1}"
         echo "effective_total_nodes=$(epoch_effective_total_nodes)"
         echo "effective_peer_hosts=$(epoch_effective_peer_hosts)"
         echo "profile_nodes=$(epoch_profile_node_ids)"
@@ -234,7 +214,6 @@ epoch_do_prep() {
     epoch_cluster_restart
     epoch_sync_benchmark_client | tee -a "${prep_result}/summary.txt"
     epoch_check_nodes_running | tee -a "${prep_result}/summary.txt"
-    epoch_cluster_shard_hist_id | tee -a "${prep_result}/summary.txt"
     echo "finished_prep_at=$(date -Iseconds)" | tee -a "${prep_result}/summary.txt"
     epoch_snapshot_epoch_guc "${prep_result}"
     echo ""

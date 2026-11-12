@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# HCJ ADDBY: epoch 多节点 BenchmarkSQL 测试环境变量
+# epoch 多节点 BenchmarkSQL 测试环境变量
 
-# 从 scripts/epoch_benchmark 向上三级推断 bench 根目录（node1/node2/node3 各自本机路径）
+# 从 scripts/epoch_benchmark 向上三级推断 bench 根目录（各节点各自本机路径）
 _epoch_env_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export EPOCH_BENCH_ROOT="${EPOCH_BENCH_ROOT:-$(cd "${_epoch_env_dir}/../../.." && pwd)}"
-# 勿沿用 ~/.bashrc 里的 GAUSSHOME，epoch 必须用 2025-9 下与 node1 同步的二进制
+# 显式指定 GAUSSHOME，避免沿用交互 shell 里的设置
 export GAUSSHOME="${EPOCH_BENCH_ROOT}/openGauss-server/mppdb_temp_install"
 export EPOCH_RUNTIME_LIBS="${EPOCH_BENCH_ROOT}/epoch_deploy/runtime_libs"
-export BINARYLIBS="${BINARYLIBS:-/home/hcj2003/openGauss-third_party_binarylibs}"
+export BINARYLIBS="${BINARYLIBS:-${HOME}/openGauss-third_party_binarylibs}"
 export GCC_PATH="${GCC_PATH:-${BINARYLIBS}/buildtools/gcc10.3}"
 
 epoch_prepend_ld_path() {
@@ -24,7 +24,7 @@ epoch_prepend_ld_path() {
     fi
 }
 
-# 仅追加本机存在的目录，避免远程节点引用 hcj2003 路径；runtime_libs 优先于 /usr/local
+# 仅追加本机存在的目录；runtime_libs 优先于系统路径
 LD_LIBRARY_PATH=""
 epoch_prepend_ld_path "${GAUSSHOME}/lib"
 epoch_prepend_ld_path "${EPOCH_RUNTIME_LIBS}"
@@ -32,10 +32,6 @@ if [ -f "${EPOCH_RUNTIME_LIBS}/libzmq.so.5" ] || [ -f "${EPOCH_RUNTIME_LIBS}/lib
     :
 elif [ -f "/lib64/libzmq.so.5" ]; then
     epoch_prepend_ld_path "/lib64"
-elif [ -d "/home/hcj2003/GeoGauss/dest/lib" ] \
-    && [ -f "/home/hcj2003/GeoGauss/dest/lib/libzmq.so.5" ]; then
-    # 仅当无 runtime_libs/lib64 时回退；勿整目录加入 LD_LIBRARY_PATH（会污染 libstdc++）
-    epoch_prepend_ld_path "/home/hcj2003/GeoGauss/dest/lib"
 fi
 if [ -d "${GCC_PATH}/lib64" ]; then
     epoch_prepend_ld_path "${GCC_PATH}/lib64"
@@ -55,10 +51,8 @@ export PATH
 export EPOCH_DATA_ROOT="${EPOCH_DATA_ROOT:-${EPOCH_BENCH_ROOT}/data}"
 export EPOCH_BENCHMARKSQL="${EPOCH_BENCH_ROOT}/benchmarksql-5.0-epoch/run"
 
-# 三节点拓扑（脚本 NODE_ID = 1..3，与 node1/node2/node3 一致）
-#   id=1  node1  202.199.13.149   本机 hcj2003
-#   id=2  node2  202.199.13.61    远程 zwx
-#   id=3  node3  219.216.64.216   远程 hcj2003（当前默认不测）
+# 三节点拓扑（脚本 NODE_ID = 1..3）
+#   下面的地址是文档示例，按实际环境覆盖
 export EPOCH_NODE1_IP="${EPOCH_NODE1_IP:-172.16.1.11}"
 export EPOCH_NODE2_IP="${EPOCH_NODE2_IP:-172.16.1.12}"
 export EPOCH_NODE3_IP="${EPOCH_NODE3_IP:-172.16.1.13}"
@@ -76,19 +70,39 @@ export EPOCH_SKIP_NODE=0
 # 对 wait / dbr / pa / pacer 都生效。RTT 和带宽由 apply_netem.sh 用 tc 写到网卡上。
 # EPOCH_PROFILE：wait | dbr | pa | pacer
 # EPOCH_DYN_NET_SLOW_NODES：被限速的节点，0 起。跳过 node3 时：0 = node1，1 = node2
-# EPOCH_NETWORK_RTT_MS：往返延迟（毫秒）。100 表示两端各 50ms，ping 大约 100ms。
+# EPOCH_NETWORK_RTT_MS：与慢节点之间的往返延迟（毫秒）；两端各加一半。
+# EPOCH_RTT_HEALTHY_MS：健康节点之间的往返延迟（毫秒）。
 # EPOCH_DYN_NET_BW_MODE：unlimit | uplimit | downlimit | bilimit
 # EPOCH_DYN_NET_BW_MBPS：慢节点带宽（Mbps）。unlimit 时不使用。
+# 上面的带宽同时写给 epoch_dyn_net_upload_bps / download_bps，让 PM 能算出利用率。
 # dbr 会打开 epoch_dyn_net_catchup，pa 打开 epoch_dyn_net_proxy，pacer 两个都开。
 export EPOCH_PROFILE="${EPOCH_PROFILE:-wait}"
 export EPOCH_DYN_NET_SLOW_NODES="${EPOCH_DYN_NET_SLOW_NODES-0}"
 export EPOCH_NETWORK_RTT_MS="${EPOCH_NETWORK_RTT_MS:-100}"
+export EPOCH_RTT_HEALTHY_MS="${EPOCH_RTT_HEALTHY_MS:-35}"
 export EPOCH_DYN_NET_BW_MODE="${EPOCH_DYN_NET_BW_MODE:-uplimit}"
 export EPOCH_DYN_NET_BW_MBPS="${EPOCH_DYN_NET_BW_MBPS:-10}"
+export EPOCH_DYN_NET_UPLOAD_BPS="${EPOCH_DYN_NET_UPLOAD_BPS:-$((EPOCH_DYN_NET_BW_MBPS * 1000000))}"
+export EPOCH_DYN_NET_DOWNLOAD_BPS="${EPOCH_DYN_NET_DOWNLOAD_BPS:-$((EPOCH_DYN_NET_BW_MBPS * 1000000))}"
 
 epoch_node_is_skipped() {
     local node_id="$1"
     [ "${EPOCH_SKIP_NODE:-0}" != "0" ] && [ "${node_id}" = "${EPOCH_SKIP_NODE}" ]
+}
+
+# 节点是否在慢节点名单里（比较 GUC 编号）
+epoch_node_is_slow() {
+    local node_id="$1"
+    local guc id
+    guc="$(epoch_guc_node_id "${node_id}")"
+    local IFS=','
+    for id in ${EPOCH_DYN_NET_SLOW_NODES:-}; do
+        id="${id// /}"
+        if [ -n "${id}" ] && [ "${id}" = "${guc}" ]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 epoch_effective_total_nodes() {
@@ -121,16 +135,9 @@ epoch_effective_peer_hosts() {
     echo "${hosts}"
 }
 
-# 按 EPOCH_PROFILE 决定 prep/压测流程实际操作哪些节点（single-node-baseline 仅 node1）
+# prep/压测流程实际操作的节点
 epoch_profile_node_ids() {
-    case "${EPOCH_PROFILE:-benchmark}" in
-        single-node-baseline)
-            echo "1"
-            ;;
-        *)
-            epoch_active_node_ids
-            ;;
-    esac
+    epoch_active_node_ids
 }
 
 epoch_remote_deploy_node_ids() {
@@ -164,13 +171,13 @@ epoch_guc_node_id() {
 export EPOCH_DB_PORT="${EPOCH_DB_PORT:-32000}"
 export EPOCH_ZMQ_PORT_BASE="${EPOCH_ZMQ_PORT_BASE:-25600}"
 
-# node1 / node3：hcj2003；node2：zwx（gs_initdb 超级用户随 OS 用户）
-export EPOCH_SUPER_USER="${EPOCH_SUPER_USER:-hcj2003}"
-export EPOCH_SUPER_PASSWORD="${EPOCH_SUPER_PASSWORD:-Gauss@123.}"
-export EPOCH_NODE2_SUPER_USER="${EPOCH_NODE2_SUPER_USER:-hcj2003}"
+# 数据库超级用户随 gs_initdb 的 OS 用户；密码与 sudo 密码按实际环境覆盖
+export EPOCH_SUPER_USER="${EPOCH_SUPER_USER:-omm}"
+export EPOCH_SUPER_PASSWORD="${EPOCH_SUPER_PASSWORD:-Gauss@123}"
+export EPOCH_NODE2_SUPER_USER="${EPOCH_NODE2_SUPER_USER:-omm}"
 export EPOCH_NODE2_SUPER_PASSWORD="${EPOCH_NODE2_SUPER_PASSWORD:-Gauss@123}"
-# node2 的 sudo 密码，apply_netem.sh 在配置/启动测试时用它改 tc
-export EPOCH_NODE2_SUDO_PASSWORD="${EPOCH_NODE2_SUDO_PASSWORD:-zwx}"
+# 非免密 sudo 时由 apply_netem.sh 使用；留空表示要求免密
+export EPOCH_NODE2_SUDO_PASSWORD="${EPOCH_NODE2_SUDO_PASSWORD:-}"
 export EPOCH_TPCC_USER=bot
 export EPOCH_TPCC_PASSWORD="${EPOCH_TPCC_PASSWORD:-Test@123}"
 # 默认整目录 bak→live 恢复（见 restore_tpcc_datadir.sh）。tpcc300 建议另起 data dir。
@@ -188,32 +195,23 @@ export EPOCH_TPCC_TBLSPC_VER_NODE3="${EPOCH_TPCC_TBLSPC_VER_NODE3:-${EPOCH_TPCC3
 export EPOCH_TPCC300_TBLSPC_VER_NODE1="${EPOCH_TPCC_TBLSPC_VER_NODE1}"
 export EPOCH_TPCC300_TBLSPC_VER_NODE3="${EPOCH_TPCC_TBLSPC_VER_NODE3}"
 
-export EPOCH_LOAD_WAREHOUSES="${EPOCH_LOAD_WAREHOUSES:-300}"
-export EPOCH_RUN_WAREHOUSES_PER_NODE="${EPOCH_RUN_WAREHOUSES_PER_NODE:-150}"
-export EPOCH_TPCC_TERMINALS_NODE1="${EPOCH_TPCC_TERMINALS_NODE1:-33}"
-export EPOCH_TPCC_TERMINALS_NODE2="${EPOCH_TPCC_TERMINALS_NODE2:-34}"
-export EPOCH_TPCC_TERMINALS_NODE3="${EPOCH_TPCC_TERMINALS_NODE3:-33}"
+# 100 个仓库、64 个客户端连接，与论文的 TPC-C 配置一致
+export EPOCH_LOAD_WAREHOUSES="${EPOCH_LOAD_WAREHOUSES:-100}"
+export EPOCH_RUN_WAREHOUSES_PER_NODE="${EPOCH_RUN_WAREHOUSES_PER_NODE:-34}"
+export EPOCH_TPCC_TERMINALS_NODE1="${EPOCH_TPCC_TERMINALS_NODE1:-21}"
+export EPOCH_TPCC_TERMINALS_NODE2="${EPOCH_TPCC_TERMINALS_NODE2:-22}"
+export EPOCH_TPCC_TERMINALS_NODE3="${EPOCH_TPCC_TERMINALS_NODE3:-21}"
 # BenchmarkSQL props（相对 EPOCH_BENCHMARKSQL）；空则按 EPOCH_TPCC_DB 选默认
 export EPOCH_TPCC_PROPS_NODE1="${EPOCH_TPCC_PROPS_NODE1:-}"
 export EPOCH_TPCC_PROPS_NODE2="${EPOCH_TPCC_PROPS_NODE2:-}"
 export EPOCH_TPCC_PROPS_NODE3="${EPOCH_TPCC_PROPS_NODE3:-}"
-export EPOCH_HIST_ID_NODE_STRIDE="${EPOCH_HIST_ID_NODE_STRIDE:-$((2147483647 / $(epoch_effective_total_nodes)))}"
-if ! [[ "${EPOCH_HIST_ID_NODE_STRIDE}" =~ ^[0-9]+$ ]] \
-    || [ $(($(epoch_effective_total_nodes) * EPOCH_HIST_ID_NODE_STRIDE)) -gt 2147483647 ]; then
-    export EPOCH_HIST_ID_NODE_STRIDE=$((2147483647 / $(epoch_effective_total_nodes)))
-    echo "WARN: EPOCH_HIST_ID_NODE_STRIDE adjusted to ${EPOCH_HIST_ID_NODE_STRIDE} for $(epoch_effective_total_nodes) active nodes" >&2
-fi
-
-export EPOCH_REMOTE_USER="${EPOCH_REMOTE_USER:-hcj2003}"
-export EPOCH_REMOTE_HOME="${EPOCH_REMOTE_HOME:-/home/hcj2003}"
+export EPOCH_REMOTE_USER="${EPOCH_REMOTE_USER:-omm}"
+export EPOCH_REMOTE_HOME="${EPOCH_REMOTE_HOME:-/home/omm}"
 export EPOCH_NODE3_BENCH_ROOT="${EPOCH_NODE3_BENCH_ROOT:-/mnt/data/geogauss}"
-export EPOCH_NODE2_REMOTE_USER="${EPOCH_NODE2_REMOTE_USER:-hcj2003}"
-export EPOCH_NODE2_REMOTE_HOME="${EPOCH_NODE2_REMOTE_HOME:-/home/hcj2003}"
+export EPOCH_NODE2_REMOTE_USER="${EPOCH_NODE2_REMOTE_USER:-omm}"
+export EPOCH_NODE2_REMOTE_HOME="${EPOCH_NODE2_REMOTE_HOME:-/home/omm}"
 
 export EPOCH_NODE2_BENCH_ROOT="${EPOCH_NODE2_BENCH_ROOT:-/data/geogauss}"
-#export EPOCH_NODE2_REMOTE_USER="${EPOCH_NODE2_REMOTE_USER:-zwx}"
-#export EPOCH_NODE2_REMOTE_HOME="${EPOCH_NODE2_REMOTE_HOME:-/home/zwx}"
-#export EPOCH_NODE2_BENCH_ROOT="${EPOCH_NODE2_BENCH_ROOT:-${EPOCH_NODE2_REMOTE_HOME}/2025-9}"
 
 export BUILD_JOBS=40
 export OPENGAUSS_SRC="${EPOCH_BENCH_ROOT}/openGauss-server"
@@ -337,15 +335,11 @@ epoch_find_cmake_bin_dir() {
         echo "${candidate}"
         return 0
     fi
-    for d in \
-        "${BINARYLIBS}"/buildtools/cmake*/bin \
-        /home/hcj2003/.cache/JetBrains/RemoteDev/dist/*/bin/cmake/linux/x64/bin; do
-        for d in ${d}; do
-            if [ -x "${d}/cmake" ]; then
-                echo "${d}"
-                return 0
-            fi
-        done
+    for d in "${BINARYLIBS}"/buildtools/cmake*/bin; do
+        if [ -x "${d}/cmake" ]; then
+            echo "${d}"
+            return 0
+        fi
     done
     return 1
 }
@@ -394,7 +388,7 @@ epoch_setup_build_env() {
         return 1
     fi
     cmake_dir="$(epoch_ensure_cmake_installed)" || {
-        echo "ERROR: cmake not found; install cmake or keep CLion bundled cmake under ~/.cache/JetBrains" >&2
+        echo "ERROR: cmake not found; install cmake or set CMAKE to its full path" >&2
         return 1
     }
     dep_zstd="${BINARYLIBS}/kernel/dependency/zstd/lib"

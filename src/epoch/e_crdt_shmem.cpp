@@ -124,6 +124,12 @@ void EpochCrdtShmemInit(void)
 {
     /* 进程内 map，无需显式初始化 */
 }
+
+/* 版本序：CSN 小者优先，CSN 相同按节点 id 决胜。 */
+static inline bool EpochCrdtVersionLess(uint64_t csn, uint32_t server_id, const EpochCrdtRow& cur)
+{
+    return csn < cur.csn || (csn == cur.csn && server_id < cur.server_id);
+}
 E_CrdtMergeOutcome EpochCrdtShmemMergeWireTxn(const E_WireTxn& txn)
 {
     E_CrdtMergeOutcome outcome;
@@ -148,7 +154,7 @@ E_CrdtMergeOutcome EpochCrdtShmemMergeWireTxn(const E_WireTxn& txn)
                     row.bi_hi, row.bi_lo, row.ip_posid);
                 auto it = rows.find(key);
                 if (it != rows.end()) {
-                    if (it->second.csn <= txn.csn) {
+                    if (!EpochCrdtVersionLess(txn.csn, txn.server_id, it->second)) {
                         continue;   /* 该行已有更早的赢家，声明失效 */
                     }
                     /* 声明压过更晚的版本：该版本应判输，与直接路径一致 */
@@ -166,19 +172,12 @@ E_CrdtMergeOutcome EpochCrdtShmemMergeWireTxn(const E_WireTxn& txn)
     }
 
     /*
-     * 两阶段：先预检、后合并。
-     *
-     * 阶段①只读 CRDT，判断这笔事务的每一行是否还能赢；只要有一行已经被
-     * 更新的 csn 占住，就整笔拒绝、CRDT 一行都不改。
-     *
-     * 这一步不能省。以前是单趟处理：某行判输后只置标记，循环继续把其余行
-     * 写进 CRDT，然后整笔事务因 abort 集合被 apply 跳过 —— 于是 CRDT 里留下了
-     * “堆表并不存在”的赢家版本（幽灵赢家）。后续任何 csn 更小的真实写者都会被
-     * 它判输，导致这一行两方都不落地，最终 SELECT 查不到该行
-     * （实测：TPCC 报 District/Warehouse not found）。
+     * 两阶段：先判定整笔能否提交，再逐行合并。
+     * 阶段①只读 CRDT，决定这笔事务是否进 apply；阶段②写入它能赢的行，
+     * 整笔判输时写成 claim：参与裁决，不进 apply。
      */
     g_crdt_rows.Modify(txn.epoch, [&](EpochCrdtRowMap& rows, bool /*is_new*/) {
-        /* ① 预检：任意一行已有 >= 本事务 csn 的版本 → 整笔拒绝 */
+        bool accepted = true;
         for (const E_WireRow& row : txn.rows) {
             if (row.op_type == EPOCH_OP_READ) {
                 continue;
@@ -186,22 +185,12 @@ E_CrdtMergeOutcome EpochCrdtShmemMergeWireTxn(const E_WireTxn& txn)
             const uint64_t key = EpochCrdtRowKey(row.relid, row.pk.data(), row.pk.size(),
                 row.bi_hi, row.bi_lo, row.ip_posid);
             auto it = rows.find(key);
-            if (it != rows.end() && txn.csn <= it->second.csn) {
-                /*
-                 * 合并阶段判输：这笔事务不会进 apply 队列，
-                 * 所以必须在这里计入失败率，否则 abort tps 只统计到
-                 * "先赢后被打回"的那一类，会明显偏低。
-                 * Insert 自带去重，只有真正新插入时才计数。
-                 */
-                if (EpochAbortCsnInsert(txn.epoch, txn.csn, txn.server_id)) {
-                    EpochApplyStatsNoteAbortN(1);
-                }
-                outcome.txn_accepted = false;
-                return;
+            if (it != rows.end() && !EpochCrdtVersionLess(txn.csn, txn.server_id, it->second)) {
+                accepted = false;
+                break;
             }
         }
 
-        /* ② 全部行都能赢，才逐行合并；被覆盖的旧版本记入 abort 集合 */
         for (const E_WireRow& row : txn.rows) {
             if (row.op_type == EPOCH_OP_READ) {
                 continue;
@@ -210,17 +199,41 @@ E_CrdtMergeOutcome EpochCrdtShmemMergeWireTxn(const E_WireTxn& txn)
                 row.bi_hi, row.bi_lo, row.ip_posid);
             auto it = rows.find(key);
             if (it != rows.end()) {
+                if (!EpochCrdtVersionLess(txn.csn, txn.server_id, it->second)) {
+                    continue;   /* 该行已有更早的写入，本行不参与 */
+                }
                 EpochAbortCsnInsert(txn.epoch, it->second.csn, it->second.server_id);
-                EpochCrdtFillRow(&it->second, row, txn);
+                if (accepted) {
+                    EpochCrdtFillRow(&it->second, row, txn);
+                } else {
+                    EpochCrdtFillClaim(&it->second, row, txn);
+                }
             } else {
                 EpochCrdtRow fresh;
-                EpochCrdtFillRow(&fresh, row, txn);
+                if (accepted) {
+                    EpochCrdtFillRow(&fresh, row, txn);
+                } else {
+                    EpochCrdtFillClaim(&fresh, row, txn);
+                }
                 rows.emplace(key, fresh);
             }
         }
+
+        if (!accepted) {
+            /*
+             * 合并阶段判输：这笔事务不会进 apply 队列，
+             * 所以必须在这里计入失败率，否则 abort tps 只统计到
+             * "先赢后被打回"的那一类，会明显偏低。
+             * Insert 自带去重，只有真正新插入时才计数。
+             */
+            if (EpochAbortCsnInsert(txn.epoch, txn.csn, txn.server_id)) {
+                EpochApplyStatsNoteAbortN(1);
+            }
+            outcome.txn_accepted = false;
+        }
     });
 
-    /* 只有整笔被接受的事务才进 apply；判输的事务一行都不会落堆 */
+    /* 只有整笔被接受的事务才进 apply；判输的事务只留下裁决用的声明 */
     if (outcome.txn_accepted) {
         EpochPipelineEnqueueApplyWinner(txn);
     }

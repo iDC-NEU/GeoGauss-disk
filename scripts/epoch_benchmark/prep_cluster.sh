@@ -29,8 +29,8 @@ node_index_of_ip() {
 RESTORE_ONLY=0
 [ "${1:-}" = "--restore-only" ] && RESTORE_ONLY=1
 
-N2="hcj2003@${EPOCH_NODE2_IP}"
-N3="hcj2003@${EPOCH_NODE3_IP}"
+N2="omm@${EPOCH_NODE2_IP}"
+N3="omm@${EPOCH_NODE3_IP}"
 ROOT2="/data/geogauss"
 ROOT3="/mnt/data/geogauss"
 GH1="${EPOCH_BENCH_ROOT}/openGauss-server/mppdb_temp_install"
@@ -44,7 +44,7 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 stop_all() {
     log "stop all nodes"
-    timeout 60 su -s /bin/bash hcj2003 -c "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH1} LD_LIBRARY_PATH=${GH1}/lib PATH=${GH1}/bin:/usr/bin:/bin; gs_ctl stop -D ${D1} -m immediate" >/dev/null 2>&1
+    timeout 60 su -s /bin/bash omm -c "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH1} LD_LIBRARY_PATH=${GH1}/lib PATH=${GH1}/bin:/usr/bin:/bin; gs_ctl stop -D ${D1} -m immediate" >/dev/null 2>&1
     ssh -o BatchMode=yes "${N2}" "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH2} LD_LIBRARY_PATH=${GH2}/lib PATH=${GH2}/bin:/usr/bin:/bin; timeout 60 gs_ctl stop -D ${D2} -m immediate" >/dev/null 2>&1
     ssh -o BatchMode=yes "${N3}" "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH3} LD_LIBRARY_PATH=${GH3}/lib PATH=${GH3}/bin:/usr/bin:/bin; timeout 60 gs_ctl stop -D ${D3} -m immediate" >/dev/null 2>&1
     sleep 2
@@ -56,12 +56,12 @@ stop_all() {
 
 clean_ipc() {
     log "clean ipc"
-    for id in $(ipcs -m | awk 'NR>3 && $3=="hcj2003"{print $2}'); do ipcrm -m "$id" 2>/dev/null; done
-    for id in $(ipcs -s | awk 'NR>3 && $3=="hcj2003"{print $2}'); do ipcrm -s "$id" 2>/dev/null; done
+    for id in $(ipcs -m | awk 'NR>3 && $3=="omm"{print $2}'); do ipcrm -m "$id" 2>/dev/null; done
+    for id in $(ipcs -s | awk 'NR>3 && $3=="omm"{print $2}'); do ipcrm -s "$id" 2>/dev/null; done
     for ip in "${EPOCH_NODE2_IP}" "${EPOCH_NODE3_IP}"; do
-        ssh -o BatchMode=yes "hcj2003@${ip}" bash -s <<'EOS' 2>/dev/null
-for id in $(ipcs -m | awk 'NR>3 && $3=="hcj2003"{print $2}'); do ipcrm -m "$id" 2>/dev/null; done
-for id in $(ipcs -s | awk 'NR>3 && $3=="hcj2003"{print $2}'); do ipcrm -s "$id" 2>/dev/null; done
+        ssh -o BatchMode=yes "omm@${ip}" bash -s <<'EOS' 2>/dev/null
+for id in $(ipcs -m | awk 'NR>3 && $3=="omm"{print $2}'); do ipcrm -m "$id" 2>/dev/null; done
+for id in $(ipcs -s | awk 'NR>3 && $3=="omm"{print $2}'); do ipcrm -s "$id" 2>/dev/null; done
 EOS
     done
 }
@@ -152,7 +152,7 @@ apply_params() {
     )
     sed -i -E "${sedexpr[@]}" "${D1}/postgresql.conf"
     # 旧版脚本写入、当前代码未注册的 GUC：残留会让实例起不来
-    sed -i -e '/^[[:space:]]*epoch_dbr_mode[[:space:]]*=/d' -e '/^[[:space:]]*enable_epoch_dyn_net[[:space:]]*=/d' -e '/^[[:space:]]*epoch_dyn_net_bw_mode[[:space:]]*=/d' "${D1}/postgresql.conf"
+    sed -i -e '/^[[:space:]]*epoch_dbr_mode[[:space:]]*=/d' -e '/^[[:space:]]*epoch_sync_start_gate[[:space:]]*=/d' -e '/^[[:space:]]*enable_epoch_dyn_net[[:space:]]*=/d' -e '/^[[:space:]]*epoch_dyn_net_bw_mode[[:space:]]*=/d' "${D1}/postgresql.conf"
     # 新参数：旧 conf 里没有这一行，sed 不会创建它
     grep -q '^epoch_dyn_net_upload_bps' "${D1}/postgresql.conf" || echo "epoch_dyn_net_upload_bps = ${DN_UPBPS}" >> "${D1}/postgresql.conf"
     grep -q '^epoch_dyn_net_download_bps' "${D1}/postgresql.conf" || echo "epoch_dyn_net_download_bps = ${DN_DOWNBPS}" >> "${D1}/postgresql.conf"
@@ -182,10 +182,10 @@ EOS
 }
 
 reset_password() {
-    log "reset hcj2003 password (single-user)"
-    timeout 90 su -s /bin/bash hcj2003 -c "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH1} LD_LIBRARY_PATH=${GH1}/lib PATH=${GH1}/bin:/usr/bin:/bin; printf \"ALTER USER hcj2003 IDENTIFIED BY 'Test@123';\n\" | gaussdb --single -D ${D1} postgres" >/dev/null 2>&1
-    ssh -o BatchMode=yes "${N2}" "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH2} LD_LIBRARY_PATH=${GH2}/lib PATH=${GH2}/bin:/usr/bin:/bin; printf \"ALTER USER hcj2003 IDENTIFIED BY 'Test@123';\n\" | timeout 90 gaussdb --single -D ${D2} postgres" >/dev/null 2>&1
-    ssh -o BatchMode=yes "${N3}" "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH3} LD_LIBRARY_PATH=${GH3}/lib PATH=${GH3}/bin:/usr/bin:/bin; printf \"ALTER USER hcj2003 IDENTIFIED BY 'Test@123';\n\" | timeout 90 gaussdb --single -D ${D3} postgres" >/dev/null 2>&1
+    log "reset omm password (single-user)"
+    timeout 90 su -s /bin/bash omm -c "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH1} LD_LIBRARY_PATH=${GH1}/lib PATH=${GH1}/bin:/usr/bin:/bin; printf \"ALTER USER omm IDENTIFIED BY 'Test@123';\n\" | gaussdb --single -D ${D1} postgres" >/dev/null 2>&1
+    ssh -o BatchMode=yes "${N2}" "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH2} LD_LIBRARY_PATH=${GH2}/lib PATH=${GH2}/bin:/usr/bin:/bin; printf \"ALTER USER omm IDENTIFIED BY 'Test@123';\n\" | timeout 90 gaussdb --single -D ${D2} postgres" >/dev/null 2>&1
+    ssh -o BatchMode=yes "${N3}" "export ASAN_OPTIONS=detect_odr_violation=0:abort_on_error=1 GAUSSHOME=${GH3} LD_LIBRARY_PATH=${GH3}/lib PATH=${GH3}/bin:/usr/bin:/bin; printf \"ALTER USER omm IDENTIFIED BY 'Test@123';\n\" | timeout 90 gaussdb --single -D ${D3} postgres" >/dev/null 2>&1
     rm -f "${D1}/postmaster.pid"
     ssh -o BatchMode=yes "${N2}" "rm -f ${D2}/postmaster.pid" 2>/dev/null
     ssh -o BatchMode=yes "${N3}" "rm -f ${D3}/postmaster.pid" 2>/dev/null

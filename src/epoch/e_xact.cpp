@@ -404,11 +404,9 @@ static void E_ResetTxnEpochContext(void)
     EpochResetReadFrontier();
 }
 
-static void EpochWaitForStartGate(uint64_t commit_epoch);
-
 /*
- * XACT START：Assign + executing++ + START gate。
- * assign 后立即 executing++（含 gate 自旋），防止 worker 将已 assign 的 epoch 误判为空并 seal。
+ * XACT START：assign + executing++。
+ * assign 后立即 executing++，防止 worker 将已 assign 的 epoch 误判为空并 seal。
  */
 static void E_AssignEpochOnStart(void)
 {
@@ -526,13 +524,6 @@ void EpochEnsureTxnEpochOnAccess(bool is_write)
     }
 }
 
-/*
- * GeoGauss is_sync_exec START gate (mot_fdw.cpp):
- * while (start_epoch > logical) usleep(200);
- *
- * sync 多主（含后台 defer pack）：默认阻塞 START gate，保证 epoch N+1 在 epoch N 关窗后再执行。
- * epoch_sync_start_gate=off 时也不在 START 阻塞。
- */
 /*
  * 已在途事务 COMMIT/pack：只等 logical 关窗。
  */

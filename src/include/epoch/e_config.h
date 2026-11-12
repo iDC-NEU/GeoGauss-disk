@@ -20,7 +20,6 @@ extern bool g_epoch_apply_local_only;
  * INSERT 仍落堆。不打开 enable_occ_staging。改初值后全量编译重启。
  */
 extern bool g_epoch_local_tip_staging;
-extern bool g_epoch_sync_start_gate;
 extern bool g_epoch_recv_diag;
 extern bool g_epoch_recv_diag_verbose;
 extern bool g_epoch_lifecycle_log;

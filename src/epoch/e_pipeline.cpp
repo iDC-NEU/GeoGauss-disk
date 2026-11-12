@@ -1259,6 +1259,16 @@ static bool EpochPipelineRecvIncomingOnce(void)
                 fflush(stderr);
             }
         } else {
+            /*
+             * 重传或代理重发可能送来同一份写集。只认第一份：
+             * 第二份会在 merge 里输给自己的第一份并被记入 abort 集合，
+             * 结果是这笔事务整笔不落盘。
+             */
+            const uint64_t wire_key = EpochPipelineWireTxnKey(txn);
+            if (!EpochConcurrent::U64SetInsert(g_merge_accepted_wires, epoch, wire_key)) {
+                EpochRecvNoteStale();
+                continue;
+            }
             /* 写集：received++ 并进 merge 队列 */
             EpochRecvNoteWire(epoch, txn.server_id);
             /*

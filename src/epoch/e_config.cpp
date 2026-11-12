@@ -34,7 +34,6 @@ bool g_epoch_apply_local_only = false;
  */
 bool g_epoch_local_tip_staging = false;
 
-bool g_epoch_sync_start_gate = true;
 bool g_epoch_recv_diag = false;
 bool g_epoch_recv_diag_verbose = false;
 bool g_epoch_lifecycle_log = false;
@@ -154,19 +153,6 @@ void EpochRegisterGucs(void)
                              GUC_NO_RESET_ALL,
                              EpochCheckMultimaster,
                              EpochAssignMultimaster,
-                             NULL);
-
-    DefineCustomBoolVariable("epoch_sync_start_gate",
-                             "When on (default), sync multi-master blocks BEGIN on START gate "
-                             "until logical epoch catches up; extended-protocol Parse (prepare) "
-                             "skips assign/gate/executing. When off, skip START gate for all paths.",
-                             NULL,
-                             &g_epoch_sync_start_gate,
-                             true,
-                             PGC_POSTMASTER,
-                             GUC_NO_RESET_ALL,
-                             NULL,
-                             NULL,
                              NULL);
 
     DefineCustomStringVariable("epoch_peer_hosts",
@@ -548,7 +534,7 @@ void EpochRegisterGucs(void)
                                "User name for epoch worker remote apply.",
                                NULL,
                                &g_epoch_apply_user,
-                               "hcj2003",
+                               "omm",
                                PGC_POSTMASTER,
                                GUC_NO_RESET_ALL,
                                NULL,

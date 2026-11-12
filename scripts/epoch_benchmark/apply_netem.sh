@@ -51,11 +51,22 @@ apply_local() {
         return 0
     fi
 
+    # 参数：健康对端延迟、慢节点对端延迟、慢节点 IP 列表（逗号分隔）、上行、下行、健康对端 IP...
     local delay_ms="$1"
-    local up_mbit="$2"
-    local down_mbit="$3"
-    shift 3
+    local slow_delay_ms="$2"
+    local slow_csv="$3"
+    local up_mbit="$4"
+    local down_mbit="$5"
+    shift 5
     local peers=("$@")
+    local -a slow_peers=()
+    # 空列表用 "-" 占位：ssh 重放参数时空串会被吞掉
+    if [ "${slow_csv}" = "-" ]; then
+        slow_csv=""
+    fi
+    if [ -n "${slow_csv}" ]; then
+        IFS=',' read -r -a slow_peers <<< "${slow_csv}"
+    fi
 
     cleanup_tc "${iface}"
     if [ "${delay_ms}" -eq 0 ] && [ "${up_mbit}" -eq 0 ] && [ "${down_mbit}" -eq 0 ]; then
@@ -67,10 +78,17 @@ apply_local() {
         return 0
     fi
 
-    echo "Node ${local_ip} iface ${iface}: egress delay ${delay_ms}ms up ${up_mbit}Mbit down ${down_mbit}Mbit peers: ${peers[*]}"
+    echo "Node ${local_ip} iface ${iface}: egress delay ${delay_ms}ms (slow peers ${slow_delay_ms}ms) up ${up_mbit}Mbit down ${down_mbit}Mbit peers: ${peers[*]}"
 
     if [ "${delay_ms}" -gt 0 ] || [ "${up_mbit}" -gt 0 ]; then
         "${TC_CMD}" qdisc add dev "${iface}" root handle 1: prio bands 4 priomap 1 2 2 2 1 2 0 0 1 1 1 1 1 1 1 1
+        if [ "${slow_delay_ms}" -gt 0 ] && [ "${#slow_peers[@]}" -gt 0 ]; then
+            "${TC_CMD}" qdisc add dev "${iface}" parent 1:3 handle 30: netem delay "${slow_delay_ms}ms"
+            local slow
+            for slow in "${slow_peers[@]}"; do
+                "${TC_CMD}" filter add dev "${iface}" protocol ip parent 1:0 prio 1 u32 match ip dst "${slow}" flowid 1:3
+            done
+        fi
         if [ "${up_mbit}" -gt 0 ]; then
             "${TC_CMD}" qdisc add dev "${iface}" parent 1:4 handle 40: htb default 1
             "${TC_CMD}" class add dev "${iface}" parent 40: classid 40:1 htb rate "${up_mbit}mbit" ceil "${up_mbit}mbit" burst 256kb
@@ -118,20 +136,6 @@ case "${CMD}" in
         ;;
 esac
 
-node_is_slow() {
-    local node_id="$1"
-    local guc id
-    guc="$(epoch_guc_node_id "${node_id}")"
-    local IFS=','
-    for id in ${EPOCH_DYN_NET_SLOW_NODES:-}; do
-        id="${id// /}"
-        if [ -n "${id}" ] && [ "${id}" = "${guc}" ]; then
-            return 0
-        fi
-    done
-    return 1
-}
-
 run_sudo() {
     if sudo -n "$@"; then
         return 0
@@ -172,11 +176,12 @@ run_on_node() {
 }
 
 if [ "${CMD}" = "add" ]; then
-    rtt="${EPOCH_NETWORK_RTT_MS:-100}"
+    slow_rtt="${EPOCH_NETWORK_RTT_MS:-100}"
+    healthy_rtt="${EPOCH_RTT_HEALTHY_MS:-35}"
     bw_mode="${EPOCH_DYN_NET_BW_MODE:-uplimit}"
-    bw_mbps="${EPOCH_DYN_NET_BW_MBPS:-100}"
-    if ! [[ "${rtt}" =~ ^[0-9]+$ ]]; then
-        echo "ERROR: EPOCH_NETWORK_RTT_MS must be an integer, got: ${rtt}" >&2
+    bw_mbps="${EPOCH_DYN_NET_BW_MBPS:-10}"
+    if ! [[ "${slow_rtt}" =~ ^[0-9]+$ ]] || ! [[ "${healthy_rtt}" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: EPOCH_NETWORK_RTT_MS / EPOCH_RTT_HEALTHY_MS must be integers" >&2
         exit 1
     fi
     if ! [[ "${bw_mbps}" =~ ^[0-9]+$ ]]; then
@@ -190,7 +195,8 @@ if [ "${CMD}" = "add" ]; then
             exit 1
             ;;
     esac
-    delay_ms=$((rtt / 2))
+    slow_delay_ms=$((slow_rtt / 2))
+    healthy_delay_ms=$((healthy_rtt / 2))
 fi
 
 for n in $(epoch_active_node_ids); do
@@ -200,24 +206,44 @@ for n in $(epoch_active_node_ids); do
     fi
     up=0
     down=0
-    if node_is_slow "${n}"; then
+    if epoch_node_is_slow "${n}"; then
         case "${bw_mode}" in
             uplimit) up="${bw_mbps}" ;;
             downlimit) down="${bw_mbps}" ;;
             bilimit) up="${bw_mbps}"; down="${bw_mbps}" ;;
         esac
     fi
+    # 慢节点：所有出口都按慢链路延迟；健康节点：到慢节点 1:3、到健康节点 1:4
+    if epoch_node_is_slow "${n}"; then
+        node_delay="${slow_delay_ms}"
+        node_slow_delay=0
+        slow_csv="-"
+    else
+        node_delay="${healthy_delay_ms}"
+        node_slow_delay="${slow_delay_ms}"
+        slow_csv=""
+        for s in $(epoch_active_node_ids); do
+            [ "${s}" = "${n}" ] && continue
+            epoch_node_is_slow "${s}" || continue
+            slow_csv="${slow_csv:+${slow_csv},}$(epoch_node_ip "${s}")"
+        done
+    fi
     peers=""
     for p in $(epoch_active_node_ids); do
         [ "${p}" = "${n}" ] && continue
+        # 健康节点发往慢节点的流量已经分到 1:3，不再进 1:4
+        if ! epoch_node_is_slow "${n}" && epoch_node_is_slow "${p}"; then
+            continue
+        fi
         peers="${peers} $(epoch_node_ip "${p}")"
     done
     # shellcheck disable=SC2086
-    run_on_node "${n}" add "${delay_ms}" "${up}" "${down}" ${peers}
+    run_on_node "${n}" add "${node_delay}" "${node_slow_delay}" "${slow_csv}" "${up}" "${down}" ${peers}
 done
 
 if [ "${CMD}" = "add" ]; then
-    echo "tc 已加上。每端出口延迟 ${delay_ms}ms，ping 往返应约 ${EPOCH_NETWORK_RTT_MS}ms。"
+    echo "tc 已加上：慢节点出口 ${slow_delay_ms}ms，健康节点出口 ${healthy_delay_ms}ms（发往慢节点 ${slow_delay_ms}ms）。"
+    echo "预期 RTT：慢节点链路约 ${EPOCH_NETWORK_RTT_MS:-100}ms，健康节点之间约 ${EPOCH_RTT_HEALTHY_MS:-35}ms。"
     echo "核对: ping -c 5 ${EPOCH_NODE1_IP} ; ping -c 5 ${EPOCH_NODE2_IP}"
     echo "撤掉: bash ${SCRIPT_DIR}/apply_netem.sh del"
 fi
