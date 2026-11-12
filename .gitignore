@@ -30,16 +30,18 @@ objfiles.txt
 *.bak.*
 build.log*
 lex.backup
-scripts/epoch_benchmark/_agent_edits.json
-Pacer__Straggler_Tolerant_Replication_for_Epoch_Based_Geo_Distributed_OLTP_Databases (2).pdf
+*.pdf
 
 # 本地工具配置与私人笔记（不进入公开镜像）
 /.cursor/
 /代码相关版本说明.txt
-*.pdf
-dbr_pa_stat.txt
-pacer_text.txt
-pacer2_text.txt
 
-# 设计文档与本地说明（仅保留在本地，不进入公开镜像）
-/docs/
+# 客户端编译产物
+scripts/epoch_benchmark/ycsb/classes/
+
+# 设计文档：只发布与代码一致的四份说明
+/docs/*
+!/docs/DEPENDENCIES.md
+!/docs/IMPLEMENTATION.md
+!/docs/EXPERIMENTS.md
+!/docs/VALIDATION.md
